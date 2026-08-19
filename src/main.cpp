@@ -1,0 +1,3826 @@
+﻿// =============================================================================
+// main.cpp
+// 浣滅敤锛氱▼搴忓叆鍙ｄ笌鏁翠綋璋冨害銆?// 鏁翠綋娴佺▼锛?//   1) 寮逛笁涓璇濇锛岃鐢ㄦ埛閫?杈撳叆OSGB鏂囦欢澶?/ 杈撳叆Shapefile / 杈撳嚭Shapefile锛?//   2) 鐢?OSGMeshSampler 鎶?OSGB 閲囨牱鎴愮偣浜?甯︽硶鍚戦噺)锛?//   3) 鐢?GDAL/OGR 鎵撳紑杈撳叆 shp锛岄€愪釜寤虹瓚鐗╁杈瑰舰锛?//        - 浠庣偣浜戦噷鍙栬竟鐣屾敮鎾戠偣 -> 璋?outlineRegular 鍋氳疆寤撹鍒欏寲锛?//   4) 鎶婅鍒欏寲鍚庣殑澶氳竟褰㈠啓鍑哄埌杈撳嚭 shp(淇濈暀鍘熷睘鎬у瓧娈?銆?// 鏂囦欢涓婂崐閮ㄥ垎鏄嫢骞?2D 鍑犱綍/Shapefile 杈呭姪鍑芥暟(鍖垮悕鍛藉悕绌洪棿)锛屼笅鍗婇儴鍒嗘槸 main()銆?// =============================================================================
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include "OSGMeshSampler.h"
+#include "outlineRegular.h"
+#include "PathDialogs.h"
+#include "MaskVectorizer.h"
+
+#include <gdal_priv.h>
+#include <ogrsf_frmts.h>
+#include <ceres/ceres.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <cstdio>
+#include <cstdint>
+#include <cpl_minixml.h>
+#include <functional>
+
+#include <pcl/kdtree/kdtree_flann.h> // KdTree锛氬姞閫熷杈瑰舰閭诲煙鏌ヨ
+#include <pcl/io/ply_io.h>           // PLY 璇诲啓(澶囩敤)
+#include <laszip/laszip_api.h>       // LAS 鍐欏嚭(淇濆瓨閲囨牱鐐逛簯锛屽惈鍦扮悊鍙傝€?offset)
+
+// 娉細SetConsoleOutputCP / GetModuleFileNameA 鐢遍《閮ㄧ殑 <windows.h> 鎻愪緵
+
+namespace {
+
+class TeeStreamBuffer : public std::streambuf {
+public:
+    TeeStreamBuffer(std::streambuf* console_buffer, std::streambuf* file_buffer)
+        : console_buffer_(console_buffer), file_buffer_(file_buffer)
+    {
+    }
+
+protected:
+    int overflow(int ch) override
+    {
+        if (ch == EOF) return !EOF;
+        const int console_result = console_buffer_ ? console_buffer_->sputc(static_cast<char>(ch)) : ch;
+        const int file_result = file_buffer_ ? file_buffer_->sputc(static_cast<char>(ch)) : ch;
+        return (console_result == EOF || file_result == EOF) ? EOF : ch;
+    }
+
+    int sync() override
+    {
+        const int console_result = console_buffer_ ? console_buffer_->pubsync() : 0;
+        const int file_result = file_buffer_ ? file_buffer_->pubsync() : 0;
+        return (console_result == 0 && file_result == 0) ? 0 : -1;
+    }
+
+private:
+    std::streambuf* console_buffer_ = nullptr;
+    std::streambuf* file_buffer_ = nullptr;
+};
+
+class ConsoleLogTee {
+public:
+    explicit ConsoleLogTee(const std::filesystem::path& log_path)
+    {
+        log_file_.open(log_path, std::ios::out | std::ios::trunc | std::ios::binary);
+        if (!log_file_.is_open()) {
+            std::cerr << "[Log] Cannot open console log file: " << log_path.string() << std::endl;
+            return;
+        }
+
+        cout_buffer_ = std::cout.rdbuf();
+        cerr_buffer_ = std::cerr.rdbuf();
+        tee_cout_ = std::make_unique<TeeStreamBuffer>(cout_buffer_, log_file_.rdbuf());
+        tee_cerr_ = std::make_unique<TeeStreamBuffer>(cerr_buffer_, log_file_.rdbuf());
+        std::cout.rdbuf(tee_cout_.get());
+        std::cerr.rdbuf(tee_cerr_.get());
+        enabled_ = true;
+
+        std::cout << "[Log] Console output is also saved to: "
+            << log_path.string() << std::endl;
+    }
+
+    ~ConsoleLogTee()
+    {
+        if (!enabled_) return;
+        std::cout.flush();
+        std::cerr.flush();
+        std::cout.rdbuf(cout_buffer_);
+        std::cerr.rdbuf(cerr_buffer_);
+        log_file_.flush();
+    }
+
+private:
+    bool enabled_ = false;
+    std::ofstream log_file_;
+    std::streambuf* cout_buffer_ = nullptr;
+    std::streambuf* cerr_buffer_ = nullptr;
+    std::unique_ptr<TeeStreamBuffer> tee_cout_;
+    std::unique_ptr<TeeStreamBuffer> tee_cerr_;
+};
+
+std::filesystem::path GetExecutableDirectory()
+{
+    char module_path[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameA(nullptr, module_path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return std::filesystem::current_path();
+    }
+    return std::filesystem::path(module_path).parent_path();
+}
+
+// ---- 鍏ㄥ眬绠楁硶鍙傛暟(鍙寜鏁版嵁鎯呭喌璋冩暣) ----
+const float kSampleDensity = 30.0f;              // OSGB 缃戞牸閲囨牱瀵嗗害(鐐?骞虫柟绫?
+const int kMaxPagedLODDepth = 10;                // PagedLOD 鏈€澶ч€掑綊娣卞害
+const double kBoundarySupportBuffer = 3.0;      // 杈圭晫鏀拺鐐规悳绱㈢殑缂撳啿瀹藉害(绫?
+const double kDensifyStep = 0.5;                 // 鍏滃簳鍔犲瘑杈圭晫鏃剁殑姝ラ暱(绫?
+const double kVerticalNormalMaxAbsZ = 0.45;      // 鍒ゅ畾涓?澧欓潰鐐?鐨勬硶鍚?z 鍒嗛噺闃堝€硷紱
+                                                 // 瓒呰繃鍒欒涓烘按骞抽潰鐐癸紝鍦ㄥ彧鍙栧闈㈢偣鏃惰鎺掗櫎
+const float kSupportVoxelLeaf = 0.15f;           // Support 2D voxel leaf size, meters.
+const double kSupportDensityRadius = 1.0;        // XY radius for local support-density reliability weight.
+const double kSupportDensityMinWeight = 0.40;    // Sparse support is downweighted, not discarded.
+const double kSupportDensityMaxWeight = 1.15;    // Dense support gets only a mild boost.
+const double kMinPolygonBBoxArea = 20.0;
+const double kSmallBuildingBBoxArea = 60.0;     // Smaller footprints use a stable oriented-MBR fast path.
+const double kMinOutputPolygonArea = 15.0;      // Final write-out safety floor in square meters.
+const double kMinOutputPolygonBBoxArea = 20.0;  // Final write-out bbox safety floor in square meters.
+const double kModelCoverageBuffer = 3.0;
+const std::size_t kMinModelEvidencePoints = 10;
+const double kMinSharedBoundaryLength = 0.6;
+const double kMinSharedPerimeterRatio = 0.025;
+const double kShapeMergeMinSharedLength = 2.0;
+const double kShapeMergeMinSharedPerimeterRatio = 0.015;
+const double kStrongSeamEvidenceRatio = 0.85;  // 鍙湁闈炲父寮虹殑璇佹嵁鎵嶉樆姝㈠悎骞讹紱璋冮珮浠ユ斁寮€琚敊鍒?Case B)鐨勫ぇ寤虹瓚
+const double kMergeSeamLength = 3.0;           // 瀹界紳闃堝€硷細鍏变韩杈?=姝ゅ€兼墠鍚堝苟(棰?绐勮繛鎺?涓嶅悓鏍嬶紝涓嶅悎)
+const double kLargeBuildingMergeArea = 1500.0; // 澶у缓绛戠洿鍚堝苟锛歮in(闈㈢Н)>姝ゅ€?涓斿叡浜竟>=kMergeSeamLength 鏃?                                              // 璺宠繃璇佹嵁闂哥洿鎺ュ悎骞躲€備袱鏍嬪悇鑷嫭绔嬬殑澶фゼ鍑犱箮涓嶅彲鑳藉叡浜嚑鍗佺背
+const double kMaxSplitCompactnessGainForMerge = 0.4;
+const double kContainedFootprintMaxArea = 1000.0;
+const double kOutputOverlapMinArea = 0.5;
+const double kInitialMergeSimplifyTolerance = 0.35; // meters. Smooths raster/union seams before regularization.
+const double kRobustSharedBoundaryTolerance = 0.65;
+const double kRobustSharedAngleToleranceDeg = 8.0;
+const double kOutputOverlapMinRatio = 0.005;
+const double kSeamSampleStep = 0.5;
+const double kSeamWallSearchRadius = 0.6;
+const double kSeamRoofSideOffset = 1.2;
+const double kSeamRoofSearchRadius = 0.8;
+const double kSeamRoofHeightDifference = 1.2;
+const int kMinSeamEvidenceSamples = 6;
+const int kMinSeamHeightPairs = 3;
+const double kSupportOwnershipTieTolerance = 0.20; // meters. Prevents dense-neighbor wall points from supporting both footprints.
+const double kSupportOwnershipGridSize = 20.0;     // meters. Spatial index cell size for initial footprint ownership tests.
+const double kNarrowNeckMaxWidth = 4.1;            // meters. Post-vectorization split threshold for missed building separations.
+const double kNarrowNeckMinBoundarySeparation = 4.0;
+const double kNarrowNeckBoundarySeparationRatio = 0.02;
+const double kNarrowNeckMinPartArea = 20.0;
+const double kNarrowNeckCutBuffer = 0.12;
+const int kNarrowNeckMaxCutsPerFeature = 12;
+
+// ---- 璁℃椂绱(绉?锛岀敤浜庡畾浣嶈鍒欏寲鍚勯樁娈佃€楁椂 ----
+double g_supportTime = 0.0;   // 鏀拺鐐规彁鍙?鍚?KdTree 鏌ヨ)绱
+double g_optimizeTime = 0.0;
+std::size_t g_removedSmallPolygons = 0;
+std::size_t g_removedOutsideModel = 0;
+std::size_t g_supportOwnershipRejected = 0;
+
+bool RemoveShapefileFamily(const std::filesystem::path& shpPath, bool verbose = true)
+{
+    static const char* const extensions[] = {
+        ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix",
+        ".sbn", ".sbx", ".fbn", ".fbx", ".ain", ".aih", ".atx"
+    };
+    const std::filesystem::path stem = shpPath.parent_path() / shpPath.stem();
+    for (const char* extension : extensions) {
+        std::filesystem::path file = stem;
+        file += extension;
+        std::error_code ec;
+        if (!std::filesystem::remove(file, ec) && ec) {
+            if (!verbose) return false;
+            std::cerr << "[SHP] Cannot remove " << file.string()
+                      << ": " << ec.message() << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ShapefileFamilyExists(const std::filesystem::path& shpPath)
+{
+    static const char* const extensions[] = {
+        ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix",
+        ".sbn", ".sbx", ".fbn", ".fbx", ".ain", ".aih", ".atx"
+    };
+    const std::filesystem::path stem = shpPath.parent_path() / shpPath.stem();
+    for (const char* extension : extensions) {
+        std::filesystem::path file = stem;
+        file += extension;
+        std::error_code ec;
+        if (std::filesystem::exists(file, ec)) return true;
+    }
+    return false;
+}
+
+std::filesystem::path MakeUniqueShapefilePath(const std::filesystem::path& desired)
+{
+    const std::filesystem::path parent = desired.parent_path();
+    const std::string stem = desired.stem().string();
+    const std::string extension = desired.extension().empty()
+        ? std::string(".shp")
+        : desired.extension().string();
+    for (int i = 1; i < 10000; ++i) {
+        std::filesystem::path candidate = parent / (stem + "_" + std::to_string(i) + extension);
+        if (!ShapefileFamilyExists(candidate)) return candidate;
+    }
+    return parent / (stem + "_new" + extension);
+}
+
+std::filesystem::path PrepareWritableShapefilePath(
+    const std::filesystem::path& desired,
+    const std::string& label)
+{
+    if (RemoveShapefileFamily(desired, false)) return desired;
+
+    const std::filesystem::path fallback = MakeUniqueShapefilePath(desired);
+    std::cout << "[SHP] " << label << " is open or locked, writing to: "
+              << fallback.string() << std::endl;
+    return fallback;
+}
+
+bool ReadMetadataOffset(const std::string& xmlPath, Eigen::Vector3d& offset)
+{
+    CPLXMLNode* tree = CPLParseXMLFile(xmlPath.c_str());
+    if (!tree) {
+        std::cerr << "Cannot parse metadata XML: " << xmlPath << std::endl;
+        return false;
+    }
+
+    std::function<const char*(CPLXMLNode*)> findSRSOrigin = [&](CPLXMLNode* node) -> const char* {
+        for (CPLXMLNode* current = node; current; current = current->psNext) {
+            if (current->eType == CXT_Element &&
+                current->pszValue &&
+                std::string(current->pszValue) == "SRSOrigin") {
+                return CPLGetXMLValue(current, nullptr, nullptr);
+            }
+            if (current->psChild) {
+                if (const char* value = findSRSOrigin(current->psChild)) {
+                    return value;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    const char* value = findSRSOrigin(tree);
+    if (!value) {
+        std::cerr << "metadata XML has no SRSOrigin: " << xmlPath << std::endl;
+        CPLDestroyXMLNode(tree);
+        return false;
+    }
+
+    double x = 0.0, y = 0.0, z = 0.0;
+    const int parsed = std::sscanf(value, "%lf,%lf,%lf", &x, &y, &z);
+    CPLDestroyXMLNode(tree);
+    if (parsed < 2) {
+        std::cerr << "Invalid SRSOrigin value in metadata XML: " << value << std::endl;
+        return false;
+    }
+
+    offset = Eigen::Vector3d(x, y, parsed >= 3 ? z : 0.0);
+    return true;
+}
+
+// 灏嗛噰鏍风偣浜戜繚瀛樹负 LAS(鐐规暟鎹牸寮?3 = GPS+RGB锛屼簩杩涘埗 .las)銆?// 鍐呭瓨鐐逛簯涓虹浉瀵瑰潗鏍囷紝杩欓噷鍙犲姞 mc.offset 寰楀埌涓栫晫鍧愭爣鍚庡啓鍏ワ紱laszip 鎸?header 鐨?// offset/scale 鑷姩鎶?double 涓栫晫鍧愭爣閲忓寲涓烘暣鍨嬶紝鍏ㄧ▼鍙岀簿搴︼紝浼樹簬鎵嬪姩瀹氱偣銆?// 閫昏緫鍙傝€?E:\jt\src\FileIO::saveLAS / IO\lasio锛屽簱鏀圭敤寮€婧?laszip C API(鏈」鐩棤 LASlib)銆?
+bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
+{
+    if (!mc.cloud || mc.cloud->empty()) {
+        std::cerr << "[LAS] point cloud is empty, skip saving." << std::endl;
+        return false;
+    }
+
+    laszip_POINTER writer = nullptr;
+    if (laszip_create(&writer) != 0) {
+        std::cerr << "[LAS] laszip_create failed." << std::endl;
+        return false;
+    }
+
+    // 鐐规暟鎹牸寮?3(GPS time + RGB)锛岃褰曢暱搴?34 瀛楄妭
+    if (laszip_set_point_type_and_size(writer, 3, 34) != 0) {
+        laszip_CHAR* err = nullptr; laszip_get_error(writer, &err);
+        std::cerr << "[LAS] laszip_set_point_type_and_size 澶辫触: " << (err ? err : "?") << std::endl;
+        laszip_destroy(writer);
+        return false;
+    }
+
+    laszip_header_struct* header = nullptr;
+    laszip_get_header_pointer(writer, &header);
+    header->x_scale_factor = 0.0001;
+    header->y_scale_factor = 0.0001;
+    header->z_scale_factor = 0.0001;
+    header->x_offset = mc.offset.x();
+    header->y_offset = mc.offset.y();
+    header->z_offset = mc.offset.z();
+    header->number_of_point_records = static_cast<laszip_U32>(mc.cloud->size());
+
+    // FALSE = 涓嶅帇缂?.las)锛汿RUE 鍒欎负鍘嬬缉(.laz)
+    if (laszip_open_writer(writer, path.c_str(), FALSE) != 0) {
+        laszip_CHAR* err = nullptr; laszip_get_error(writer, &err);
+        std::cerr << "[LAS] laszip_open_writer 澶辫触: " << (err ? err : "?") << std::endl;
+        laszip_destroy(writer);
+        return false;
+    }
+
+    laszip_point_struct* point = nullptr;
+    laszip_get_point_pointer(writer, &point);
+
+    const laszip_F64 ox = mc.offset.x();
+    const laszip_F64 oy = mc.offset.y();
+    const laszip_F64 oz = mc.offset.z();
+    const std::size_t n = mc.cloud->size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& p = mc.cloud->points[i];
+        // 涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + offset
+        const laszip_F64 coords[3] = {
+            static_cast<laszip_F64>(p.x) + ox,
+            static_cast<laszip_F64>(p.y) + oy,
+            static_cast<laszip_F64>(p.z) + oz
+        };
+        laszip_set_coordinates(writer, coords);
+        // 8bit RGB -> 16bit LAS RGB(涔?257锛屼笌璇诲彇鏃剁殑 /257 瀵圭О)
+        point->rgb[0] = static_cast<laszip_U16>(p.r) * 257;
+        point->rgb[1] = static_cast<laszip_U16>(p.g) * 257;
+        point->rgb[2] = static_cast<laszip_U16>(p.b) * 257;
+        point->classification = 1; // Unclassified
+        laszip_set_point(writer, point);
+        laszip_write_point(writer);
+    }
+
+    laszip_close_writer(writer);
+    laszip_destroy(writer);
+    return true;
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr DownsampleSupport2D(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    double leaf)
+{
+    auto result = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
+    if (!cloud || cloud->empty() || leaf <= 0.0) return result;
+
+    struct Accumulator {
+        double x = 0.0;
+        double y = 0.0;
+        double z = 0.0;
+        std::size_t count = 0;
+    };
+    std::map<std::pair<long long, long long>, Accumulator> cells;
+    for (const auto& p : cloud->points) {
+        const long long ix = static_cast<long long>(std::floor(static_cast<double>(p.x) / leaf));
+        const long long iy = static_cast<long long>(std::floor(static_cast<double>(p.y) / leaf));
+        auto& cell = cells[{ix, iy}];
+        cell.x += p.x;
+        cell.y += p.y;
+        cell.z += p.z;
+        ++cell.count;
+    }
+
+    result->reserve(cells.size());
+    for (const auto& item : cells) {
+        const auto& cell = item.second;
+        pcl::PointXYZ p;
+        p.x = static_cast<float>(cell.x / cell.count);
+        p.y = static_cast<float>(cell.y / cell.count);
+        p.z = static_cast<float>(cell.z / cell.count);
+        result->push_back(p);
+    }
+    return result;
+}
+
+struct WeightedSupportCloud {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr points{new pcl::PointCloud<pcl::PointXYZ>};
+    std::vector<double> weights;
+};
+
+double ClampDoubleLocal(double value, double min_value, double max_value)
+{
+    return std::max(min_value, std::min(max_value, value));
+}
+
+double NormalSupportWeightFromZ(double normal_z)
+{
+    const double verticality = ClampDoubleLocal(
+        1.0 - std::abs(normal_z) / std::max(kVerticalNormalMaxAbsZ, 1e-6),
+        0.0, 1.0);
+    return ClampDoubleLocal(0.15 + 0.85 * verticality * verticality, 0.15, 1.0);
+}
+
+WeightedSupportCloud DownsampleSupport2DWithWeights(
+    const WeightedSupportCloud& support,
+    double leaf)
+{
+    WeightedSupportCloud result;
+    if (!support.points || support.points->empty() || leaf <= 0.0) return result;
+
+    struct Representative {
+        pcl::PointXYZ point;
+        double weight = -1.0;
+    };
+    std::map<std::pair<long long, long long>, Representative> cells;
+    for (std::size_t i = 0; i < support.points->size(); ++i) {
+        const auto& p = support.points->points[i];
+        const double weight = i < support.weights.size()
+            ? ClampDoubleLocal(support.weights[i], 0.10, 1.0)
+            : 1.0;
+        const long long ix = static_cast<long long>(std::floor(static_cast<double>(p.x) / leaf));
+        const long long iy = static_cast<long long>(std::floor(static_cast<double>(p.y) / leaf));
+        auto& cell = cells[{ix, iy}];
+        if (weight > cell.weight) {
+            cell.point = p;
+            cell.weight = weight;
+        }
+    }
+
+    result.points->reserve(cells.size());
+    result.weights.reserve(cells.size());
+    for (const auto& item : cells) {
+        result.points->push_back(item.second.point);
+        result.weights.push_back(ClampDoubleLocal(item.second.weight, 0.10, 1.0));
+    }
+    return result;
+}
+
+void ApplySupportDensityWeights(WeightedSupportCloud& support)
+{
+    if (!support.points || support.points->size() < 8) return;
+    if (support.weights.size() != support.points->size()) {
+        support.weights.assign(support.points->size(), 1.0);
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr support2d(new pcl::PointCloud<pcl::PointXYZ>);
+    support2d->resize(support.points->size());
+    for (std::size_t i = 0; i < support.points->size(); ++i) {
+        const auto& p = support.points->points[i];
+        support2d->points[i].x = p.x;
+        support2d->points[i].y = p.y;
+        support2d->points[i].z = 0.0f;
+    }
+
+    pcl::KdTreeFLANN<pcl::PointXYZ> densityTree;
+    densityTree.setInputCloud(support2d);
+
+    std::vector<int> neighborCounts(support.points->size(), 0);
+    std::vector<int> indices;
+    std::vector<float> distances;
+    for (std::size_t i = 0; i < support2d->size(); ++i) {
+        indices.clear();
+        distances.clear();
+        densityTree.radiusSearch(
+            support2d->points[i],
+            static_cast<float>(kSupportDensityRadius),
+            indices,
+            distances);
+        neighborCounts[i] = std::max(0, static_cast<int>(indices.size()) - 1);
+    }
+
+    std::vector<int> sortedCounts = neighborCounts;
+    std::nth_element(
+        sortedCounts.begin(),
+        sortedCounts.begin() + sortedCounts.size() / 2,
+        sortedCounts.end());
+    const double expectedCount = std::max(
+        1.0,
+        static_cast<double>(sortedCounts[sortedCounts.size() / 2]));
+
+    double densityWeightSum = 0.0;
+    double densityWeightMin = std::numeric_limits<double>::max();
+    double densityWeightMax = 0.0;
+    for (std::size_t i = 0; i < support.weights.size(); ++i) {
+        const double raw = static_cast<double>(neighborCounts[i]) / expectedCount;
+        const double densityWeight = ClampDoubleLocal(
+            raw, kSupportDensityMinWeight, kSupportDensityMaxWeight);
+        support.weights[i] = ClampDoubleLocal(
+            support.weights[i] * densityWeight, 0.05, 1.15);
+        densityWeightSum += densityWeight;
+        densityWeightMin = std::min(densityWeightMin, densityWeight);
+        densityWeightMax = std::max(densityWeightMax, densityWeight);
+    }
+
+    std::cerr << "[SupportDensity] radius=" << kSupportDensityRadius
+              << " expected_neighbors=" << expectedCount
+              << " avg_weight=" << densityWeightSum / support.weights.size()
+              << " min=" << densityWeightMin
+              << " max=" << densityWeightMax << std::endl;
+}
+
+// ===== Distance2D =====
+// 浣滅敤锛氫袱涓笁缁寸偣鐨勬按骞?XY)璺濈(蹇界暐 Z)銆?
+double Distance2D(const pcl::PointXYZ& a, const pcl::PointXYZ& b)
+{
+    const double dx = static_cast<double>(a.x) - b.x;
+    const double dy = static_cast<double>(a.y) - b.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// ===== PointToSegmentDistance2D =====
+// 浣滅敤锛氱偣 p 鍒扮嚎娈?a-b 鐨勬按骞虫渶鐭窛绂?鎶婂瀭瓒?clamp 鍒扮嚎娈佃寖鍥村唴)銆?
+double PointToSegmentDistance2D(const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b)
+{
+    const double vx = static_cast<double>(b.x) - a.x;
+    const double vy = static_cast<double>(b.y) - a.y;
+    const double wx = static_cast<double>(p.x) - a.x;
+    const double wy = static_cast<double>(p.y) - a.y;
+    const double len2 = vx * vx + vy * vy;
+    double t = len2 > 0.0 ? (wx * vx + wy * vy) / len2 : 0.0;
+    t = std::max(0.0, std::min(1.0, t));
+    const double px = static_cast<double>(a.x) + t * vx;
+    const double py = static_cast<double>(a.y) + t * vy;
+    const double dx = static_cast<double>(p.x) - px;
+    const double dy = static_cast<double>(p.y) - py;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// ===== PointInPolygon2D =====
+// 浣滅敤锛氬垽鏂偣 p 鏄惁鍦ㄥ杈瑰舰 poly 鍐呴儴(姘村钩闈紝灏勭嚎娉?銆?
+bool PointInPolygon2D(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& poly)
+{
+    bool inside = false;
+    const std::size_t n = poly.size();
+    if (n < 3) return false;
+
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+        const auto& pi = poly[i];
+        const auto& pj = poly[j];
+        const bool intersect = ((pi.y > p.y) != (pj.y > p.y)) &&
+            (p.x < (pj.x - pi.x) * (p.y - pi.y) / ((pj.y - pi.y) + 1e-12f) + pi.x);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+double DistanceToRingBoundary2D(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& ring)
+{
+    if (ring.empty()) return std::numeric_limits<double>::max();
+    double best = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        best = std::min(best, PointToSegmentDistance2D(p, ring[i], ring[(i + 1) % ring.size()]));
+    }
+    return best;
+}
+
+struct RingEnvelope2D {
+    double minX = 0.0;
+    double maxX = 0.0;
+    double minY = 0.0;
+    double maxY = 0.0;
+};
+
+RingEnvelope2D ComputeRingEnvelope2D(const std::vector<pcl::PointXYZ>& ring)
+{
+    RingEnvelope2D env;
+    if (ring.empty()) return env;
+    env.minX = env.maxX = ring.front().x;
+    env.minY = env.maxY = ring.front().y;
+    for (const auto& p : ring) {
+        env.minX = std::min(env.minX, static_cast<double>(p.x));
+        env.maxX = std::max(env.maxX, static_cast<double>(p.x));
+        env.minY = std::min(env.minY, static_cast<double>(p.y));
+        env.maxY = std::max(env.maxY, static_cast<double>(p.y));
+    }
+    return env;
+}
+
+bool EnvelopeContainsPoint(const RingEnvelope2D& env, const pcl::PointXYZ& p, double buffer)
+{
+    return p.x >= env.minX - buffer && p.x <= env.maxX + buffer &&
+           p.y >= env.minY - buffer && p.y <= env.maxY + buffer;
+}
+
+// ===== RemoveClosingDuplicate =====
+// 浣滅敤锛氬鏋滃杈瑰舰棣栧熬鐐瑰嚑涔庨噸鍚堬紝鍘绘帀鏈熬鐨勯噸澶嶉棴鍚堢偣銆?
+void RemoveClosingDuplicate(std::vector<pcl::PointXYZ>& points)
+{
+    if (points.size() >= 2 && Distance2D(points.front(), points.back()) < 1e-6) {
+        points.pop_back();
+    }
+}
+
+// ===== ExtractExteriorRing =====
+// 浣滅敤锛氫粠 OGR 澶氳竟褰腑鍙栧嚭澶栫幆椤剁偣锛岃浆涓?pcl::PointXYZ 鐐瑰垪锛屽苟鍘婚棴鍚堥噸澶嶇偣銆?
+std::vector<pcl::PointXYZ> ExtractExteriorRing(
+    OGRPolygon* polygon, const Eigen::Vector3d& metadataOffset)
+{
+    std::vector<pcl::PointXYZ> ring;
+    if (!polygon) return ring;
+
+    OGRLinearRing* ogr_ring = polygon->getExteriorRing();
+    if (!ogr_ring) return ring;
+
+    for (int i = 0; i < ogr_ring->getNumPoints(); ++i) {
+        pcl::PointXYZ p;
+        p.x = static_cast<float>(ogr_ring->getX(i) - metadataOffset.x());
+        p.y = static_cast<float>(ogr_ring->getY(i) - metadataOffset.y());
+        p.z = static_cast<float>(ogr_ring->getZ(i) - metadataOffset.z());
+        ring.push_back(p);
+    }
+    RemoveClosingDuplicate(ring);
+    return ring;
+}
+
+struct InitialRingRecord {
+    std::size_t id = 0;
+    GIntBig sourceFid = OGRNullFID;
+    int ringIndex = 0;
+    std::vector<pcl::PointXYZ> ring;
+    RingEnvelope2D envelope;
+};
+
+struct CellKey {
+    int x = 0;
+    int y = 0;
+
+    bool operator==(const CellKey& other) const {
+        return x == other.x && y == other.y;
+    }
+};
+
+struct CellKeyHash {
+    std::size_t operator()(const CellKey& key) const {
+        const std::uint64_t ux = static_cast<std::uint32_t>(key.x);
+        const std::uint64_t uy = static_cast<std::uint32_t>(key.y);
+        return static_cast<std::size_t>((ux << 32) ^ uy);
+    }
+};
+
+struct SupportOwnershipContext {
+    std::vector<InitialRingRecord> records;
+    std::unordered_map<CellKey, std::vector<std::size_t>, CellKeyHash> grid;
+    double cellSize = kSupportOwnershipGridSize;
+
+    CellKey cellFor(double x, double y) const {
+        return {
+            static_cast<int>(std::floor(x / cellSize)),
+            static_cast<int>(std::floor(y / cellSize))
+        };
+    }
+
+    void addRecord(InitialRingRecord record) {
+        if (record.ring.size() < 3) return;
+        record.id = records.size();
+        record.envelope = ComputeRingEnvelope2D(record.ring);
+        const std::size_t id = record.id;
+        records.push_back(std::move(record));
+        const auto minCell = cellFor(records.back().envelope.minX - kBoundarySupportBuffer,
+                                     records.back().envelope.minY - kBoundarySupportBuffer);
+        const auto maxCell = cellFor(records.back().envelope.maxX + kBoundarySupportBuffer,
+                                     records.back().envelope.maxY + kBoundarySupportBuffer);
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy) {
+            for (int cx = minCell.x; cx <= maxCell.x; ++cx) {
+                grid[{cx, cy}].push_back(id);
+            }
+        }
+    }
+
+    bool ownsSupportPoint(const pcl::PointXYZ& p,
+                          std::size_t currentId,
+                          double currentDistance) const {
+        if (currentId >= records.size()) return true;
+        const auto cell = cellFor(p.x, p.y);
+        const auto found = grid.find(cell);
+        if (found == grid.end()) return true;
+
+        for (std::size_t otherId : found->second) {
+            if (otherId == currentId || otherId >= records.size()) continue;
+            const auto& other = records[otherId];
+            if (!EnvelopeContainsPoint(other.envelope, p, kBoundarySupportBuffer)) continue;
+            const double otherDistance = DistanceToRingBoundary2D(p, other.ring);
+            if (otherDistance > kBoundarySupportBuffer) continue;
+
+            if (otherDistance + kSupportOwnershipTieTolerance < currentDistance) {
+                return false;
+            }
+            if (std::abs(otherDistance - currentDistance) <= kSupportOwnershipTieTolerance &&
+                otherId < currentId) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+std::size_t FindInitialRingRecordId(
+    const SupportOwnershipContext* ownership,
+    GIntBig sourceFid,
+    int ringIndex)
+{
+    if (!ownership) return static_cast<std::size_t>(-1);
+    for (const auto& record : ownership->records) {
+        if (record.sourceFid == sourceFid && record.ringIndex == ringIndex) {
+            return record.id;
+        }
+    }
+    return static_cast<std::size_t>(-1);
+}
+
+// ===== DensifyBoundary =====
+// 浣滅敤锛氭部澶氳竟褰㈣竟鐣屾寜姝ラ暱 step 鎻掑€煎姞瀵嗭紝鐢熸垚瀵嗛泦鐨勭偣浜?浣滀负鏀拺鐐圭殑鍏滃簳鏉ユ簮)銆?
+pcl::PointCloud<pcl::PointXYZ>::Ptr DensifyBoundary(const std::vector<pcl::PointXYZ>& ring, double step)
+{
+    auto cloud = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
+    if (ring.size() < 2) return cloud;
+
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const pcl::PointXYZ& a = ring[i];
+        const pcl::PointXYZ& b = ring[(i + 1) % ring.size()];
+        const double len = Distance2D(a, b);
+        const int segments = std::max(1, static_cast<int>(std::ceil(len / step)));
+        for (int s = 0; s < segments; ++s) {
+            const double t = static_cast<double>(s) / segments;
+            pcl::PointXYZ p;
+            p.x = static_cast<float>(a.x * (1.0 - t) + b.x * t);
+            p.y = static_cast<float>(a.y * (1.0 - t) + b.y * t);
+            p.z = static_cast<float>(a.z * (1.0 - t) + b.z * t);
+            cloud->push_back(p);
+        }
+    }
+    return cloud;
+}
+
+// ===== MakePolygon =====
+// 浣滅敤锛氭妸鐐瑰垪閲嶆柊缁勮鎴愪竴涓?OGRPolygon(鑷姩闂悎澶栫幆)銆傜偣鏁?<3 杩斿洖 nullptr銆?
+OGRPolygon* MakePolygon(
+    const std::vector<pcl::PointXYZ>& ring, const Eigen::Vector3d& metadataOffset)
+{
+    if (ring.size() < 3) return nullptr;
+
+    auto* polygon = new OGRPolygon();
+    OGRLinearRing ogr_ring;
+    for (const auto& p : ring) {
+        ogr_ring.addPoint(p.x + metadataOffset.x(),
+            p.y + metadataOffset.y(),
+            p.z + metadataOffset.z());
+    }
+    ogr_ring.addPoint(ring.front().x + metadataOffset.x(),
+        ring.front().y + metadataOffset.y(),
+        ring.front().z + metadataOffset.z());
+    polygon->addRing(&ogr_ring);
+    return polygon;
+}
+
+// ===== ExtractBoundarySupportFromOSGB =====
+// 浣滅敤锛氫粠閲囨牱鐨勭偣浜戦噷锛屾寫鍑?鏀拺杈圭晫瑙勫垯鍖?鐢ㄧ殑鐐广€?//       銆怟dTree 鐗堛€戠敤棰勫厛寤哄ソ鐨?kdtree 鍋氫竴娆?2D 鍗婂緞鏌ヨ锛屽彧鍙栧杈瑰舰鎵╁睍鍖呭洿鐩掕寖鍥村唴鐨?//       鍊欓€夌偣锛屽啀鎸夊師閫昏緫(澧欓潰鐐?/ 闈犺繎杈圭晫 / 钀藉湪澶氳竟褰㈠唴)绛涢€夈€?//       鍊欓€夐泦 鈯?鍘熷叏閲忔壂鎻忚兘閫氳繃鐨勬墍鏈夌偣锛屽洜姝ょ粨鏋滀笌鍘熺増瀹屽叏涓€鑷达紝鍙槸蹇緢澶氥€?// 鍙傛暟锛歴ampled  - OSGB 閲囨牱鐐逛簯锛況ing - 澶氳竟褰㈣竟鐣岋紱
+//       wallOnly- 鏄惁鍙彇澧欓潰鐐癸紱kdtree - 棰勫缓鐨?2D KdTree(Z 宸茬疆 0)銆?// 杩斿洖锛氭敮鎾戠偣浜戙€?
+WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
+    const MyCloudPtr& sampled,
+    const std::vector<pcl::PointXYZ>& ring,
+    bool wallOnly,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const SupportOwnershipContext* ownership = nullptr,
+    std::size_t currentRingId = static_cast<std::size_t>(-1))
+{
+    WeightedSupportCloud support;
+    if (!sampled || !sampled->cloud || sampled->cloud->empty() || ring.size() < 3 || !kdtree) return support;
+
+    double min_x = ring[0].x, max_x = ring[0].x;
+    double min_y = ring[0].y, max_y = ring[0].y;
+    for (const auto& p : ring) {
+        min_x = std::min(min_x, static_cast<double>(p.x));
+        max_x = std::max(max_x, static_cast<double>(p.x));
+        min_y = std::min(min_y, static_cast<double>(p.y));
+        max_y = std::max(max_y, static_cast<double>(p.y));
+    }
+
+    // 浠ユ墿灞曞寘鍥寸洅涓績涓哄渾蹇冦€佸崐瀵硅绾夸负鍗婂緞鍋氫竴娆?2D 鏌ヨ锛屽緱鍒板€欓€夌偣绱㈠紩
+    const double cx = (min_x + max_x) * 0.5;
+    const double cy = (min_y + max_y) * 0.5;
+    const double half_w = (max_x - min_x) * 0.5 + kBoundarySupportBuffer;
+    const double half_h = (max_y - min_y) * 0.5 + kBoundarySupportBuffer;
+    const float radius = static_cast<float>(std::sqrt(half_w * half_w + half_h * half_h) + 1e-3);
+
+    pcl::PointXYZ center;
+    center.x = static_cast<float>(cx);
+    center.y = static_cast<float>(cy);
+    center.z = 0.0f;
+
+    std::vector<int> candidates;
+    std::vector<float> dists2;
+    kdtree->radiusSearch(center, radius, candidates, dists2);
+
+    for (int idx : candidates) {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= sampled->cloud->size()) continue;
+        const auto& src = sampled->cloud->points[idx];
+
+        // 鍖呭洿鐩掔矖绛?淇濈暀锛屼繚璇佺粨鏋滀笌鍘熺増涓€鑷?
+        if (src.x < min_x - kBoundarySupportBuffer || src.x > max_x + kBoundarySupportBuffer ||
+            src.y < min_y - kBoundarySupportBuffer || src.y > max_y + kBoundarySupportBuffer) {
+            continue;
+        }
+
+        // 鍙彇澧欓潰鐐规椂锛氭硶鍚?z 鍒嗛噺杩囧ぇ(鎺ヨ繎姘村钩闈?鐨勭偣璺宠繃
+        double normalWeight = 1.0;
+        if (sampled->normal && static_cast<std::size_t>(idx) < sampled->normal->size()) {
+            const auto& n = sampled->normal->points[idx];
+            const double absNormalZ = std::abs(n.normal_z);
+            if (wallOnly && absNormalZ > kVerticalNormalMaxAbsZ) {
+                continue;
+            }
+            if (wallOnly) {
+                normalWeight = NormalSupportWeightFromZ(n.normal_z);
+            }
+        }
+
+        pcl::PointXYZ p;
+        p.x = src.x;
+        p.y = src.y;
+        p.z = src.z;
+
+        const double boundaryDistance = DistanceToRingBoundary2D(p, ring);
+        const bool nearBoundary = boundaryDistance <= kBoundarySupportBuffer;
+
+        if (nearBoundary || (!wallOnly && PointInPolygon2D(p, ring))) {
+            if (nearBoundary && ownership &&
+                !ownership->ownsSupportPoint(p, currentRingId, boundaryDistance)) {
+                ++g_supportOwnershipRejected;
+                continue;
+            }
+            support.points->push_back(p);
+            support.weights.push_back(normalWeight);
+        }
+    }
+
+    return support;
+}
+
+// Compatibility wrapper for callers that only need support point coordinates.
+pcl::PointCloud<pcl::PointXYZ>::Ptr ExtractBoundarySupportFromOSGB(
+    const MyCloudPtr& sampled,
+    const std::vector<pcl::PointXYZ>& ring,
+    bool wallOnly,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const SupportOwnershipContext* ownership = nullptr,
+    std::size_t currentRingId = static_cast<std::size_t>(-1))
+{
+    return ExtractWeightedBoundarySupportFromOSGB(
+        sampled, ring, wallOnly, kdtree, ownership, currentRingId).points;
+}
+
+struct DebugHypothesisRecord {
+    GIntBig sourceFid = OGRNullFID;
+    int ringIndex = 0;
+    std::vector<pcl::PointXYZ> points;
+};
+
+struct RegularizationDebugCollector {
+    std::vector<DebugHypothesisRecord> hypotheses;
+    PointCloudT::Ptr support{new PointCloudT};
+};
+
+double BoundingBoxArea2D(const std::vector<pcl::PointXYZ>& ring);
+double PolygonArea2D(const std::vector<pcl::PointXYZ>& ring);
+std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
+    const std::vector<pcl::PointXYZ>& ring, double angle);
+bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring);
+
+// ===== RegularizeRing =====
+// 浣滅敤锛氬鍗曟潯澶氳竟褰㈣竟鐣屽仛瑙勫垯鍖栥€?//       浼樺厛鐢?澧欓潰鏀拺鐐?锛岀偣澶皯鍒欓€€鍖栦负"鍏ㄩ儴鏀拺鐐?锛屽啀灏戝垯鐢ㄨ竟鐣岃嚜韬姞瀵嗙偣鍏滃簳锛?//       鐒跺悗鏋勯€?outlineRegular 骞舵墽琛?regular_Contour() 寰楀埌瑙勫垯鍖栫粨鏋溿€?
+std::vector<pcl::PointXYZ> RegularizeRing(
+    const std::vector<pcl::PointXYZ>& ring,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const SupportOwnershipContext* ownership = nullptr,
+    std::size_t currentRingId = static_cast<std::size_t>(-1),
+    std::vector<pcl::PointXYZ>* debugBestHypothesis = nullptr,
+    std::vector<pcl::PointXYZ>* debugSupport = nullptr)
+{
+    if (ring.size() < 3) return ring;
+
+    // ---- 鏀拺鐐规彁鍙?璁℃椂) ----
+    auto t0 = std::chrono::steady_clock::now();
+    auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
+        sampled, ring, true, kdtree, ownership, currentRingId);   // 鍏堝彧鐢ㄥ闈㈢偣
+    auto weightedSupport = wallOnlySupport;
+    if (weightedSupport.points->size() < 20) {
+        weightedSupport = ExtractWeightedBoundarySupportFromOSGB(
+            sampled, ring, false, kdtree, ownership, currentRingId);
+    }
+    if (weightedSupport.points->size() < 20) {
+        weightedSupport.points = DensifyBoundary(ring, kDensifyStep);
+        weightedSupport.weights.assign(weightedSupport.points->size(), 1.0);
+    }
+    // 鏀拺鐐硅繃澶氭椂闄嶉噰鏍凤細computeModelResolution 鏄?O(N虏)锛孋eres/鎷撴墤淇涔熼殢鐐规暟鍙樿吹
+    // Ceres only uses XY. A 3D voxel grid keeps repeated wall locations at
+    // different heights and unintentionally gives tall walls more influence.
+    auto downsampled = DownsampleSupport2DWithWeights(weightedSupport, kSupportVoxelLeaf);
+    if (downsampled.points && !downsampled.points->empty()) weightedSupport = downsampled;
+    auto downsampledWall = DownsampleSupport2DWithWeights(wallOnlySupport, kSupportVoxelLeaf);
+    if (downsampledWall.points && !downsampledWall.points->empty()) wallOnlySupport = downsampledWall;
+    ApplySupportDensityWeights(weightedSupport);
+    auto support = weightedSupport.points;
+    if (debugSupport) {
+        debugSupport->assign(support->points.begin(), support->points.end());
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    g_supportTime += std::chrono::duration<double>(t1 - t0).count();
+
+    if (BoundingBoxArea2D(ring) < kSmallBuildingBBoxArea) {
+        double direction = 0.0;
+        double peakRatio = 0.0;
+        double axisRatio = 1.0;
+        std::size_t pairCount = 0;
+        const char* source = "ring_pca";
+        if (outlineRegular::estimateSupportDirection2D(
+                wallOnlySupport.points, direction, peakRatio, pairCount)) {
+            source = "wall_pairs";
+        } else if (outlineRegular::estimatePcaDirection2D(
+                       support, direction, axisRatio)) {
+            source = "support_pca";
+        } else {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr ringCloud(new pcl::PointCloud<pcl::PointXYZ>);
+            ringCloud->points.assign(ring.begin(), ring.end());
+            outlineRegular::estimatePcaDirection2D(ringCloud, direction, axisRatio);
+        }
+        std::vector<pcl::PointXYZ> rectangle = OrientedBoundingRectangle(ring, direction);
+        if (rectangle.size() == 4) {
+            if (debugBestHypothesis) *debugBestHypothesis = rectangle;
+            std::cerr << "[SmallBuilding] bbox_area=" << BoundingBoxArea2D(ring)
+                      << " direction_deg=" << direction * 180.0 / M_PI
+                      << " source=" << source
+                      << " peak_ratio=" << peakRatio
+                      << " pairs=" << pairCount
+                      << " axis_ratio=" << axisRatio << std::endl;
+            return rectangle;
+        }
+    }
+
+    // ---- 瑙勫垯鍖栦紭鍖?璁℃椂) ----
+    // The AI mask is the initial contour, not an independent DLG observation.
+    outlineRegular regularizer(ring, support, weightedSupport.weights);
+    double wallDirection = 0.0;
+    double wallPeakRatio = 0.0;
+    std::size_t wallPairCount = 0;
+    outlineRegular::estimateSupportDirection2D(
+        wallOnlySupport.points, wallDirection, wallPeakRatio, wallPairCount);
+    regularizer.setSupportDirectionHint(wallDirection, wallPeakRatio, wallPairCount);
+    auto t2 = std::chrono::steady_clock::now();
+    regularizer.regular_Contour();
+    auto t3 = std::chrono::steady_clock::now();
+    g_optimizeTime += std::chrono::duration<double>(t3 - t2).count();
+
+    if (debugBestHypothesis) {
+        *debugBestHypothesis = regularizer.getBestEnergyHypothesis();
+        if (debugBestHypothesis->size() < 3) *debugBestHypothesis = ring;
+        RemoveClosingDuplicate(*debugBestHypothesis);
+    }
+
+    std::vector<pcl::PointXYZ> result;
+    if (regularizer.final_points && regularizer.final_points->size() >= 3) {
+        result.assign(regularizer.final_points->points.begin(), regularizer.final_points->points.end());
+    } else {
+        result = ring;
+    }
+    RemoveClosingDuplicate(result);
+    return result.size() >= 3 ? result : ring;
+}
+
+double BoundingBoxArea2D(const std::vector<pcl::PointXYZ>& ring)
+{
+    if (ring.empty()) return 0.0;
+    double min_x = ring.front().x;
+    double max_x = ring.front().x;
+    double min_y = ring.front().y;
+    double max_y = ring.front().y;
+    for (const auto& p : ring) {
+        min_x = std::min(min_x, static_cast<double>(p.x));
+        max_x = std::max(max_x, static_cast<double>(p.x));
+        min_y = std::min(min_y, static_cast<double>(p.y));
+        max_y = std::max(max_y, static_cast<double>(p.y));
+    }
+    return std::max(0.0, max_x - min_x) * std::max(0.0, max_y - min_y);
+}
+
+double PolygonArea2D(const std::vector<pcl::PointXYZ>& ring)
+{
+    if (ring.size() < 3) return 0.0;
+    double area = 0.0;
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % ring.size()];
+        area += static_cast<double>(a.x) * b.y - static_cast<double>(b.x) * a.y;
+    }
+    return std::abs(area) * 0.5;
+}
+
+std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
+    const std::vector<pcl::PointXYZ>& ring,
+    double angle)
+{
+    std::vector<pcl::PointXYZ> result;
+    if (ring.size() < 3) return result;
+    const double ux = std::cos(angle);
+    const double uy = std::sin(angle);
+    const double vx = -uy;
+    const double vy = ux;
+    double minU = std::numeric_limits<double>::max();
+    double maxU = -std::numeric_limits<double>::max();
+    double minV = std::numeric_limits<double>::max();
+    double maxV = -std::numeric_limits<double>::max();
+    for (const auto& p : ring) {
+        const double u = p.x * ux + p.y * uy;
+        const double v = p.x * vx + p.y * vy;
+        minU = std::min(minU, u);
+        maxU = std::max(maxU, u);
+        minV = std::min(minV, v);
+        maxV = std::max(maxV, v);
+    }
+    const float z = ring.front().z;
+    auto point = [&](double u, double v) {
+        return pcl::PointXYZ(static_cast<float>(u * ux + v * vx),
+            static_cast<float>(u * uy + v * vy), z);
+    };
+    result = { point(minU, minV), point(maxU, minV),
+               point(maxU, maxV), point(minU, maxV) };
+    return result;
+}
+
+bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring)
+{
+    return ring.size() >= 3 &&
+        PolygonArea2D(ring) >= kMinOutputPolygonArea &&
+        BoundingBoxArea2D(ring) >= kMinOutputPolygonBBoxArea;
+}
+
+bool RingHasModelCoverage(
+    const std::vector<pcl::PointXYZ>& ring,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree)
+{
+    if (ring.size() < 3 || !sampled || !sampled->cloud || sampled->cloud->empty() || !kdtree) {
+        return false;
+    }
+
+    double minX = ring.front().x;
+    double maxX = ring.front().x;
+    double minY = ring.front().y;
+    double maxY = ring.front().y;
+    for (const auto& p : ring) {
+        minX = std::min(minX, static_cast<double>(p.x));
+        maxX = std::max(maxX, static_cast<double>(p.x));
+        minY = std::min(minY, static_cast<double>(p.y));
+        maxY = std::max(maxY, static_cast<double>(p.y));
+    }
+
+    const Eigen::Vector3f cloudMin = sampled->boundingBox.min();
+    const Eigen::Vector3f cloudMax = sampled->boundingBox.max();
+    if (maxX + kModelCoverageBuffer < cloudMin.x() ||
+        minX - kModelCoverageBuffer > cloudMax.x() ||
+        maxY + kModelCoverageBuffer < cloudMin.y() ||
+        minY - kModelCoverageBuffer > cloudMax.y()) {
+        return false;
+    }
+
+    const double centerX = (minX + maxX) * 0.5;
+    const double centerY = (minY + maxY) * 0.5;
+    const double halfWidth = (maxX - minX) * 0.5 + kModelCoverageBuffer;
+    const double halfHeight = (maxY - minY) * 0.5 + kModelCoverageBuffer;
+    const float radius = static_cast<float>(std::hypot(halfWidth, halfHeight) + 1e-3);
+
+    pcl::PointXYZ center;
+    center.x = static_cast<float>(centerX);
+    center.y = static_cast<float>(centerY);
+    center.z = 0.0f;
+    std::vector<int> candidates;
+    std::vector<float> distances;
+    kdtree->radiusSearch(center, radius, candidates, distances);
+
+    std::size_t evidenceCount = 0;
+    for (int index : candidates) {
+        if (index < 0 || static_cast<std::size_t>(index) >= sampled->cloud->size()) continue;
+        const auto& source = sampled->cloud->points[static_cast<std::size_t>(index)];
+        if (source.x < minX - kModelCoverageBuffer || source.x > maxX + kModelCoverageBuffer ||
+            source.y < minY - kModelCoverageBuffer || source.y > maxY + kModelCoverageBuffer) {
+            continue;
+        }
+
+        pcl::PointXYZ point;
+        point.x = source.x;
+        point.y = source.y;
+        point.z = source.z;
+        bool supported = PointInPolygon2D(point, ring);
+        if (!supported) {
+            for (std::size_t i = 0; i < ring.size(); ++i) {
+                if (PointToSegmentDistance2D(point, ring[i], ring[(i + 1) % ring.size()]) <=
+                    kModelCoverageBuffer) {
+                    supported = true;
+                    break;
+                }
+            }
+        }
+        if (supported && ++evidenceCount >= kMinModelEvidencePoints) return true;
+    }
+    return false;
+}
+
+SupportOwnershipContext BuildSupportOwnershipContext(
+    OGRLayer* layer,
+    const Eigen::Vector3d& metadataOffset,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree)
+{
+    SupportOwnershipContext context;
+    if (!layer) return context;
+
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (!geometry) {
+            OGRFeature::DestroyFeature(feature);
+            continue;
+        }
+
+        const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+        if (type == wkbPolygon) {
+            auto ring = ExtractExteriorRing(geometry->toPolygon(), metadataOffset);
+            if (BoundingBoxArea2D(ring) >= kMinPolygonBBoxArea &&
+                RingHasModelCoverage(ring, sampled, kdtree)) {
+                InitialRingRecord record;
+                record.sourceFid = feature->GetFID();
+                record.ringIndex = 0;
+                record.ring = std::move(ring);
+                context.addRecord(std::move(record));
+            }
+        } else if (type == wkbMultiPolygon) {
+            auto* multi = geometry->toMultiPolygon();
+            int partIndex = 0;
+            for (auto&& part : *multi) {
+                auto ring = ExtractExteriorRing(part->toPolygon(), metadataOffset);
+                if (BoundingBoxArea2D(ring) >= kMinPolygonBBoxArea &&
+                    RingHasModelCoverage(ring, sampled, kdtree)) {
+                    InitialRingRecord record;
+                    record.sourceFid = feature->GetFID();
+                    record.ringIndex = partIndex;
+                    record.ring = std::move(ring);
+                    context.addRecord(std::move(record));
+                }
+                ++partIndex;
+            }
+        }
+
+        OGRFeature::DestroyFeature(feature);
+    }
+    layer->ResetReading();
+    return context;
+}
+
+struct InitialOutlineMergeStats {
+    long long adjacentCandidates = 0;
+    long long keptByModelEvidence = 0;
+    long long keptByShape = 0;
+    long long keptNarrowSeam = 0;     // 鍏变韩杈?kMergeSeamLength(棰?绐勮繛鎺?锛屼笉鍚堝苟
+    long long mergedPairs = 0;
+    long long mergedByBigPair = 0;    // 澶у缓绛戠洿鍚堝苟(璺宠繃璇佹嵁闂?鐨勫鏁帮紝渚夸簬璋?kLargeBuildingMergeArea
+    long long mergedByShape = 0;      // shared-boundary geometry strongly suggests an over-segmentation seam
+    long long removedFeatures = 0;
+    // 褰㈢姸闂?keptByShape)鐨勫瓙鍘熷洜鎷嗗垎(璇婃柇鐢?
+    long long shapeUnionFailed = 0;       // A鈭狟 杩斿洖绌?    long long shapeNotSinglePolygon = 0;  // 骞堕泦涓嶆槸鍗曚釜 wkbPolygon(甯歌浜庢爡鏍煎皬缂濋殭鈫扢ultiPolygon)
+    long long shapePerimeterRatio = 0;    // 鍏变韩杈瑰崰鍛ㄩ暱姣?< kMinSharedPerimeterRatio
+    long long shapeCompactness = 0;       // 绱у噾搴︽敹鐩?> kMaxSplitCompactnessGainForMerge
+    double maxCompactnessGain = 0.0;      // 瑙傚療鍒扮殑鏈€澶х揣鍑戝害澧炵泭(鍒ゆ柇闃堝€艰鏀惧澶氬皯)
+    long long mergedByParent = 0;
+};
+
+struct OutlineFeatureRecord {
+    GIntBig fid = OGRNullFID;
+    std::unique_ptr<OGRGeometry> geometry;
+    OGREnvelope envelope = {};
+    double area = 0.0;
+    double perimeter = 0.0;
+    int parent = -1;   // 鎵€灞炲師濮嬭繛閫氬垎閲?<=0 琛ㄧず鏈煡锛屼笉鍙備笌鍚屾簮鍚堝苟)
+};
+
+struct OutputOverlapRepairStats {
+    long long candidatePairs = 0;
+    long long overlapPairs = 0;
+    long long resolvedPairs = 0;
+    long long unresolvedPairs = 0;
+    long long shiftedFeatures = 0;
+    long long optimizedGroups = 0;
+    double maxOverlapArea = 0.0;
+    double maxShiftDistance = 0.0;
+};
+
+struct SeamSegment {
+    pcl::PointXYZ a;
+    pcl::PointXYZ b;
+};
+
+struct SeamEvidence {
+    double wallRatio = 0.0;
+    double heightRatio = 0.0;
+    int modelSampleCount = 0;
+    int wallCount = 0;
+    int heightPairCount = 0;
+    int heightDifferenceCount = 0;
+};
+
+struct NarrowNeckSplitStats {
+    long long inspectedFeatures = 0;
+    long long splitFeatures = 0;
+    long long cuts = 0;
+    long long createdParts = 0;
+    long long candidateOnly = 0;
+    long long rejectedInvalidRing = 0;
+    long long rejectedSmallPartArea = 0;
+    long long rejectedInvalidPolygon = 0;
+    long long debugRejectLogs = 0;
+};
+
+constexpr int kNarrowNeckDebugRejectLogLimit = 24;
+
+void CopyFieldValues(OGRFeature* src, OGRFeature* dst);
+
+double GeometryLength(OGRGeometry* geometry)
+{
+    return geometry ? OGR_G_Length(OGRGeometry::ToHandle(geometry)) : 0.0;
+}
+
+double GeometryArea(const OGRGeometry* geometry)
+{
+    return geometry ? OGR_G_Area(OGRGeometry::ToHandle(const_cast<OGRGeometry*>(geometry))) : 0.0;
+}
+
+double GeometryPerimeter(OGRGeometry* geometry)
+{
+    if (!geometry) return 0.0;
+    std::unique_ptr<OGRGeometry> boundary(geometry->Boundary());
+    return GeometryLength(boundary.get());
+}
+
+struct NarrowNeckCandidate {
+    double ax = 0.0;
+    double ay = 0.0;
+    double bx = 0.0;
+    double by = 0.0;
+    double width = std::numeric_limits<double>::max();
+    double boundarySeparation = 0.0;
+    std::size_t vertexA = 0;
+    std::size_t vertexB = 0;
+};
+
+struct Point2D64 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+double Distance2D64(const Point2D64& a, const Point2D64& b)
+{
+    return std::hypot(a.x - b.x, a.y - b.y);
+}
+
+std::vector<Point2D64> ExtractExteriorRing64(OGRPolygon* polygon)
+{
+    std::vector<Point2D64> ring;
+    if (!polygon || !polygon->getExteriorRing()) return ring;
+    OGRLinearRing* ogrRing = polygon->getExteriorRing();
+    for (int i = 0; i < ogrRing->getNumPoints(); ++i) {
+        ring.push_back({ogrRing->getX(i), ogrRing->getY(i), ogrRing->getZ(i)});
+    }
+    if (ring.size() >= 2 && Distance2D64(ring.front(), ring.back()) < 1e-9) {
+        ring.pop_back();
+    }
+    return ring;
+}
+
+double PolygonArea2D64(const std::vector<Point2D64>& ring)
+{
+    if (ring.size() < 3) return 0.0;
+    double area = 0.0;
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % ring.size()];
+        area += a.x * b.y - b.x * a.y;
+    }
+    return std::abs(area) * 0.5;
+}
+
+bool PointInPolygon2D64(const Point2D64& p, const std::vector<Point2D64>& poly)
+{
+    bool inside = false;
+    const std::size_t n = poly.size();
+    if (n < 3) return false;
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+        const auto& pi = poly[i];
+        const auto& pj = poly[j];
+        const bool intersect = ((pi.y > p.y) != (pj.y > p.y)) &&
+            (p.x < (pj.x - pi.x) * (p.y - pi.y) / ((pj.y - pi.y) + 1e-12) + pi.x);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+double Orient2D64(const Point2D64& a, const Point2D64& b, const Point2D64& c)
+{
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+bool OnSegment2D64(const Point2D64& a, const Point2D64& b, const Point2D64& p)
+{
+    constexpr double eps = 1e-8;
+    if (std::abs(Orient2D64(a, b, p)) > eps) return false;
+    return p.x >= std::min(a.x, b.x) - eps && p.x <= std::max(a.x, b.x) + eps &&
+           p.y >= std::min(a.y, b.y) - eps && p.y <= std::max(a.y, b.y) + eps;
+}
+
+bool SegmentsIntersect2D64(
+    const Point2D64& a,
+    const Point2D64& b,
+    const Point2D64& c,
+    const Point2D64& d)
+{
+    constexpr double eps = 1e-8;
+    const double o1 = Orient2D64(a, b, c);
+    const double o2 = Orient2D64(a, b, d);
+    const double o3 = Orient2D64(c, d, a);
+    const double o4 = Orient2D64(c, d, b);
+
+    if (((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps)) &&
+        ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps))) {
+        return true;
+    }
+    if (std::abs(o1) <= eps && OnSegment2D64(a, b, c)) return true;
+    if (std::abs(o2) <= eps && OnSegment2D64(a, b, d)) return true;
+    if (std::abs(o3) <= eps && OnSegment2D64(c, d, a)) return true;
+    if (std::abs(o4) <= eps && OnSegment2D64(c, d, b)) return true;
+    return false;
+}
+
+bool EdgeTouchesVertex(std::size_t edgeIndex, std::size_t vertexIndex, std::size_t vertexCount)
+{
+    return edgeIndex == vertexIndex || ((edgeIndex + 1) % vertexCount) == vertexIndex;
+}
+
+bool NeckCutLineInsidePolygon2D64(
+    const std::vector<Point2D64>& ring,
+    std::size_t vertexA,
+    std::size_t vertexB)
+{
+    const std::size_t n = ring.size();
+    if (n < 4 || vertexA >= n || vertexB >= n || vertexA == vertexB) return false;
+    const Point2D64& a = ring[vertexA];
+    const Point2D64& b = ring[vertexB];
+
+    // Interior samples reject chords that pass through exterior space.
+    constexpr int sampleCount = 7;
+    for (int s = 1; s < sampleCount; ++s) {
+        const double t = static_cast<double>(s) / sampleCount;
+        Point2D64 p;
+        p.x = a.x * (1.0 - t) + b.x * t;
+        p.y = a.y * (1.0 - t) + b.y * t;
+        p.z = a.z * (1.0 - t) + b.z * t;
+        if (!PointInPolygon2D64(p, ring)) return false;
+    }
+
+    // A valid internal chord may only touch the original boundary at its two
+    // endpoints. Any other boundary intersection means the line leaves the
+    // polygon or crosses another lobe.
+    for (std::size_t edge = 0; edge < n; ++edge) {
+        if (EdgeTouchesVertex(edge, vertexA, n) ||
+            EdgeTouchesVertex(edge, vertexB, n)) {
+            continue;
+        }
+        if (SegmentsIntersect2D64(a, b, ring[edge], ring[(edge + 1) % n])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+OGRPolygon* MakePolygon64(const std::vector<Point2D64>& ring)
+{
+    if (ring.size() < 3) return nullptr;
+    auto* polygon = new OGRPolygon();
+    OGRLinearRing ogrRing;
+    for (const auto& p : ring) {
+        ogrRing.addPoint(p.x, p.y, p.z);
+    }
+    ogrRing.addPoint(ring.front().x, ring.front().y, ring.front().z);
+    polygon->addRing(&ogrRing);
+    return polygon;
+}
+
+struct ClosestSegmentPoints2D {
+    double ax = 0.0;
+    double ay = 0.0;
+    double bx = 0.0;
+    double by = 0.0;
+    double ta = 0.0;
+    double tb = 0.0;
+    double distance = std::numeric_limits<double>::max();
+};
+
+double Clamp01(double value)
+{
+    return std::max(0.0, std::min(1.0, value));
+}
+
+ClosestSegmentPoints2D ClosestPointsOnSegments2D(
+    const pcl::PointXYZ& a0,
+    const pcl::PointXYZ& a1,
+    const pcl::PointXYZ& b0,
+    const pcl::PointXYZ& b1)
+{
+    const double ux = a1.x - a0.x;
+    const double uy = a1.y - a0.y;
+    const double vx = b1.x - b0.x;
+    const double vy = b1.y - b0.y;
+    const double wx = a0.x - b0.x;
+    const double aa = ux * ux + uy * uy;
+    const double bb = ux * vx + uy * vy;
+    const double cc = vx * vx + vy * vy;
+    const double dd = ux * wx;
+    const double ee = vx * wx;
+    const double denom = aa * cc - bb * bb;
+
+    double s = 0.0;
+    double t = 0.0;
+    if (aa <= 1e-12 && cc <= 1e-12) {
+        s = t = 0.0;
+    } else if (aa <= 1e-12) {
+        s = 0.0;
+        t = Clamp01(ee / cc);
+    } else if (cc <= 1e-12) {
+        t = 0.0;
+        s = Clamp01(-dd / aa);
+    } else if (std::abs(denom) > 1e-12) {
+        s = Clamp01((bb * ee - cc * dd) / denom);
+        t = Clamp01((aa * ee - bb * dd) / denom);
+    } else {
+        s = 0.0;
+        t = Clamp01(ee / cc);
+    }
+
+    // Re-clamp once after fixing one parameter. This is enough for short
+    // raster-outline segments and avoids pulling in a larger geometry library.
+    const double px = a0.x + s * ux;
+    const double py = a0.y + s * uy;
+    t = cc > 1e-12 ? Clamp01(((px - b0.x) * vx + (py - b0.y) * vy) / cc) : 0.0;
+    const double qx = b0.x + t * vx;
+    const double qy = b0.y + t * vy;
+    s = aa > 1e-12 ? Clamp01(((qx - a0.x) * ux + (qy - a0.y) * uy) / aa) : 0.0;
+
+    ClosestSegmentPoints2D result;
+    result.ta = s;
+    result.tb = t;
+    result.ax = a0.x + s * ux;
+    result.ay = a0.y + s * uy;
+    result.bx = b0.x + t * vx;
+    result.by = b0.y + t * vy;
+    result.distance = std::hypot(result.ax - result.bx, result.ay - result.by);
+    return result;
+}
+
+bool CutLineMostlyInsidePolygon(
+    const NarrowNeckCandidate& candidate,
+    const std::vector<pcl::PointXYZ>& ring)
+{
+    for (int i = 1; i <= 5; ++i) {
+        const double t = static_cast<double>(i) / 6.0;
+        pcl::PointXYZ p;
+        p.x = static_cast<float>(candidate.ax * (1.0 - t) + candidate.bx * t);
+        p.y = static_cast<float>(candidate.ay * (1.0 - t) + candidate.by * t);
+        p.z = 0.0f;
+        if (!PointInPolygon2D(p, ring)) return false;
+    }
+    return true;
+}
+
+bool FindNarrowNeckCandidates(
+    const std::vector<Point2D64>& ring,
+    std::vector<NarrowNeckCandidate>& candidates);
+
+bool FindBestNarrowNeckCandidate(
+    const std::vector<Point2D64>& ring,
+    NarrowNeckCandidate& best)
+{
+    std::vector<NarrowNeckCandidate> candidates;
+    if (!FindNarrowNeckCandidates(ring, candidates)) return false;
+    best = candidates.front();
+    return true;
+}
+
+bool FindNarrowNeckCandidates(
+    const std::vector<Point2D64>& ring,
+    std::vector<NarrowNeckCandidate>& candidates)
+{
+    candidates.clear();
+    if (ring.size() < 4) return false;
+
+    const std::size_t n = ring.size();
+    std::vector<double> edgeLengths(n, 0.0);
+    std::vector<double> prefix(n + 1, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        edgeLengths[i] = Distance2D64(ring[i], ring[(i + 1) % n]);
+        prefix[i + 1] = prefix[i] + edgeLengths[i];
+    }
+    const double perimeter = prefix.back();
+    if (perimeter <= 2.0 * kNarrowNeckMinBoundarySeparation) return false;
+
+    // A narrow neck is defined by two non-adjacent boundary vertices.
+    // The two arcs between them become the two new exterior rings.
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            const std::size_t forwardEdges = j - i;
+            const std::size_t backwardEdges = n - forwardEdges;
+            if (forwardEdges < 2 || backwardEdges < 2) continue;
+
+            const double arcA = prefix[j] - prefix[i];
+            const double arcB = perimeter - arcA;
+            const double boundarySeparation = std::min(arcA, arcB);
+            if (arcA < kNarrowNeckMinBoundarySeparation ||
+                arcB < kNarrowNeckMinBoundarySeparation) {
+                continue;
+            }
+
+            const double width = Distance2D64(ring[i], ring[j]);
+            if (width <= 1e-6 || width > kNarrowNeckMaxWidth) continue;
+            if (!NeckCutLineInsidePolygon2D64(ring, i, j)) continue;
+
+            std::vector<Point2D64> ringA;
+            std::vector<Point2D64> ringB;
+            for (std::size_t index = i;; index = (index + 1) % n) {
+                ringA.push_back(ring[index]);
+                if (index == j) break;
+            }
+            for (std::size_t index = j;; index = (index + 1) % n) {
+                ringB.push_back(ring[index]);
+                if (index == i) break;
+            }
+            std::unique_ptr<OGRPolygon> polygonA(MakePolygon64(ringA));
+            std::unique_ptr<OGRPolygon> polygonB(MakePolygon64(ringB));
+            if (!polygonA || !polygonB) continue;
+            const double areaA = GeometryArea(polygonA.get());
+            const double areaB = GeometryArea(polygonB.get());
+            if (areaA < kNarrowNeckMinPartArea || areaB < kNarrowNeckMinPartArea) {
+                continue;
+            }
+
+            NarrowNeckCandidate candidate;
+            candidate.ax = ring[i].x;
+            candidate.ay = ring[i].y;
+            candidate.bx = ring[j].x;
+            candidate.by = ring[j].y;
+            candidate.width = width;
+            candidate.boundarySeparation = boundarySeparation;
+            candidate.vertexA = i;
+            candidate.vertexB = j;
+            candidates.push_back(candidate);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const NarrowNeckCandidate& lhs, const NarrowNeckCandidate& rhs) {
+            if (std::abs(lhs.width - rhs.width) > 1e-6) {
+                return lhs.width < rhs.width;
+            }
+            return lhs.boundarySeparation > rhs.boundarySeparation;
+        });
+    return !candidates.empty();
+}
+
+void CollectPolygonParts(
+    OGRGeometry* geometry,
+    std::vector<std::unique_ptr<OGRGeometry>>& parts)
+{
+    if (!geometry || geometry->IsEmpty()) return;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbPolygon) {
+        if (GeometryArea(geometry) >= kNarrowNeckMinPartArea) {
+            parts.emplace_back(geometry->clone());
+        }
+    } else if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+        auto* collection = geometry->toGeometryCollection();
+        for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+            CollectPolygonParts(collection->getGeometryRef(i), parts);
+        }
+    }
+}
+
+bool SplitOnePolygonAtNarrowNeck(
+OGRPolygon* polygon,
+    std::vector<std::unique_ptr<OGRGeometry>>& splitParts,
+    bool* foundCandidate = nullptr,
+    NarrowNeckSplitStats* stats = nullptr,
+    GIntBig fid = -1)
+{
+    splitParts.clear();
+    if (!polygon || GeometryArea(polygon) < kNarrowNeckMinPartArea * 2.0) return false;
+
+    auto ring = ExtractExteriorRing64(polygon);
+    std::vector<NarrowNeckCandidate> candidates;
+    if (!FindNarrowNeckCandidates(ring, candidates)) return false;
+    if (foundCandidate) *foundCandidate = true;
+
+    const std::size_t n = ring.size();
+    for (const auto& candidate : candidates) {
+        splitParts.clear();
+        const std::size_t a = candidate.vertexA;
+        const std::size_t b = candidate.vertexB;
+        if (a >= n || b >= n || a == b) continue;
+
+        std::vector<Point2D64> ringA;
+        std::vector<Point2D64> ringB;
+        for (std::size_t index = a;; index = (index + 1) % n) {
+            ringA.push_back(ring[index]);
+            if (index == b) break;
+        }
+        for (std::size_t index = b;; index = (index + 1) % n) {
+            ringB.push_back(ring[index]);
+            if (index == a) break;
+        }
+
+        if (ringA.size() < 3 || ringB.size() < 3) {
+            if (stats) {
+                ++stats->rejectedInvalidRing;
+                if (stats->debugRejectLogs < kNarrowNeckDebugRejectLogLimit) {
+                    ++stats->debugRejectLogs;
+                    std::cout << "[Mask neck split reject] fid=" << fid
+                              << " reason=invalid_ring"
+                              << " width=" << candidate.width
+                              << " sep=" << candidate.boundarySeparation
+                              << " vA=" << candidate.vertexA
+                              << " vB=" << candidate.vertexB << std::endl;
+                }
+            }
+            continue;
+        }
+
+        std::unique_ptr<OGRPolygon> polygonA(
+            MakePolygon64(ringA));
+        std::unique_ptr<OGRPolygon> polygonB(
+            MakePolygon64(ringB));
+        if (!polygonA || !polygonB) {
+            if (stats) {
+                ++stats->rejectedInvalidPolygon;
+                if (stats->debugRejectLogs < kNarrowNeckDebugRejectLogLimit) {
+                    ++stats->debugRejectLogs;
+                    std::cout << "[Mask neck split reject] fid=" << fid
+                              << " reason=invalid_polygon"
+                              << " width=" << candidate.width
+                              << " sep=" << candidate.boundarySeparation
+                              << " vA=" << candidate.vertexA
+                              << " vB=" << candidate.vertexB << std::endl;
+                }
+            }
+            continue;
+        }
+        const double areaA = GeometryArea(polygonA.get());
+        const double areaB = GeometryArea(polygonB.get());
+        if (areaA < kNarrowNeckMinPartArea ||
+            areaB < kNarrowNeckMinPartArea) {
+            if (stats) {
+                ++stats->rejectedSmallPartArea;
+                if (stats->debugRejectLogs < kNarrowNeckDebugRejectLogLimit) {
+                    ++stats->debugRejectLogs;
+                    std::cout << "[Mask neck split reject] fid=" << fid
+                              << " reason=small_part_area"
+                              << " width=" << candidate.width
+                              << " sep=" << candidate.boundarySeparation
+                              << " areaA=" << areaA
+                              << " areaB=" << areaB
+                              << " vA=" << candidate.vertexA
+                              << " vB=" << candidate.vertexB << std::endl;
+                }
+            }
+            continue;
+        }
+
+        splitParts.emplace_back(polygonA.release());
+        splitParts.emplace_back(polygonB.release());
+        return true;
+    }
+
+    if (stats) {
+        ++stats->rejectedInvalidPolygon;
+        if (stats->debugRejectLogs < kNarrowNeckDebugRejectLogLimit) {
+            ++stats->debugRejectLogs;
+            std::cout << "[Mask neck split reject] fid=" << fid
+                      << " reason=all_candidates_failed"
+                      << " candidates=" << candidates.size() << std::endl;
+        }
+    }
+    splitParts.clear();
+    return false;
+}
+
+void SplitGeometryAtNarrowNecks(
+    OGRGeometry* geometry,
+    std::vector<std::unique_ptr<OGRGeometry>>& outputParts,
+    long long& cutCount,
+    long long& candidateOnlyCount,
+    NarrowNeckSplitStats* stats = nullptr,
+    GIntBig fid = -1)
+{
+    if (!geometry || geometry->IsEmpty()) return;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+        auto* collection = geometry->toGeometryCollection();
+        for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+            SplitGeometryAtNarrowNecks(
+                collection->getGeometryRef(i), outputParts, cutCount, candidateOnlyCount, stats, fid);
+        }
+        return;
+    }
+    if (type != wkbPolygon) {
+        outputParts.emplace_back(geometry->clone());
+        return;
+    }
+
+    std::vector<std::unique_ptr<OGRGeometry>> pending;
+    pending.emplace_back(geometry->clone());
+    int localCuts = 0;
+    for (int pass = 0;
+         pass < kNarrowNeckMaxCutsPerFeature &&
+         localCuts < kNarrowNeckMaxCutsPerFeature &&
+         !pending.empty();
+         ++pass) {
+        bool splitThisPass = false;
+        std::vector<std::unique_ptr<OGRGeometry>> next;
+        for (auto& item : pending) {
+            auto* polygon = item->toPolygon();
+            std::vector<std::unique_ptr<OGRGeometry>> splitParts;
+            bool foundCandidate = false;
+            if (localCuts < kNarrowNeckMaxCutsPerFeature &&
+                SplitOnePolygonAtNarrowNeck(polygon, splitParts, &foundCandidate, stats, fid)) {
+                ++cutCount;
+                ++localCuts;
+                splitThisPass = true;
+                for (auto& part : splitParts) next.push_back(std::move(part));
+            } else {
+                if (foundCandidate) ++candidateOnlyCount;
+                next.push_back(std::move(item));
+            }
+        }
+        pending = std::move(next);
+        if (!splitThisPass) break;
+    }
+    for (auto& item : pending) outputParts.push_back(std::move(item));
+}
+
+bool SplitInitialOutlinesAtNarrowNecks(
+    const std::string& shpPath,
+    NarrowNeckSplitStats& stats)
+{
+    stats = {};
+    GDALDataset* dataset = static_cast<GDALDataset*>(
+        GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                   nullptr, nullptr, nullptr));
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->GetLayer(0);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+
+    std::vector<GIntBig> fids;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        fids.push_back(feature->GetFID());
+        OGRFeature::DestroyFeature(feature);
+    }
+
+    OGRFeatureDefn* defn = layer->GetLayerDefn();
+    for (GIntBig fid : fids) {
+        OGRFeature* feature = layer->GetFeature(fid);
+        if (!feature) continue;
+        ++stats.inspectedFeatures;
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        std::vector<std::unique_ptr<OGRGeometry>> parts;
+        long long cutsBefore = stats.cuts;
+        SplitGeometryAtNarrowNecks(geometry, parts, stats.cuts, stats.candidateOnly, &stats, fid);
+        if (parts.size() <= 1 || stats.cuts == cutsBefore) {
+            OGRFeature::DestroyFeature(feature);
+            continue;
+        }
+
+        if (layer->DeleteFeature(fid) != OGRERR_NONE) {
+            OGRFeature::DestroyFeature(feature);
+            continue;
+        }
+        ++stats.splitFeatures;
+        stats.createdParts += static_cast<long long>(parts.size());
+        for (auto& part : parts) {
+            OGRFeature* out = OGRFeature::CreateFeature(defn);
+            CopyFieldValues(feature, out);
+            out->SetGeometry(part.get());
+            layer->CreateFeature(out);
+            OGRFeature::DestroyFeature(out);
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+
+    layer->SyncToDisk();
+    GDALClose(dataset);
+    return true;
+}
+
+struct BoundarySegment2D {
+    double ax = 0.0;
+    double ay = 0.0;
+    double bx = 0.0;
+    double by = 0.0;
+    double length = 0.0;
+};
+
+void AddExteriorRingSegments(const OGRLinearRing* ring, std::vector<BoundarySegment2D>& segments)
+{
+    if (!ring || ring->getNumPoints() < 2) return;
+    for (int i = 1; i < ring->getNumPoints(); ++i) {
+        BoundarySegment2D segment;
+        segment.ax = ring->getX(i - 1);
+        segment.ay = ring->getY(i - 1);
+        segment.bx = ring->getX(i);
+        segment.by = ring->getY(i);
+        segment.length = std::hypot(segment.bx - segment.ax, segment.by - segment.ay);
+        if (segment.length > 1e-6) segments.push_back(segment);
+    }
+}
+
+void CollectExteriorBoundarySegments(const OGRGeometry* geometry, std::vector<BoundarySegment2D>& segments)
+{
+    if (!geometry) return;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbPolygon) {
+        const auto* polygon = geometry->toPolygon();
+        if (polygon) AddExteriorRingSegments(polygon->getExteriorRing(), segments);
+    } else if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+        const auto* collection = geometry->toGeometryCollection();
+        for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+            CollectExteriorBoundarySegments(collection->getGeometryRef(i), segments);
+        }
+    }
+}
+
+double PointLineDistance2D(double x, double y, const BoundarySegment2D& segment)
+{
+    const double dx = segment.bx - segment.ax;
+    const double dy = segment.by - segment.ay;
+    return std::abs((x - segment.ax) * dy - (y - segment.ay) * dx) /
+        std::max(segment.length, 1e-9);
+}
+
+double SegmentProjectionOverlap2D(
+    const BoundarySegment2D& a,
+    const BoundarySegment2D& b,
+    double tolerance)
+{
+    const double aux = (a.bx - a.ax) / a.length;
+    const double auy = (a.by - a.ay) / a.length;
+    const double bux = (b.bx - b.ax) / b.length;
+    const double buy = (b.by - b.ay) / b.length;
+    const double angleCos = std::abs(aux * bux + auy * buy);
+    const double minCos = std::cos(kRobustSharedAngleToleranceDeg * M_PI / 180.0);
+    if (angleCos < minCos) return 0.0;
+
+    const double distB0 = PointLineDistance2D(b.ax, b.ay, a);
+    const double distB1 = PointLineDistance2D(b.bx, b.by, a);
+    const double midAx = 0.5 * (a.ax + a.bx);
+    const double midAy = 0.5 * (a.ay + a.by);
+    const double distAmid = PointLineDistance2D(midAx, midAy, b);
+    if (std::min(distB0, distB1) > tolerance && distAmid > tolerance) {
+        return 0.0;
+    }
+
+    const double b0 = (b.ax - a.ax) * aux + (b.ay - a.ay) * auy;
+    const double b1 = (b.bx - a.ax) * aux + (b.by - a.ay) * auy;
+    const double lo = std::max(0.0, std::min(b0, b1));
+    const double hi = std::min(a.length, std::max(b0, b1));
+    return std::max(0.0, hi - lo);
+}
+
+double RobustSharedBoundaryLength(
+    const OGRGeometry* a,
+    const OGRGeometry* b,
+    double exactSharedLength)
+{
+    std::vector<BoundarySegment2D> segmentsA;
+    std::vector<BoundarySegment2D> segmentsB;
+    CollectExteriorBoundarySegments(a, segmentsA);
+    CollectExteriorBoundarySegments(b, segmentsB);
+    if (segmentsA.empty() || segmentsB.empty()) return exactSharedLength;
+
+    double robustLength = 0.0;
+    for (const auto& sa : segmentsA) {
+        for (const auto& sb : segmentsB) {
+            robustLength += SegmentProjectionOverlap2D(
+                sa, sb, kRobustSharedBoundaryTolerance);
+        }
+    }
+    return std::max(exactSharedLength, robustLength);
+}
+
+std::unique_ptr<OGRGeometry> CleanMergedGeometry(const OGRGeometry* geometry)
+{
+    if (!geometry) return nullptr;
+    std::unique_ptr<OGRGeometry> cleaned(geometry->clone());
+    if (!cleaned) return nullptr;
+
+    // First remove self-intersection artifacts produced by Union/Buffer(0).
+    if (!cleaned->IsValid()) {
+        std::unique_ptr<OGRGeometry> fixed(cleaned->Buffer(0.0));
+        if (fixed) cleaned = std::move(fixed);
+    }
+
+    // Then smooth tiny raster seams while preserving topology.
+    std::unique_ptr<OGRGeometry> simplified(
+        cleaned->SimplifyPreserveTopology(kInitialMergeSimplifyTolerance));
+    if (simplified && !simplified->IsEmpty()) {
+        cleaned = std::move(simplified);
+    }
+
+    if (!cleaned->IsValid()) {
+        std::unique_ptr<OGRGeometry> fixed(cleaned->Buffer(0.0));
+        if (fixed) cleaned = std::move(fixed);
+    }
+    return cleaned;
+}
+
+bool ShouldMergeByFootprintShape(
+    const OutlineFeatureRecord& a,
+    const OutlineFeatureRecord& b,
+    double sharedLength)
+{
+    if (!a.geometry || !b.geometry) return false;
+    const double smallerPerimeter = std::max(1e-9, std::min(a.perimeter, b.perimeter));
+    const double sharedRatio = sharedLength / smallerPerimeter;
+    if (sharedLength < kShapeMergeMinSharedLength &&
+        sharedRatio < kShapeMergeMinSharedPerimeterRatio) {
+        return false;
+    }
+
+    std::unique_ptr<OGRGeometry> merged(a.geometry->Union(b.geometry.get()));
+    merged = CleanMergedGeometry(merged.get());
+    if (!merged || merged->IsEmpty() ||
+        wkbFlatten(merged->getGeometryType()) != wkbPolygon) {
+        return false;
+    }
+
+    const double mergedArea = GeometryArea(merged.get());
+    const double areaSum = a.area + b.area;
+    if (mergedArea <= 0.0 || mergedArea > areaSum * 1.02) return false;
+
+    const double mergedPerimeter = GeometryPerimeter(merged.get());
+    const double expectedPerimeter = std::max(0.0, a.perimeter + b.perimeter - 2.0 * sharedLength);
+    if (expectedPerimeter > 1e-6 &&
+        std::abs(mergedPerimeter - expectedPerimeter) / expectedPerimeter > 0.25) {
+        return false;
+    }
+
+    return true;
+}
+
+double Compactness(double area, double perimeter)
+{
+    return area > 0.0 && perimeter > 0.0
+        ? 4.0 * M_PI * area / (perimeter * perimeter) : 0.0;
+}
+
+bool HasMeaningfulGeometryOverlap(
+    const OGRGeometry* a,
+    const OGRGeometry* b,
+    double& overlapArea)
+{
+    overlapArea = 0.0;
+    if (!a || !b) return false;
+    if (!a->Intersects(b)) return false;
+
+    std::unique_ptr<OGRGeometry> overlap(a->Intersection(b));
+    overlapArea = GeometryArea(overlap.get());
+    if (overlapArea < kOutputOverlapMinArea) return false;
+
+    const double areaA = GeometryArea(a);
+    const double areaB = GeometryArea(b);
+    const double smaller = std::max(1e-9, std::min(areaA, areaB));
+    return overlapArea / smaller >= kOutputOverlapMinRatio;
+}
+
+bool GeometryCentroid2D(const OGRGeometry* geometry, double& x, double& y)
+{
+    x = y = 0.0;
+    if (!geometry || geometry->IsEmpty()) return false;
+    OGRPoint centroid;
+    if (const auto* surface = dynamic_cast<const OGRSurface*>(geometry)) {
+        if (const_cast<OGRSurface*>(surface)->Centroid(&centroid) == OGRERR_NONE) {
+            x = centroid.getX();
+            y = centroid.getY();
+            return true;
+        }
+    }
+    OGREnvelope env;
+    geometry->getEnvelope(&env);
+    x = 0.5 * (env.MinX + env.MaxX);
+    y = 0.5 * (env.MinY + env.MaxY);
+    return true;
+}
+
+std::unique_ptr<OGRGeometry> TranslateGeometry2D(
+    const OGRGeometry* geometry,
+    double dx,
+    double dy)
+{
+    if (!geometry) return nullptr;
+    std::unique_ptr<OGRGeometry> moved(geometry->clone());
+    if (!moved) return nullptr;
+
+    std::function<void(OGRGeometry*)> translate = [&](OGRGeometry* g) {
+        if (!g) return;
+        const OGRwkbGeometryType type = wkbFlatten(g->getGeometryType());
+        if (type == wkbPoint) {
+            auto* p = g->toPoint();
+            p->setX(p->getX() + dx);
+            p->setY(p->getY() + dy);
+        } else if (type == wkbLineString || type == wkbLinearRing) {
+            auto* line = g->toLineString();
+            for (int i = 0; i < line->getNumPoints(); ++i) {
+                line->setPoint(i, line->getX(i) + dx, line->getY(i) + dy, line->getZ(i));
+            }
+        } else if (type == wkbPolygon) {
+            auto* polygon = g->toPolygon();
+            if (polygon->getExteriorRing()) translate(polygon->getExteriorRing());
+            for (int i = 0; i < polygon->getNumInteriorRings(); ++i) {
+                translate(polygon->getInteriorRing(i));
+            }
+        } else if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+            auto* collection = g->toGeometryCollection();
+            for (int i = 0; i < collection->getNumGeometries(); ++i) {
+                translate(collection->getGeometryRef(i));
+            }
+        }
+    };
+    translate(moved.get());
+    return moved;
+}
+
+bool TryResolvePairByTranslation(
+    const OGRGeometry* fixed,
+    const OGRGeometry* moving,
+    double overlapArea,
+    std::unique_ptr<OGRGeometry>& resolved,
+    double& shiftDistance)
+{
+    resolved.reset();
+    shiftDistance = 0.0;
+    if (!fixed || !moving) return false;
+
+    double fixedCx = 0.0, fixedCy = 0.0;
+    double movingCx = 0.0, movingCy = 0.0;
+    if (!GeometryCentroid2D(fixed, fixedCx, fixedCy) ||
+        !GeometryCentroid2D(moving, movingCx, movingCy)) {
+        return false;
+    }
+
+    double vx = movingCx - fixedCx;
+    double vy = movingCy - fixedCy;
+    double len = std::hypot(vx, vy);
+    if (len < 1e-6) {
+        OGREnvelope fixedEnv, movingEnv;
+        fixed->getEnvelope(&fixedEnv);
+        moving->getEnvelope(&movingEnv);
+        const double gapX = std::min(std::abs(movingEnv.MaxX - fixedEnv.MinX),
+                                     std::abs(fixedEnv.MaxX - movingEnv.MinX));
+        const double gapY = std::min(std::abs(movingEnv.MaxY - fixedEnv.MinY),
+                                     std::abs(fixedEnv.MaxY - movingEnv.MinY));
+        if (gapX <= gapY) {
+            vx = movingCx >= fixedCx ? 1.0 : -1.0;
+            vy = 0.0;
+        } else {
+            vx = 0.0;
+            vy = movingCy >= fixedCy ? 1.0 : -1.0;
+        }
+        len = 1.0;
+    }
+    vx /= len;
+    vy /= len;
+
+    const double areaScale = std::sqrt(std::max(std::min(GeometryArea(fixed), GeometryArea(moving)), 1.0));
+    const double baseStep = std::clamp(std::sqrt(std::max(overlapArea, 0.0)) * 0.35, 0.05, 0.6);
+    const double maxShift = std::clamp(0.08 * areaScale, 0.5, 3.0);
+    const int maxSteps = std::max(4, static_cast<int>(std::ceil(maxShift / baseStep)));
+    for (int step = 1; step <= maxSteps; ++step) {
+        const double distance = std::min(maxShift, baseStep * step);
+        std::unique_ptr<OGRGeometry> candidate = TranslateGeometry2D(moving, vx * distance, vy * distance);
+        if (!candidate || candidate->IsEmpty()) continue;
+        double remainingOverlap = 0.0;
+        if (!HasMeaningfulGeometryOverlap(fixed, candidate.get(), remainingOverlap)) {
+            resolved = std::move(candidate);
+            shiftDistance = distance;
+            return true;
+        }
+    }
+    return false;
+}
+
+struct GroupEdgeLine {
+    double theta = 0.0;
+    double nx = 0.0;
+    double ny = 0.0;
+    double initialD = 0.0;
+    double d = 0.0;
+    double insideSign = 1.0;
+};
+
+struct GroupBuildingModel {
+    GIntBig fid = OGRNullFID;
+    std::vector<pcl::PointXYZ> initialRing;
+    std::vector<pcl::PointXYZ> ring;
+    std::vector<GroupEdgeLine> edges;
+    double area = 0.0;
+};
+
+struct DRegularizerResidual {
+    explicit DRegularizerResidual(double initialD, double weight)
+        : initialD_(initialD), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const d, T* residual) const {
+        residual[0] = T(weight_) * (d[0] - T(initialD_));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double initialD, double weight) {
+        return new ceres::AutoDiffCostFunction<DRegularizerResidual, 1, 1>(
+            new DRegularizerResidual(initialD, weight));
+    }
+
+    double initialD_;
+    double weight_;
+};
+
+struct IntrusionHalfspaceResidual {
+    IntrusionHalfspaceResidual(double x, double y, double nx, double ny,
+                               double insideSign, double margin, double weight)
+        : x_(x), y_(y), nx_(nx), ny_(ny),
+          insideSign_(insideSign), margin_(margin), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const d, T* residual) const {
+        const T signedInside = T(insideSign_) * (T(nx_) * T(x_) + T(ny_) * T(y_) - d[0]);
+        residual[0] = T(weight_) * (signedInside + T(margin_));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double x, double y, double nx, double ny,
+                                       double insideSign, double margin, double weight) {
+        return new ceres::AutoDiffCostFunction<IntrusionHalfspaceResidual, 1, 1>(
+            new IntrusionHalfspaceResidual(x, y, nx, ny, insideSign, margin, weight));
+    }
+
+    double x_;
+    double y_;
+    double nx_;
+    double ny_;
+    double insideSign_;
+    double margin_;
+    double weight_;
+};
+
+bool LineIntersection2D(
+    const GroupEdgeLine& a,
+    const GroupEdgeLine& b,
+    double& x,
+    double& y)
+{
+    const double det = a.nx * b.ny - b.nx * a.ny;
+    if (std::abs(det) < 1e-8) return false;
+    x = (a.d * b.ny - b.d * a.ny) / det;
+    y = (a.nx * b.d - b.nx * a.d) / det;
+    return std::isfinite(x) && std::isfinite(y);
+}
+
+bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
+    GroupBuildingModel& model)
+{
+    model = {};
+    if (!feature.geometry || wkbFlatten(feature.geometry->getGeometryType()) != wkbPolygon) {
+        return false;
+    }
+    OGRPolygon* polygon = feature.geometry->toPolygon();
+    if (!polygon) return false;
+
+    model.fid = feature.fid;
+    model.initialRing = ExtractExteriorRing(polygon, Eigen::Vector3d::Zero());
+    RemoveClosingDuplicate(model.initialRing);
+    if (model.initialRing.size() < 3) return false;
+    model.ring = model.initialRing;
+    model.area = std::max(GeometryArea(feature.geometry.get()), PolygonArea2D(model.ring));
+
+    double cx = 0.0;
+    double cy = 0.0;
+    for (const auto& p : model.ring) {
+        cx += p.x;
+        cy += p.y;
+    }
+    cx /= static_cast<double>(model.ring.size());
+    cy /= static_cast<double>(model.ring.size());
+
+    model.edges.reserve(model.ring.size());
+    for (std::size_t i = 0; i < model.ring.size(); ++i) {
+        const auto& a = model.ring[i];
+        const auto& b = model.ring[(i + 1) % model.ring.size()];
+        const double dx = b.x - a.x;
+        const double dy = b.y - a.y;
+        const double len = std::hypot(dx, dy);
+        if (len < 1e-6) return false;
+
+        GroupEdgeLine edge;
+        edge.theta = std::atan2(dy, dx);
+        edge.nx = -std::sin(edge.theta);
+        edge.ny = std::cos(edge.theta);
+        edge.initialD = edge.nx * a.x + edge.ny * a.y;
+        edge.d = edge.initialD;
+        const double centroidSigned = edge.nx * cx + edge.ny * cy - edge.d;
+        edge.insideSign = centroidSigned >= 0.0 ? 1.0 : -1.0;
+        model.edges.push_back(edge);
+    }
+    return model.edges.size() == model.ring.size();
+}
+
+bool ReconstructGroupRing(GroupBuildingModel& model)
+{
+    if (model.edges.size() < 3) return false;
+    std::vector<pcl::PointXYZ> rebuilt;
+    rebuilt.reserve(model.edges.size());
+    const float z = model.initialRing.empty() ? 0.0f : model.initialRing.front().z;
+    for (std::size_t i = 0; i < model.edges.size(); ++i) {
+        const std::size_t previous = (i + model.edges.size() - 1) % model.edges.size();
+        double x = 0.0;
+        double y = 0.0;
+        if (!LineIntersection2D(model.edges[previous], model.edges[i], x, y)) {
+            return false;
+        }
+        pcl::PointXYZ p;
+        p.x = static_cast<float>(x);
+        p.y = static_cast<float>(y);
+        p.z = z;
+        rebuilt.push_back(p);
+    }
+    RemoveClosingDuplicate(rebuilt);
+    if (rebuilt.size() < 3) return false;
+    const double area = PolygonArea2D(rebuilt);
+    const double initialArea = std::max(PolygonArea2D(model.initialRing), 1e-6);
+    if (area < 1e-6 || area / initialArea < 0.5 || area / initialArea > 1.8) {
+        return false;
+    }
+    model.ring.swap(rebuilt);
+    return true;
+}
+
+std::vector<pcl::PointXYZ> SampleRingForOverlap(const std::vector<pcl::PointXYZ>& ring)
+{
+    std::vector<pcl::PointXYZ> samples;
+    if (ring.size() < 3) return samples;
+    samples.reserve(ring.size() * 3);
+    double cx = 0.0;
+    double cy = 0.0;
+    for (const auto& p : ring) {
+        samples.push_back(p);
+        cx += p.x;
+        cy += p.y;
+    }
+    cx /= static_cast<double>(ring.size());
+    cy /= static_cast<double>(ring.size());
+    pcl::PointXYZ center;
+    center.x = static_cast<float>(cx);
+    center.y = static_cast<float>(cy);
+    center.z = ring.front().z;
+    samples.push_back(center);
+
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % ring.size()];
+        pcl::PointXYZ mid;
+        mid.x = 0.5f * (a.x + b.x);
+        mid.y = 0.5f * (a.y + b.y);
+        mid.z = 0.5f * (a.z + b.z);
+        samples.push_back(mid);
+    }
+    return samples;
+}
+
+int NearestEdgeIndex(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& ring)
+{
+    int best = -1;
+    double bestDistance = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const double distance = PointToSegmentDistance2D(p, ring[i], ring[(i + 1) % ring.size()]);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+bool OptimizeCeresConflictGroup(
+    std::vector<GroupBuildingModel>& group,
+    OutputOverlapRepairStats& stats)
+{
+    if (group.size() < 2) return false;
+    bool anyImproved = false;
+    constexpr int kOuterIterations = 4;
+    const double margin = 0.08;
+    const double overlapWeight = 12.0;
+    const double priorWeight = 1.0;
+
+    for (int outer = 0; outer < kOuterIterations; ++outer) {
+        ceres::Problem problem;
+        int intrusionResiduals = 0;
+
+        for (auto& building : group) {
+            for (auto& edge : building.edges) {
+                problem.AddResidualBlock(
+                    DRegularizerResidual::Create(edge.initialD, priorWeight),
+                    new ceres::HuberLoss(0.3),
+                    &edge.d);
+            }
+        }
+
+        for (std::size_t a = 0; a < group.size(); ++a) {
+            for (std::size_t b = a + 1; b < group.size(); ++b) {
+                const auto samplesA = SampleRingForOverlap(group[a].ring);
+                for (const auto& p : samplesA) {
+                    if (!PointInPolygon2D(p, group[b].ring)) continue;
+                    const int edgeIndex = NearestEdgeIndex(p, group[b].ring);
+                    if (edgeIndex < 0) continue;
+                    auto& edge = group[b].edges[static_cast<std::size_t>(edgeIndex)];
+                    problem.AddResidualBlock(
+                        IntrusionHalfspaceResidual::Create(
+                            p.x, p.y, edge.nx, edge.ny, edge.insideSign, margin, overlapWeight),
+                        new ceres::HuberLoss(0.5),
+                        &edge.d);
+                    ++intrusionResiduals;
+                }
+
+                const auto samplesB = SampleRingForOverlap(group[b].ring);
+                for (const auto& p : samplesB) {
+                    if (!PointInPolygon2D(p, group[a].ring)) continue;
+                    const int edgeIndex = NearestEdgeIndex(p, group[a].ring);
+                    if (edgeIndex < 0) continue;
+                    auto& edge = group[a].edges[static_cast<std::size_t>(edgeIndex)];
+                    problem.AddResidualBlock(
+                        IntrusionHalfspaceResidual::Create(
+                            p.x, p.y, edge.nx, edge.ny, edge.insideSign, margin, overlapWeight),
+                        new ceres::HuberLoss(0.5),
+                        &edge.d);
+                    ++intrusionResiduals;
+                }
+            }
+        }
+
+        if (intrusionResiduals == 0) break;
+
+        ceres::Solver::Options options;
+        options.max_num_iterations = 40;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.minimizer_progress_to_stdout = false;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        bool rebuiltAll = true;
+        for (auto& building : group) {
+            rebuiltAll = ReconstructGroupRing(building) && rebuiltAll;
+        }
+        if (!rebuiltAll) return anyImproved;
+        anyImproved = true;
+    }
+    if (anyImproved) {
+        ++stats.optimizedGroups;
+    }
+    return anyImproved;
+}
+
+void CollectSeamSegments(const OGRGeometry* geometry,
+                         const Eigen::Vector3d& metadataOffset,
+                         std::vector<SeamSegment>& segments)
+{
+    if (!geometry) return;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbLineString) {
+        const auto* line = geometry->toLineString();
+        for (int i = 1; i < line->getNumPoints(); ++i) {
+            SeamSegment segment;
+            segment.a.x = static_cast<float>(line->getX(i - 1) - metadataOffset.x());
+            segment.a.y = static_cast<float>(line->getY(i - 1) - metadataOffset.y());
+            segment.a.z = 0.0f;
+            segment.b.x = static_cast<float>(line->getX(i) - metadataOffset.x());
+            segment.b.y = static_cast<float>(line->getY(i) - metadataOffset.y());
+            segment.b.z = 0.0f;
+            if (Distance2D(segment.a, segment.b) > 1e-6) segments.push_back(segment);
+        }
+        return;
+    }
+    if (type == wkbMultiLineString || type == wkbGeometryCollection) {
+        const auto* collection = geometry->toGeometryCollection();
+        for (int i = 0; i < collection->getNumGeometries(); ++i) {
+            CollectSeamSegments(collection->getGeometryRef(i), metadataOffset, segments);
+        }
+    }
+}
+
+bool HasWallPointNear(
+    const pcl::PointXYZ& query,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    bool* hasAnyPoint = nullptr)
+{
+    std::vector<int> indices;
+    std::vector<float> distances;
+    const int found = kdtree->radiusSearch(query, static_cast<float>(kSeamWallSearchRadius),
+                                           indices, distances);
+    if (hasAnyPoint) *hasAnyPoint = found > 0;
+    if (found <= 0) {
+        return false;
+    }
+    for (int index : indices) {
+        if (index < 0 || static_cast<std::size_t>(index) >= sampled->normal->size()) continue;
+        if (std::abs(sampled->normal->points[index].normal_z) <= kVerticalNormalMaxAbsZ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MedianRoofHeightNear(
+    const pcl::PointXYZ& query,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    double& height)
+{
+    std::vector<int> indices;
+    std::vector<float> distances;
+    kdtree->radiusSearch(query, static_cast<float>(kSeamRoofSearchRadius), indices, distances);
+    std::vector<float> heights;
+    heights.reserve(indices.size());
+    for (int index : indices) {
+        if (index < 0 || static_cast<std::size_t>(index) >= sampled->cloud->size() ||
+            static_cast<std::size_t>(index) >= sampled->normal->size()) {
+            continue;
+        }
+        if (std::abs(sampled->normal->points[index].normal_z) >= 0.65f) {
+            heights.push_back(sampled->cloud->points[index].z);
+        }
+    }
+    if (heights.size() < 3) return false;
+    const std::size_t middle = heights.size() / 2;
+    std::nth_element(heights.begin(), heights.begin() + middle, heights.end());
+    height = heights[middle];
+    return true;
+}
+
+SeamEvidence EvaluateSeamEvidence(
+    const OGRGeometry* sharedBoundary,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const Eigen::Vector3d& metadataOffset)
+{
+    SeamEvidence evidence;
+    if (!sharedBoundary || !sampled || !sampled->cloud || !sampled->normal || !kdtree) {
+        return evidence;
+    }
+    std::vector<SeamSegment> segments;
+    CollectSeamSegments(sharedBoundary, metadataOffset, segments);
+    int sampleCount = 0;
+    int wallCount = 0;
+    int heightDifferenceCount = 0;
+    int heightPairCount = 0;
+    for (const SeamSegment& segment : segments) {
+        const double dx = segment.b.x - segment.a.x;
+        const double dy = segment.b.y - segment.a.y;
+        const double length = std::hypot(dx, dy);
+        const int steps = std::max(1, static_cast<int>(std::ceil(length / kSeamSampleStep)));
+        const double nx = -dy / length;
+        const double ny = dx / length;
+        for (int step = 0; step <= steps; ++step) {
+            const double t = static_cast<double>(step) / steps;
+            pcl::PointXYZ center;
+            center.x = static_cast<float>(segment.a.x + t * dx);
+            center.y = static_cast<float>(segment.a.y + t * dy);
+            center.z = 0.0f;
+            bool hasAnyPoint = false;
+            const bool hasWallPoint = HasWallPointNear(center, sampled, kdtree, &hasAnyPoint);
+            if (!hasAnyPoint) continue;
+            ++sampleCount;
+            if (hasWallPoint) ++wallCount;
+
+            pcl::PointXYZ sideA = center;
+            pcl::PointXYZ sideB = center;
+            sideA.x += static_cast<float>(nx * kSeamRoofSideOffset);
+            sideA.y += static_cast<float>(ny * kSeamRoofSideOffset);
+            sideB.x -= static_cast<float>(nx * kSeamRoofSideOffset);
+            sideB.y -= static_cast<float>(ny * kSeamRoofSideOffset);
+            double heightA = 0.0;
+            double heightB = 0.0;
+            if (MedianRoofHeightNear(sideA, sampled, kdtree, heightA) &&
+                MedianRoofHeightNear(sideB, sampled, kdtree, heightB)) {
+                ++heightPairCount;
+                if (std::abs(heightA - heightB) >= kSeamRoofHeightDifference) {
+                    ++heightDifferenceCount;
+                }
+            }
+        }
+    }
+    evidence.modelSampleCount = sampleCount;
+    evidence.wallCount = wallCount;
+    evidence.heightPairCount = heightPairCount;
+    evidence.heightDifferenceCount = heightDifferenceCount;
+    if (sampleCount > 0) evidence.wallRatio = static_cast<double>(wallCount) / sampleCount;
+    if (heightPairCount > 0) evidence.heightRatio = static_cast<double>(heightDifferenceCount) / heightPairCount;
+    return evidence;
+}
+
+class DisjointSet {
+public:
+    explicit DisjointSet(std::size_t size) : parent_(size), rank_(size, 0)
+    {
+        std::iota(parent_.begin(), parent_.end(), 0);
+    }
+
+    std::size_t find(std::size_t value)
+    {
+        if (parent_[value] != value) parent_[value] = find(parent_[value]);
+        return parent_[value];
+    }
+
+    void unite(std::size_t a, std::size_t b)
+    {
+        a = find(a);
+        b = find(b);
+        if (a == b) return;
+        if (rank_[a] < rank_[b]) std::swap(a, b);
+        parent_[b] = a;
+        if (rank_[a] == rank_[b]) ++rank_[a];
+    }
+
+private:
+    std::vector<std::size_t> parent_;
+    std::vector<int> rank_;
+};
+
+#if 0
+bool ResolveOutputOverlaps(OGRLayer* layer,
+    const Eigen::Vector3d& metadataOffset,
+    OutputOverlapRepairStats& stats)
+{
+    stats = {};
+    if (!layer) return false;
+
+    std::vector<OutlineFeatureRecord> features;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            OutlineFeatureRecord record;
+            record.fid = feature->GetFID();
+            record.geometry.reset(geometry->clone());
+            if (record.geometry && !record.geometry->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(record.geometry->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    record.geometry = std::move(fixed);
+                } else {
+                    record.validForCeres = false;
+                    std::cerr << "[Output overlap] fid=" << record.fid
+                              << " remains invalid after Buffer(0); skip Ceres"
+                              << std::endl;
+                }
+            }
+            record.geometry->getEnvelope(&record.envelope);
+            record.area = GeometryArea(record.geometry.get());
+            record.perimeter = GeometryPerimeter(record.geometry.get());
+            if (record.area > 0.0 && record.perimeter > 0.0) {
+                features.push_back(std::move(record));
+            }
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+    if (features.size() < 2) return true;
+
+    DisjointSet groups(features.size());
+    long long initialOverlapPairs = 0;
+    for (std::size_t i = 0; i < features.size(); ++i) {
+        for (std::size_t j = i + 1; j < features.size(); ++j) {
+            const auto& a = features[i];
+            const auto& b = features[j];
+            if (a.envelope.MaxX < b.envelope.MinX || b.envelope.MaxX < a.envelope.MinX ||
+                a.envelope.MaxY < b.envelope.MinY || b.envelope.MaxY < a.envelope.MinY) {
+                continue;
+            }
+            double overlapArea = 0.0;
+            if (!HasMeaningfulGeometryOverlap(a.geometry.get(), b.geometry.get(), overlapArea)) {
+                continue;
+            }
+            ++initialOverlapPairs;
+            stats.maxOverlapArea = std::max(stats.maxOverlapArea, overlapArea);
+            groups.unite(i, j);
+        }
+    }
+
+    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
+    for (std::size_t i = 0; i < features.size(); ++i) {
+        members[groups.find(i)].push_back(i);
+    }
+
+    for (const auto& item : members) {
+        const auto& indices = item.second;
+        if (indices.size() < 2) continue;
+
+        std::vector<GroupBuildingModel> group;
+        group.reserve(indices.size());
+        bool groupOk = true;
+        for (std::size_t index : indices) {
+            const OGRPolygon* sourcePolygon = features[index].geometry &&
+                wkbFlatten(features[index].geometry->getGeometryType()) == wkbPolygon
+                ? features[index].geometry->toPolygon() : nullptr;
+            const OGRLinearRing* sourceRing = sourcePolygon
+                ? sourcePolygon->getExteriorRing() : nullptr;
+            if (!features[index].validForCeres || !sourceRing ||
+                sourceRing->getNumPoints() - 1 > 40) {
+                groupOk = false;
+                std::cerr << "[Output overlap] skip Ceres group fid="
+                          << features[index].fid << " valid="
+                          << (features[index].validForCeres ? 1 : 0)
+                          << " vertices=" << (sourceRing ? sourceRing->getNumPoints() - 1 : 0)
+                          << std::endl;
+                break;
+            }
+            GroupBuildingModel model;
+            if (!BuildGroupModelFromGeometry(features[index], metadataOffset, model)) {
+                groupOk = false;
+                break;
+            }
+            group.push_back(std::move(model));
+        }
+        if (!groupOk || group.size() < 2) continue;
+
+        if (!OptimizeCeresConflictGroup(group, stats)) continue;
+
+        for (std::size_t local = 0; local < group.size(); ++local) {
+            const std::size_t featureIndex = indices[local];
+            std::unique_ptr<OGRPolygon> polygon(MakePolygon(group[local].ring, metadataOffset));
+            if (!polygon) continue;
+            features[featureIndex].geometry.reset(polygon.release());
+            features[featureIndex].geometry->getEnvelope(&features[featureIndex].envelope);
+            features[featureIndex].area = GeometryArea(features[featureIndex].geometry.get());
+            features[featureIndex].perimeter = GeometryPerimeter(features[featureIndex].geometry.get());
+            ++stats.shiftedFeatures;
+            for (std::size_t p = 0; p < group[local].ring.size() &&
+                    p < group[local].initialRing.size(); ++p) {
+                stats.maxShiftDistance = std::max(stats.maxShiftDistance,
+                    Distance2D(group[local].ring[p], group[local].initialRing[p]));
+            }
+        }
+    }
+
+    // Resolve residual conflicts without changing the larger footprint. Translation
+    // is accepted only when it does not create a new conflict with any third building.
+    for (std::size_t pass = 0; pass < features.size(); ++pass) {
+        bool changed = false;
+        for (std::size_t i = 0; i < features.size(); ++i) {
+            for (std::size_t j = i + 1; j < features.size(); ++j) {
+                double overlapArea = 0.0;
+                if (!HasMeaningfulGeometryOverlap(
+                        features[i].geometry.get(), features[j].geometry.get(), overlapArea)) {
+                    continue;
+                }
+
+                const std::size_t fixedIndex = features[i].area >= features[j].area ? i : j;
+                const std::size_t movingIndex = fixedIndex == i ? j : i;
+                std::unique_ptr<OGRGeometry> candidate;
+                double shiftDistance = 0.0;
+                bool translated = TryResolvePairByTranslation(
+                    features[fixedIndex].geometry.get(),
+                    features[movingIndex].geometry.get(),
+                    overlapArea, candidate, shiftDistance);
+                if (translated) {
+                    for (std::size_t k = 0; k < features.size(); ++k) {
+                        if (k == movingIndex || k == fixedIndex) continue;
+                        double otherOverlap = 0.0;
+                        if (HasMeaningfulGeometryOverlap(
+                                candidate.get(), features[k].geometry.get(), otherOverlap)) {
+                            translated = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (translated) {
+                    features[movingIndex].geometry = std::move(candidate);
+                    stats.maxShiftDistance = std::max(stats.maxShiftDistance, shiftDistance);
+                    ++stats.translatedFeatures;
+                } else {
+                    if (!features[movingIndex].geometry->IsValid()) {
+                        std::unique_ptr<OGRGeometry> fixed(
+                            features[movingIndex].geometry->Buffer(0.0));
+                        if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                            features[movingIndex].geometry = std::move(fixed);
+                        }
+                    }
+                    if (!features[fixedIndex].geometry->IsValid()) {
+                        std::unique_ptr<OGRGeometry> fixed(
+                            features[fixedIndex].geometry->Buffer(0.0));
+                        if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                            features[fixedIndex].geometry = std::move(fixed);
+                        }
+                    }
+                    candidate.reset(features[movingIndex].geometry->Difference(
+                        features[fixedIndex].geometry.get()));
+                    if (!candidate || candidate->IsEmpty()) {
+                        std::cerr << "[Output overlap] Difference removed fid="
+                                  << features[movingIndex].fid << std::endl;
+                        features[movingIndex].geometry.reset();
+                    } else {
+                        if (!candidate->IsValid()) {
+                            std::unique_ptr<OGRGeometry> fixed(candidate->Buffer(0.0));
+                            if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                                candidate = std::move(fixed);
+                            } else {
+                                std::cerr << "[Output overlap] Difference invalid fid="
+                                          << features[movingIndex].fid << std::endl;
+                                candidate.reset();
+                            }
+                        }
+                        features[movingIndex].geometry = std::move(candidate);
+                    }
+                    ++stats.clippedFeatures;
+                }
+
+                auto& moving = features[movingIndex];
+                if (moving.geometry) {
+                    moving.geometry->getEnvelope(&moving.envelope);
+                    moving.area = GeometryArea(moving.geometry.get());
+                    moving.perimeter = GeometryPerimeter(moving.geometry.get());
+                    const double bboxArea =
+                        (moving.envelope.MaxX - moving.envelope.MinX) *
+                        (moving.envelope.MaxY - moving.envelope.MinY);
+                    if (moving.area < kMinOutputPolygonArea ||
+                        bboxArea < kMinOutputPolygonBBoxArea) {
+                        std::cerr << "[Output filter] drop clipped fid=" << moving.fid
+                                  << " area=" << moving.area
+                                  << " bbox=" << bboxArea << std::endl;
+                        moving.geometry.reset();
+                        moving.area = moving.perimeter = 0.0;
+                    }
+                } else {
+                    moving.area = moving.perimeter = 0.0;
+                }
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+
+    if (!layer->TestCapability(OLCRandomWrite)) {
+        std::cerr << "[Output overlap] layer does not support random writes" << std::endl;
+        return false;
+    }
+    bool writeOk = true;
+    for (const auto& feature : features) {
+        OGRFeature* target = layer->GetFeature(feature.fid);
+        if (!target) {
+            std::cerr << "[Output overlap] GetFeature failed fid=" << feature.fid << std::endl;
+            writeOk = false;
+            continue;
+        }
+        const OGRErr setGeometryErr = feature.geometry
+            ? target->SetGeometry(feature.geometry.get())
+            : target->SetGeometry(nullptr);
+        const OGRErr setFeatureErr = setGeometryErr == OGRERR_NONE
+            ? layer->SetFeature(target) : setGeometryErr;
+        OGRFeature::DestroyFeature(target);
+        if (setFeatureErr != OGRERR_NONE) {
+            std::cerr << "[Output overlap] SetFeature failed fid=" << feature.fid
+                      << " err=" << static_cast<int>(setFeatureErr) << std::endl;
+            writeOk = false;
+        }
+    }
+
+    stats.maxOverlapArea = 0.0;
+    for (std::size_t i = 0; i < features.size(); ++i) {
+        if (!features[i].geometry) continue;
+        for (std::size_t j = i + 1; j < features.size(); ++j) {
+            if (!features[j].geometry) continue;
+            const auto& a = features[i];
+            const auto& b = features[j];
+            if (a.envelope.MaxX < b.envelope.MinX || b.envelope.MaxX < a.envelope.MinX ||
+                a.envelope.MaxY < b.envelope.MinY || b.envelope.MaxY < a.envelope.MinY) {
+                continue;
+            }
+            ++stats.candidatePairs;
+            double overlapArea = 0.0;
+            if (HasMeaningfulGeometryOverlap(a.geometry.get(), b.geometry.get(), overlapArea)) {
+                ++stats.overlapPairs;
+                stats.maxOverlapArea = std::max(stats.maxOverlapArea, overlapArea);
+            }
+        }
+    }
+    stats.unresolvedPairs = stats.overlapPairs;
+    stats.resolvedPairs = std::max<long long>(0, initialOverlapPairs - stats.overlapPairs);
+
+    if (layer->SyncToDisk() != OGRERR_NONE) {
+        std::cerr << "[Output overlap] SyncToDisk failed" << std::endl;
+        writeOk = false;
+    }
+    struct WrittenGeometry {
+        GIntBig fid = OGRNullFID;
+        std::unique_ptr<OGRGeometry> geometry;
+        OGREnvelope envelope = {};
+    };
+    std::vector<WrittenGeometry> writtenGeometries;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        const OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            WrittenGeometry written;
+            written.fid = feature->GetFID();
+            written.geometry.reset(geometry->clone());
+            if (written.geometry && !written.geometry->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(written.geometry->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    written.geometry = std::move(fixed);
+                } else {
+                    std::cerr << "[Output overlap audit] invalid fid="
+                              << written.fid << std::endl;
+                    writeOk = false;
+                }
+            }
+            if (written.geometry) written.geometry->getEnvelope(&written.envelope);
+            writtenGeometries.push_back(std::move(written));
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+    stats.overlapPairs = 0;
+    stats.maxOverlapArea = 0.0;
+    for (std::size_t i = 0; i < writtenGeometries.size(); ++i) {
+        for (std::size_t j = i + 1; j < writtenGeometries.size(); ++j) {
+            const auto& a = writtenGeometries[i];
+            const auto& b = writtenGeometries[j];
+            if (!a.geometry || !b.geometry ||
+                a.envelope.MaxX < b.envelope.MinX || b.envelope.MaxX < a.envelope.MinX ||
+                a.envelope.MaxY < b.envelope.MinY || b.envelope.MaxY < a.envelope.MinY) {
+                continue;
+            }
+            double overlapArea = 0.0;
+            if (HasMeaningfulGeometryOverlap(
+                    a.geometry.get(), b.geometry.get(), overlapArea)) {
+                ++stats.overlapPairs;
+                stats.maxOverlapArea = std::max(stats.maxOverlapArea, overlapArea);
+                std::cerr << "[Output overlap audit] unresolved fid=" << a.fid
+                          << " x " << b.fid << " area=" << overlapArea << std::endl;
+            }
+        }
+    }
+    stats.unresolvedPairs = stats.overlapPairs;
+    stats.resolvedPairs = std::max<long long>(0, initialOverlapPairs - stats.overlapPairs);
+    return writeOk && stats.unresolvedPairs == 0;
+}
+#endif
+
+bool MergeOversegmentedInitialOutlines(
+    const std::string& shpPath,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const Eigen::Vector3d& metadataOffset,
+    InitialOutlineMergeStats& stats)
+{
+    stats = {};
+    GDALDataset* dataset = static_cast<GDALDataset*>(
+        GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                   nullptr, nullptr, nullptr));
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->GetLayer(0);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+
+    std::vector<OutlineFeatureRecord> features;
+    const int parentFieldIdx = layer->GetLayerDefn()->GetFieldIndex("parent");
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            OutlineFeatureRecord record;
+            record.fid = feature->GetFID();
+            record.geometry.reset(geometry->clone());
+            record.geometry->getEnvelope(&record.envelope);
+            record.area = GeometryArea(record.geometry.get());
+            record.perimeter = GeometryPerimeter(record.geometry.get());
+            if (parentFieldIdx >= 0) record.parent = feature->GetFieldAsInteger(parentFieldIdx);
+            if (record.area > 0.0 && record.perimeter > 0.0) {
+                features.push_back(std::move(record));
+            }
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+
+    DisjointSet groups(features.size());
+    for (std::size_t i = 0; i < features.size(); ++i) {
+        for (std::size_t j = i + 1; j < features.size(); ++j) {
+            const auto& a = features[i];
+            const auto& b = features[j];
+            if (a.envelope.MaxX < b.envelope.MinX || b.envelope.MaxX < a.envelope.MinX ||
+                a.envelope.MaxY < b.envelope.MinY || b.envelope.MaxY < a.envelope.MinY) {
+                continue;
+            }
+            std::unique_ptr<OGRGeometry> boundaryA(a.geometry->Boundary());
+            std::unique_ptr<OGRGeometry> boundaryB(b.geometry->Boundary());
+            std::unique_ptr<OGRGeometry> shared(
+                boundaryA && boundaryB ? boundaryA->Intersection(boundaryB.get()) : nullptr);
+            const double exactSharedLength = GeometryLength(shared.get());
+            const double sharedLength = RobustSharedBoundaryLength(
+                a.geometry.get(), b.geometry.get(), exactSharedLength);
+            if (sharedLength < kMinSharedBoundaryLength) continue;   // 閭绘帴涓嬮檺(鐐?瑙掓帴瑙︿笉绠?
+            ++stats.adjacentCandidates;
+            if (sharedLength > exactSharedLength + 0.5) {
+                std::cerr << "[Merge diag] ROBUST exactShared=" << exactSharedLength
+                          << " robustShared=" << sharedLength
+                          << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+            }
+
+            const bool largePair = std::min(a.area, b.area) > 500.0;  // 澶у潡瀵?鐤戜技澶у缓绛戯紝鎵撹瘖鏂?
+bool evidenceComputed = false;
+            SeamEvidence evidence;
+            auto getEvidence = [&]() -> const SeamEvidence& {
+                if (!evidenceComputed) {
+                    evidence = EvaluateSeamEvidence(
+                        shared.get(), sampled, kdtree, metadataOffset);
+                    evidenceComputed = true;
+                }
+                return evidence;
+            };
+
+            if (ShouldMergeByFootprintShape(a, b, sharedLength)) {
+                if (largePair) std::cerr << "[Merge diag] SHAPE sharedLen=" << sharedLength
+                                         << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+                groups.unite(i, j);
+                ++stats.mergedPairs;
+                ++stats.mergedByShape;
+                continue;
+            }
+
+            // 闂? 瀹界紳锛氬叡浜竟 >= kMergeSeamLength 鎵嶇畻"璇ュ悎"銆?            // 棰?绐勮繛鎺?濡傚垎姘村箔鍒囧紑鐨勭矘杩炴ゼ)鍏变韩杈圭煭 鈫?涓嶅悓鏍?鈫?涓嶅悎銆?
+if (sharedLength < kMergeSeamLength) {
+                if (largePair) std::cerr << "[Merge diag] NARROW sharedLen=" << sharedLength
+                                         << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+                ++stats.keptNarrowSeam;
+                continue;
+            }
+            const bool sameParent = a.parent > 0 && a.parent == b.parent;
+            if (sameParent) {
+                groups.unite(i, j);
+                ++stats.mergedPairs;
+                ++stats.mergedByParent;
+                continue;
+            }
+            // 澶у缓绛戠洿閫氾細涓や晶閮芥槸澶у潡涓斿叡浜暱杈?鈫?瑙嗕负鍚屼竴缁煎悎浣擄紝璺宠繃璇佹嵁闂哥洿鎺ュ悎骞躲€?            // 瑙?kLargeBuildingMergeArea 澶勬敞閲婏細闀胯竟鏈韩鏄?鍚屼竴鏍?鐨勬渶寮哄嚑浣曡瘉鎹紝鑰岃瘉鎹椄
+            // 鍦ㄥぇ寤虹瓚灞嬮潰浼氬洜濂冲効澧?浼哥缉缂濈瓑璇Е鍙?wallRatio 楗卞拰)鑰岄敊璇湴闃绘鍚堝苟銆?
+if (std::min(a.area, b.area) > kLargeBuildingMergeArea) {
+                if (largePair) std::cerr << "[Merge diag] BIGMERGE sharedLen=" << sharedLength
+                                         << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+                groups.unite(i, j);
+                ++stats.mergedPairs;
+                ++stats.mergedByBigPair;
+                continue;
+            }
+            const SeamEvidence& seamEvidence = getEvidence();
+            const double maxEvidence = std::max(seamEvidence.wallRatio, seamEvidence.heightRatio);
+            if (maxEvidence >= kStrongSeamEvidenceRatio) {
+                if (largePair) std::cerr << "[Merge diag] EVIDENCE sharedLen=" << sharedLength
+                                         << " wall=" << seamEvidence.wallRatio << " height=" << seamEvidence.heightRatio
+                                         << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+                ++stats.keptByModelEvidence;
+                continue;
+            }
+            if (largePair) std::cerr << "[Merge diag] MERGE sharedLen=" << sharedLength
+                                     << " wall=" << seamEvidence.wallRatio << " height=" << seamEvidence.heightRatio
+                                     << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+            groups.unite(i, j);
+            ++stats.mergedPairs;
+        }
+    }
+
+    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
+    for (std::size_t i = 0; i < features.size(); ++i) members[groups.find(i)].push_back(i);
+    for (const auto& item : members) {
+        const auto& indices = item.second;
+        if (indices.size() < 2) continue;
+        std::unique_ptr<OGRGeometry> merged(features[indices.front()].geometry->clone());
+        for (std::size_t k = 1; k < indices.size(); ++k) {
+            std::unique_ptr<OGRGeometry> next(merged->Union(features[indices[k]].geometry.get()));
+            if (next) merged = std::move(next);
+        }
+        std::unique_ptr<OGRGeometry> mergeCleaned = CleanMergedGeometry(merged.get());
+        if (mergeCleaned) merged = std::move(mergeCleaned);
+        // 鐐规帴瑙?灏忕紳闅欎細璁╁苟闆嗗彉鎴?MultiPolygon锛涚敤 Buffer(0) 铻嶅悎鎴愬崟澶氳竟褰?
+if (merged && wkbFlatten(merged->getGeometryType()) != wkbPolygon) {
+            std::unique_ptr<OGRGeometry> cleaned(merged->Buffer(0.0));
+            if (cleaned && wkbFlatten(cleaned->getGeometryType()) == wkbPolygon) {
+                merged = std::move(cleaned);
+            } else {
+                continue;  // 瀹炲湪鍚堜笉鎴愬崟澶氳竟褰紝鏀惧純杩欑粍
+            }
+        }
+        if (!merged || wkbFlatten(merged->getGeometryType()) != wkbPolygon) continue;
+
+        OGRFeature* target = layer->GetFeature(features[indices.front()].fid);
+        if (!target) continue;
+        target->SetGeometry(merged.get());
+        const bool updated = layer->SetFeature(target) == OGRERR_NONE;
+        OGRFeature::DestroyFeature(target);
+        if (!updated) continue;
+        for (std::size_t k = 1; k < indices.size(); ++k) {
+            if (layer->DeleteFeature(features[indices[k]].fid) == OGRERR_NONE) {
+                ++stats.removedFeatures;
+            }
+        }
+    }
+    layer->SyncToDisk();
+    GDALClose(dataset);
+    return true;
+}
+
+// 鎶婂杈瑰舰(鍗?澶?鐨勬墍鏈?interior ring 鍘绘帀锛屽彧淇濈暀澶栫幆(瀹炲績鍖?銆俢hanged 缃负鏄惁鐪熺殑鏀瑰姩杩囥€?
+std::unique_ptr<OGRGeometry> SolidGeometry(const OGRGeometry* g, bool& changed)
+{
+    changed = false;
+    if (!g) return nullptr;
+    const OGRwkbGeometryType t = wkbFlatten(g->getGeometryType());
+    if (t == wkbPolygon) {
+        const OGRPolygon* p = g->toPolygon();
+        if (p->getNumInteriorRings() == 0) return std::unique_ptr<OGRGeometry>(g->clone());
+        auto* np = new OGRPolygon();
+        if (const OGRLinearRing* ext = p->getExteriorRing())
+            np->addRingDirectly(new OGRLinearRing(*ext));
+        np->assignSpatialReference(g->getSpatialReference());
+        changed = true;
+        return std::unique_ptr<OGRGeometry>(np);
+    }
+    if (t == wkbMultiPolygon) {
+        const OGRMultiPolygon* mp = g->toMultiPolygon();
+        bool anyHole = false;
+        for (int i = 0; i < mp->getNumGeometries(); ++i) {
+            const OGRPolygon* p = mp->getGeometryRef(i)->toPolygon();
+            if (p && p->getNumInteriorRings() > 0) { anyHole = true; break;
+        }
+        }
+        if (!anyHole) return std::unique_ptr<OGRGeometry>(g->clone());
+        auto* nmp = new OGRMultiPolygon();
+        for (int i = 0; i < mp->getNumGeometries(); ++i) {
+            const OGRPolygon* p = mp->getGeometryRef(i)->toPolygon();
+            if (!p || !p->getExteriorRing()) continue;
+            auto* np = new OGRPolygon();
+            np->addRingDirectly(new OGRLinearRing(*(p->getExteriorRing())));
+            nmp->addGeometryDirectly(np);
+        }
+        nmp->assignSpatialReference(g->getSpatialReference());
+        changed = true;
+        return std::unique_ptr<OGRGeometry>(nmp);
+    }
+    return std::unique_ptr<OGRGeometry>(g->clone());
+}
+
+// 鍚堝苟鏀舵暃鍚庯細鍏堟妸鎵€鏈夊杈瑰舰鍘?interior ring(瀹炲績鍖?锛屽啀鍒犻櫎琚洿澶ц疆寤撳畬鍏ㄥ寘鍚殑灏忚疆寤撱€?// 澶у缓绛戝悎骞跺悗锛屽唴閮ㄦ畫鐣欑殑鍒嗗壊/鏍呮牸鍖栧皬纰庣墖甯镐互"澶ц疆寤撳甫娲?+ 娲為噷濂楀皬杞粨"鐨勫舰寮忓瓨鍦紱
+// 甯︽礊鐨?A 瀵规礊閲岀殑 B 璋?Contains 杩斿洖 false 浼氭紡妫€锛屾晠鍏堝叏灞€鍘诲瓟锛屽啀鎸夊疄蹇冨嚑浣曞仛鍖呭惈娓呯悊銆?// maxArea锛氬彧鍒犻潰绉?=maxArea 鐨勮鍖呭惈鑰呫€?
+long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxArea)
+{
+    GDALDataset* dataset = static_cast<GDALDataset*>(
+        GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                   nullptr, nullptr, nullptr));
+    if (!dataset) return 0;
+    OGRLayer* layer = dataset->GetLayer(0);
+    if (!layer) { GDALClose(dataset); return 0; }
+
+    struct ContainedRec {
+        GIntBig fid = OGRNullFID;
+        std::unique_ptr<OGRGeometry> geom;
+        OGREnvelope env = {};
+        double area = 0.0;
+        bool solidified = false;              // 鍘熷甫瀛斻€佸凡瀹炲績鍖栵紝闇€鍐欏洖
+        bool remove = false;
+    };
+    std::vector<ContainedRec> recs;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            ContainedRec rec;
+            rec.fid = feature->GetFID();
+            bool changed = false;
+            rec.geom = SolidGeometry(geometry, changed);   // 鍏堝疄蹇冨寲锛岃娲為噷鐨勫皬杞粨鍙 Contains
+            rec.solidified = changed;
+            rec.geom->getEnvelope(&rec.env);
+            rec.area = GeometryArea(rec.geom.get());
+            if (rec.area > 0.0) recs.push_back(std::move(rec));
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+
+    std::sort(recs.begin(), recs.end(),
+              [](const ContainedRec& a, const ContainedRec& b) { return a.area > b.area; });
+    for (std::size_t i = 1; i < recs.size(); ++i) {
+        ContainedRec& b = recs[i];
+        if (b.area > maxArea) continue;          // 鍙垹"灏?杞粨
+        for (std::size_t j = 0; j < i; ++j) {
+            const ContainedRec& a = recs[j];
+            if (a.area <= b.area) continue;
+            if (a.env.MinX > b.env.MinX || a.env.MinY > b.env.MinY ||
+                a.env.MaxX < b.env.MaxX || a.env.MaxY < b.env.MaxY) {
+                continue;                         // envelope 棰勭瓫锛欰 鍖呬笉浣?B 鐨勫鎺ョ煩褰㈠垯璺宠繃
+            }
+            if (a.geom->Contains(b.geom.get())) {
+                b.remove = true;
+                break;
+            }
+        }
+    }
+
+    long long removed = 0;
+    long long solidified = 0;
+    for (const ContainedRec& rec : recs) {
+        if (rec.remove) {
+            if (rec.fid != OGRNullFID &&
+                layer->DeleteFeature(rec.fid) == OGRERR_NONE) ++removed;
+        } else if (rec.solidified && rec.fid != OGRNullFID) {
+            if (OGRFeature* feature = layer->GetFeature(rec.fid)) {
+                feature->SetGeometry(rec.geom.get());
+                if (layer->SetFeature(feature) == OGRERR_NONE) ++solidified;
+                OGRFeature::DestroyFeature(feature);
+            }
+        }
+    }
+    if (removed > 0 || solidified > 0) {
+        layer->SyncToDisk();
+        std::cout << "[Mask] solidified (removed holes) in " << solidified
+                  << " footprints." << std::endl;
+    }
+    GDALClose(dataset);
+    return removed;
+}
+
+void AppendDebugSupportPoints(
+    const std::vector<pcl::PointXYZ>& support,
+    GIntBig sourceFid,
+    int ringIndex,
+    RegularizationDebugCollector* debug)
+{
+    if (!debug || support.empty()) return;
+    const unsigned int hash = static_cast<unsigned int>(
+        (sourceFid == OGRNullFID ? 0 : sourceFid) * 2654435761u +
+        static_cast<unsigned int>(ringIndex) * 97531u);
+    const std::uint8_t r = static_cast<std::uint8_t>(80 + (hash & 0x7F));
+    const std::uint8_t g = static_cast<std::uint8_t>(80 + ((hash >> 8) & 0x7F));
+    const std::uint8_t b = static_cast<std::uint8_t>(80 + ((hash >> 16) & 0x7F));
+    debug->support->reserve(debug->support->size() + support.size());
+    for (const auto& p : support) {
+        PointT q;
+        q.x = p.x;
+        q.y = p.y;
+        q.z = p.z;
+        q.r = r;
+        q.g = g;
+        q.b = b;
+        q.a = 255;
+        debug->support->push_back(q);
+    }
+}
+
+// ===== RegularizeGeometry =====
+// 浣滅敤锛氬涓€涓?OGR 鍑犱綍(鍗曞杈瑰舰 / 澶氬杈瑰舰)鍋氳鍒欏寲锛岃繑鍥炴柊鐨勫嚑浣曘€?//       鍏跺畠绫诲瀷鐩存帴鍏嬮殕杩斿洖銆?
+std::unique_ptr<OGRGeometry> RegularizeGeometry(
+    OGRGeometry* geometry,
+    const MyCloudPtr& sampled,
+    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
+    const Eigen::Vector3d& metadataOffset,
+    const SupportOwnershipContext* ownership = nullptr,
+    GIntBig sourceFid = OGRNullFID,
+    RegularizationDebugCollector* debug = nullptr)
+{
+    if (!geometry) return nullptr;
+
+    OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbPolygon) {
+        auto* polygon = geometry->toPolygon();
+        auto ring = ExtractExteriorRing(polygon, metadataOffset);
+        if (BoundingBoxArea2D(ring) < kMinPolygonBBoxArea) {
+            ++g_removedSmallPolygons;
+            return nullptr;
+        }
+        if (!RingHasModelCoverage(ring, sampled, kdtree)) {
+            ++g_removedOutsideModel;
+            return nullptr;
+        }
+        std::vector<pcl::PointXYZ> bestHypothesis;
+        std::vector<pcl::PointXYZ> support;
+        const std::size_t ringId = FindInitialRingRecordId(ownership, sourceFid, 0);
+        auto regularized = RegularizeRing(ring, sampled, kdtree,
+            ownership, ringId,
+            debug ? &bestHypothesis : nullptr,
+            debug ? &support : nullptr);
+        if (debug && bestHypothesis.size() >= 3) {
+            debug->hypotheses.push_back({sourceFid, 0, bestHypothesis});
+            AppendDebugSupportPoints(support, sourceFid, 0, debug);
+        }
+        if (!OutputRingPassesSizeFloor(regularized)) {
+            ++g_removedSmallPolygons;
+            std::cerr << "[Output filter] drop fid=" << sourceFid
+                      << " area=" << PolygonArea2D(regularized)
+                      << " bbox=" << BoundingBoxArea2D(regularized) << std::endl;
+            return nullptr;
+        }
+        return std::unique_ptr<OGRGeometry>(MakePolygon(regularized, metadataOffset));
+    }
+
+    if (type == wkbMultiPolygon) {
+        auto* out = new OGRMultiPolygon();
+        auto* multi = geometry->toMultiPolygon();
+        int partIndex = 0;
+        for (auto&& part : *multi) {
+            auto ring = ExtractExteriorRing(part->toPolygon(), metadataOffset);
+            if (BoundingBoxArea2D(ring) < kMinPolygonBBoxArea) {
+                ++g_removedSmallPolygons;
+                ++partIndex;
+                continue;
+            }
+            if (!RingHasModelCoverage(ring, sampled, kdtree)) {
+                ++g_removedOutsideModel;
+                ++partIndex;
+                continue;
+            }
+            std::vector<pcl::PointXYZ> bestHypothesis;
+            std::vector<pcl::PointXYZ> support;
+            const std::size_t ringId = FindInitialRingRecordId(ownership, sourceFid, partIndex);
+            auto regularized = RegularizeRing(ring, sampled, kdtree,
+                ownership, ringId,
+                debug ? &bestHypothesis : nullptr,
+                debug ? &support : nullptr);
+            if (debug && bestHypothesis.size() >= 3) {
+                debug->hypotheses.push_back({sourceFid, partIndex, bestHypothesis});
+                AppendDebugSupportPoints(support, sourceFid, partIndex, debug);
+            }
+            if (!OutputRingPassesSizeFloor(regularized)) {
+                ++g_removedSmallPolygons;
+                std::cerr << "[Output filter] drop fid=" << sourceFid
+                          << " part=" << partIndex
+                          << " area=" << PolygonArea2D(regularized)
+                          << " bbox=" << BoundingBoxArea2D(regularized) << std::endl;
+                ++partIndex;
+                continue;
+            }
+            std::unique_ptr<OGRPolygon> polygon(MakePolygon(regularized, metadataOffset));
+            if (polygon) {
+                out->addGeometryDirectly(polygon.release());
+            }
+            ++partIndex;
+        }
+        if (out->getNumGeometries() == 0) {
+            delete out;
+            return nullptr;
+        }
+        return std::unique_ptr<OGRGeometry>(out);
+    }
+
+    return std::unique_ptr<OGRGeometry>(geometry->clone());
+}
+
+// ===== CopyFields =====
+// 浣滅敤锛氭妸杈撳叆鍥惧眰鐨勬墍鏈夊睘鎬у瓧娈电粨鏋勫鍒跺埌杈撳嚭鍥惧眰(鍙鍒跺瓧娈靛畾涔夛紝涓嶅鍒跺€?銆?
+void CopyFields(OGRLayer* inputLayer, OGRLayer* outputLayer)
+{
+    OGRFeatureDefn* defn = inputLayer->GetLayerDefn();
+    for (int i = 0; i < defn->GetFieldCount(); ++i) {
+        OGRFieldDefn* field = defn->GetFieldDefn(i);
+        outputLayer->CreateField(field);
+    }
+}
+
+// ===== CopyFieldValues =====
+// 浣滅敤锛氭妸涓€涓绱犵殑鎵€鏈夊睘鎬у€煎鍒跺埌鍙︿竴涓绱?鎸夊瓧娈典笅鏍囧搴?銆?
+void CopyFieldValues(OGRFeature* src, OGRFeature* dst)
+{
+    for (int i = 0; i < src->GetFieldCount(); ++i) {
+        dst->SetField(i, src->GetRawFieldRef(i));
+    }
+}
+
+bool SaveDebugBestHypotheses(
+    const std::filesystem::path& outputPath,
+    const RegularizationDebugCollector& debug,
+    OGRSpatialReference* spatialRef,
+    const Eigen::Vector3d& metadataOffset)
+{
+    // 鍒犻櫎鏃ф枃浠讹紝閬垮厤鏈娌℃湁鏈夋晥璁板綍鏃舵畫鐣欎笂涓€娆¤皟璇曠粨鏋溿€?
+if (!RemoveShapefileFamily(outputPath)) return false;
+    if (debug.hypotheses.empty()) return true;
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) return false;
+
+    GDALDataset* dataset = driver->Create(outputPath.string().c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->CreateLayer("debug_best_hypothesis", spatialRef, wkbPolygon25D, nullptr);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+    OGRFieldDefn srcField("src_fid", OFTInteger64);
+    OGRFieldDefn ringField("ring_id", OFTInteger);
+    OGRFieldDefn ptsField("npoints", OFTInteger);
+    layer->CreateField(&srcField);
+    layer->CreateField(&ringField);
+    layer->CreateField(&ptsField);
+    OGRFeatureDefn* defn = layer->GetLayerDefn();
+
+    for (const auto& record : debug.hypotheses) {
+        if (record.points.size() < 3) continue;
+        std::unique_ptr<OGRPolygon> polygon(MakePolygon(record.points, metadataOffset));
+        if (!polygon) continue;
+        OGRFeature* feature = OGRFeature::CreateFeature(defn);
+        feature->SetField("src_fid", static_cast<GIntBig>(record.sourceFid));
+        feature->SetField("ring_id", record.ringIndex);
+        feature->SetField("npoints", static_cast<int>(record.points.size()));
+        feature->SetGeometry(polygon.get());
+        layer->CreateFeature(feature);
+        OGRFeature::DestroyFeature(feature);
+    }
+    GDALClose(dataset);
+    return true;
+}
+
+bool SaveDebugSupportLas(
+    const std::filesystem::path& outputPath,
+    const RegularizationDebugCollector& debug,
+    const Eigen::Vector3d& metadataOffset)
+{
+    std::error_code ec;
+    std::filesystem::remove(outputPath, ec);
+    if (ec) {
+        std::cerr << "[LAS] Cannot remove previous debug file "
+                  << outputPath.string() << ": " << ec.message() << std::endl;
+        return false;
+    }
+    if (!debug.support || debug.support->empty()) return true;
+    MyCloud cloud;
+    cloud.cloud = debug.support;
+    cloud.offset = metadataOffset;
+    cloud.hasoffset = true;
+    return SaveSampledCloudAsLas(cloud, outputPath.string());
+}
+
+} // namespace
+
+// ===== main =====
+// 浣滅敤锛氱▼搴忓叆鍙ｃ€傝 OSGB -> 浠?TIF 鎻愬彇鍒濆杞粨 -> 鎸夋ā鍨嬭繃婊?-> 瑙勫垯鍖?-> 鍐欏嚭 SHP銆?
+int main(int argc, char* argv[])
+{
+    SetConsoleOutputCP(65001u);
+    ConsoleLogTee console_log(GetExecutableDirectory() / "console_output.txt");
+
+    if (argc == 4 && std::string(argv[1]) == "--vectorize-mask") {
+        GDALAllRegister();
+        MaskVectorizationStats stats;
+        if (!VectorizeBuildingMask(argv[2], argv[3], stats)) return 1;
+        std::cout << "[Mask] raster=" << stats.width << "x" << stats.height
+                  << ", source bands=" << stats.sourceBands
+                  << ", used bands=" << stats.usedBands
+                  << ", building pixels=" << stats.buildingPixels
+                  << ", polygons=" << stats.polygonCount
+                  << ", contained removed=" << stats.containedPolygonsRemoved << std::endl;
+        std::cout << "[Mask separation] colors=" << stats.sourceColorCount
+                  << (stats.colorLabelsPreserved ? " (preserved)" : " (binary fallback)")
+                  << ", pixel size=" << stats.pixelSizeX << " x " << stats.pixelSizeY
+                  << " m, seed erosion radius=" << stats.erosionRadiusPixels
+                  << " px, seeds=" << stats.seedCount
+                  << ", split components=" << stats.splitComponentCount
+                  << ", narrow waist splits=" << stats.narrowWaistSplitCount << std::endl;
+        std::cout << "[Mask extent] X=" << stats.minX << ".." << stats.maxX
+                  << ", Y=" << stats.minY << ".." << stats.maxY << std::endl;
+        std::cout << "[Mask] Output: " << argv[3] << std::endl;
+        return 0;
+    }
+
+    // ---- 1) Select OSGB input ----
+    std::string osgbDir;
+    std::string metadataXml;
+    std::string inputRaster;
+    std::string inputVector;
+    std::string outputVector;
+
+    std::cout << "Select input OSGB folder..." << std::endl;
+    if (!PickFolder(osgbDir)) {
+        std::cerr << "No input OSGB folder selected. Exiting." << std::endl;
+        return 1;
+    }
+
+    // ---- 2) 鍒濆鍖?GDAL锛岀‘淇濊緭鍑虹洰褰曞瓨鍦紝鎵撳嵃璺緞 ----
+    GDALAllRegister();
+    std::cout << "Input OSGB dir: " << osgbDir << std::endl;
+
+    // ---- 2.5) 閫?metadata XML锛岃В鏋愬湴鐞嗗弬鑰?SRSOrigin) ----
+    //   OSGB 鏄浉瀵瑰潗鏍囷紝鐐逛簯涔熸寜鐩稿鍧愭爣閲囨牱锛涜繖閲屽厛鎷垮埌 offset锛屼緵绋嶅悗淇濆瓨 PLY 鏃?    //   鍙犲姞鎴愪笘鐣屽潗鏍囷紝浠ュ強鍚庣画鎶婁笘鐣屽潗鏍囩殑澶氳竟褰㈡崲绠楀洖鐩稿鍧愭爣銆?
+std::cout << "Select metadata XML file..." << std::endl;
+    Eigen::Vector3d metadataOffset = Eigen::Vector3d::Zero();
+    if (PickOpenXmlFile(metadataXml)) {
+        if (!ReadMetadataOffset(metadataXml, metadataOffset)) {
+            return 1;
+        }
+    } else {
+        std::cout << "No metadata XML selected. Using metadata offset 0,0,0." << std::endl;
+    }
+
+    // ---- 3) 璇?OSGB锛岄噰鏍锋垚鐐逛簯(鍚硶鍚戦噺) ----
+    auto s0 = std::chrono::steady_clock::now();
+    MyCloudPtr sampled = std::make_shared<MyCloud>();
+    if (!OSGMeshSampler::convertOSGBToMyCloud(osgbDir, sampled, kSampleDensity, kMaxPagedLODDepth) ||
+        !sampled || !sampled->cloud || sampled->cloud->empty()) {
+        std::cerr << "Failed to sample OSGB mesh." << std::endl;
+        return 1;
+    }
+    auto s1 = std::chrono::steady_clock::now();
+    std::cout << "[Timing] OSGB sampling: " << std::chrono::duration<double>(s1 - s0).count() << " s" << std::endl;
+
+    if (!sampled->normal || sampled->normal->size() != sampled->cloud->size()) {
+        std::cerr << "Sampled point and normal counts do not match." << std::endl;
+        return 1;
+    }
+
+    // ---- 3.5) 寤轰竴娆?2D KdTree(Z 缃?0)锛屼緵鍚庣画姣忎釜澶氳竟褰㈠仛閭诲煙鏌ヨ ----
+    auto kt0 = std::chrono::steady_clock::now();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud2d(new pcl::PointCloud<pcl::PointXYZ>);
+    cloud2d->resize(sampled->cloud->size());
+    for (std::size_t i = 0; i < sampled->cloud->size(); ++i) {
+        const auto& p = sampled->cloud->points[i];
+        cloud2d->points[i].x = p.x;
+        cloud2d->points[i].y = p.y;
+        cloud2d->points[i].z = 0.0f;
+    }
+    pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtree(new pcl::KdTreeFLANN<pcl::PointXYZ>);
+    kdtree->setInputCloud(cloud2d);
+    auto kt1 = std::chrono::steady_clock::now();
+    std::cout << "[Timing] KdTree built in "
+              << std::chrono::duration<double, std::milli>(kt1 - kt0).count()
+              << " ms (" << cloud2d->size() << " points)" << std::endl;
+
+    // ---- 3.6) 鍙€夛細淇濆瓨閲囨牱鐐逛簯涓?LAS(鐐规牸寮?3=GPS+RGB锛屼簩杩涘埗, 鍚湴鐞嗗弬鑰?offset) ----
+    //          榛樿鏀惧湪 build_deps_release\src\sampled_cloud.las锛?    //          涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + SRSOrigin(offset 鍐欏叆 LAS 鏂囦欢澶?銆?    //          鍐呭瓨閲岀殑 sampled 浠嶄繚鎸佺浉瀵瑰潗鏍囷紝鍚庣画澶勭悊涓嶅彉銆?
+std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
+              << " 涓偣銆傛槸鍚︿繚瀛樹负 LAS? (y/n): ";
+    char saveCloud = 'n';
+    std::cin >> saveCloud;
+    if (saveCloud == 'y' || saveCloud == 'Y') {
+        char exePath[1024] = {0};
+        GetModuleFileNameA(nullptr, exePath, 1024);
+        // exe 鍦?build_deps_release\Release\锛屼笂涓€绾у啀杩?src = build_deps_release\src
+        std::filesystem::path lasDir = std::filesystem::path(exePath).parent_path() / ".." / "src";
+        std::filesystem::create_directories(lasDir);
+        std::string lasPath = (lasDir / "sampled_cloud.las").string();
+
+        // LAS 鏂囦欢澶?offset = 鍦扮悊鍙傝€?SRSOrigin)锛汼aveSampledCloudAsLas 鍐呴儴鎸?        // 涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + offset 鍐欏叆锛屼笉鏀瑰姩 sampled->cloud 鐨勭浉瀵瑰潗鏍囥€?        sampled->offset = metadataOffset;
+        sampled->hasoffset = true;
+
+        std::cout << "姝ｅ湪淇濆瓨鐐逛簯鍒? " << lasPath << " ..." << std::endl;
+        auto p0 = std::chrono::steady_clock::now();
+        const bool ok = SaveSampledCloudAsLas(*sampled, lasPath);
+        auto p1 = std::chrono::steady_clock::now();
+        if (ok) {
+            std::error_code ec;
+            auto sz = std::filesystem::file_size(lasPath, ec);
+            std::cout << "[LAS] 宸蹭繚瀛? " << sampled->cloud->size() << " points, 鑰楁椂 "
+                      << std::chrono::duration<double>(p1 - p0).count() << " s"
+                      << (ec ? "" : (", 鏂囦欢 " + std::to_string(sz) + " bytes")) << std::endl;
+        } else {
+            std::cerr << "[LAS] save failed." << std::endl;
+        }
+    }
+
+    // ---- 4) Select footprint source: AI mask raster or existing vector ----
+    std::cout << "Choose footprint source: image mask or existing vector? "
+              << "(i=image, v=vector): ";
+    char sourceMode = 'i';
+    std::cin >> sourceMode;
+    const bool useRasterMode = (sourceMode == 'i' || sourceMode == 'I');
+
+    if (useRasterMode) {
+    // ---- 4a) Extract initial outlines from the AI building mask ----
+    std::cout << "Select AI building mask GeoTIFF..." << std::endl;
+    if (!PickOpenTifFile(inputRaster)) {
+        std::cerr << "No input GeoTIFF selected. Exiting." << std::endl;
+        return 1;
+    }
+
+    char executablePath[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, executablePath, MAX_PATH);
+    inputVector = PrepareWritableShapefilePath(
+        std::filesystem::path(executablePath).parent_path() /
+            "initial_building_outline.shp",
+        "initial outline Shapefile").string();
+
+    std::cout << "[Mask] Extracting all non-black building regions..." << std::endl;
+    auto maskStart = std::chrono::steady_clock::now();
+    MaskVectorizationStats maskStats;
+    if (!VectorizeBuildingMask(inputRaster, inputVector, maskStats)) {
+        std::cerr << "Failed to extract building outlines from GeoTIFF." << std::endl;
+        return 1;
+    }
+    InitialOutlineMergeStats initialMergeStats;
+    int mergePasses = 0;
+    while (true) {
+        InitialOutlineMergeStats passStats;
+        const bool ok = MergeOversegmentedInitialOutlines(
+            inputVector, sampled, kdtree, metadataOffset, passStats);
+        if (!ok) {
+            if (mergePasses == 0) {
+                std::cerr << "Failed to evaluate adjacent initial outlines." << std::endl;
+                return 1;
+            }
+            break;
+        }
+        ++mergePasses;
+        initialMergeStats.adjacentCandidates += passStats.adjacentCandidates;
+        initialMergeStats.keptByModelEvidence += passStats.keptByModelEvidence;
+        initialMergeStats.keptNarrowSeam += passStats.keptNarrowSeam;
+        initialMergeStats.mergedPairs += passStats.mergedPairs;
+        initialMergeStats.mergedByBigPair += passStats.mergedByBigPair;
+        initialMergeStats.mergedByShape += passStats.mergedByShape;
+        initialMergeStats.mergedByParent += passStats.mergedByParent;
+        initialMergeStats.removedFeatures += passStats.removedFeatures;
+        std::cout << "[Mask merge pass " << mergePasses << "] accepted="
+                  << passStats.mergedPairs << ", removed=" << passStats.removedFeatures
+                  << ", narrow=" << passStats.keptNarrowSeam
+                  << ", evidence=" << passStats.keptByModelEvidence
+                  << ", big=" << passStats.mergedByBigPair
+                  << ", shape=" << passStats.mergedByShape
+                  << ", parent=" << passStats.mergedByParent << std::endl;
+        if (passStats.mergedPairs == 0) break;
+        if (mergePasses >= 20) {
+            std::cerr << "[Mask merge] reached max 20 passes." << std::endl;
+            break;
+        }
+    }
+
+    NarrowNeckSplitStats neckSplitStats;
+    if (!SplitInitialOutlinesAtNarrowNecks(inputVector, neckSplitStats)) {
+        std::cerr << "[Mask neck split] failed to evaluate initial outlines." << std::endl;
+    } else {
+        std::cout << "[Mask neck split] inspected=" << neckSplitStats.inspectedFeatures
+                  << ", split features=" << neckSplitStats.splitFeatures
+                  << ", cuts=" << neckSplitStats.cuts
+                  << ", created parts=" << neckSplitStats.createdParts
+                  << ", candidate-only=" << neckSplitStats.candidateOnly
+                  << ", reject-small-area=" << neckSplitStats.rejectedSmallPartArea
+                  << ", reject-invalid-ring=" << neckSplitStats.rejectedInvalidRing
+                  << ", reject-invalid-polygon=" << neckSplitStats.rejectedInvalidPolygon
+                  << std::endl;
+    }
+
+    // ---- 鍚堝苟鏀舵暃鍚庯細鍚告敹琚ぇ杞粨瀹屽叏鍖呭惈鐨勫唴閮ㄥ皬杞粨(鍒嗗壊/鏍呮牸鍖栨畫鐣? ----
+    const long long containedFootprintsRemoved =
+        RemoveContainedSmallFootprints(inputVector, kContainedFootprintMaxArea);
+    if (containedFootprintsRemoved > 0) {
+        std::cout << "[Mask] removed " << containedFootprintsRemoved
+                  << " contained small footprints (<= " << kContainedFootprintMaxArea
+                  << " m^2) inside larger outlines." << std::endl;
+    }
+
+    maskStats.polygonCount = std::max<long long>(
+        0, maskStats.polygonCount - initialMergeStats.removedFeatures
+               + (neckSplitStats.createdParts > 0
+                    ? neckSplitStats.createdParts - neckSplitStats.splitFeatures
+                    : 0)
+               - containedFootprintsRemoved);
+    auto maskEnd = std::chrono::steady_clock::now();
+    std::cout << "[Mask] raster=" << maskStats.width << "x" << maskStats.height
+              << ", source bands=" << maskStats.sourceBands
+              << ", used bands=" << maskStats.usedBands
+              << ", building pixels=" << maskStats.buildingPixels
+              << ", polygons=" << maskStats.polygonCount
+              << ", contained removed=" << maskStats.containedPolygonsRemoved << std::endl;
+    std::cout << "[Mask separation] colors=" << maskStats.sourceColorCount
+              << (maskStats.colorLabelsPreserved ? " (preserved)" : " (binary fallback)")
+              << ", pixel size=" << maskStats.pixelSizeX << " x " << maskStats.pixelSizeY
+              << " m, seed erosion radius=" << maskStats.erosionRadiusPixels
+              << " px, seeds=" << maskStats.seedCount
+              << ", split components=" << maskStats.splitComponentCount
+              << ", narrow waist splits=" << maskStats.narrowWaistSplitCount << std::endl;
+    std::cout << "[Mask merge] passes=" << mergePasses
+              << ", total adjacent candidates=" << initialMergeStats.adjacentCandidates
+              << ", narrow seams (not merged)=" << initialMergeStats.keptNarrowSeam
+              << ", kept by evidence=" << initialMergeStats.keptByModelEvidence
+              << ", accepted pairs=" << initialMergeStats.mergedPairs
+              << ", shape merges=" << initialMergeStats.mergedByShape
+              << ", parent merges=" << initialMergeStats.mergedByParent
+              << ", removed features=" << initialMergeStats.removedFeatures << std::endl;
+    std::cout << "[Mask neck split] split features=" << neckSplitStats.splitFeatures
+              << ", cuts=" << neckSplitStats.cuts
+              << ", created parts=" << neckSplitStats.createdParts
+              << ", candidate-only=" << neckSplitStats.candidateOnly
+              << ", reject-small-area=" << neckSplitStats.rejectedSmallPartArea
+              << ", reject-invalid-ring=" << neckSplitStats.rejectedInvalidRing
+              << ", reject-invalid-polygon=" << neckSplitStats.rejectedInvalidPolygon
+              << std::endl;
+    std::cout << "[Mask extent] X=" << maskStats.minX << ".." << maskStats.maxX
+              << ", Y=" << maskStats.minY << ".." << maskStats.maxY << std::endl;
+    std::cout << "[Mask] Initial outlines saved: " << inputVector << std::endl;
+    std::cout << "[Timing] mask vectorization: "
+              << std::chrono::duration<double>(maskEnd - maskStart).count() << " s" << std::endl;
+    } else {
+        std::cout << "Select input footprint Shapefile..." << std::endl;
+        if (!PickOpenFile(inputVector)) {
+            std::cerr << "No input Shapefile selected. Exiting." << std::endl;
+            return 1;
+        }
+    }
+
+    std::cout << "Select output Shapefile (.shp) to save..." << std::endl;
+    if (!PickSaveFile(outputVector)) {
+        std::cerr << "No output Shapefile selected. Exiting." << std::endl;
+        return 1;
+    }
+
+    if (std::filesystem::path(outputVector).lexically_normal() ==
+        std::filesystem::path(inputVector).lexically_normal()) {
+        std::cerr << "Output Shapefile must differ from the input footprint Shapefile." << std::endl;
+        return 1;
+    }
+
+    std::filesystem::create_directories(std::filesystem::path(outputVector).parent_path());
+    outputVector = PrepareWritableShapefilePath(
+        std::filesystem::path(outputVector),
+        "output Shapefile").string();
+    std::cout << "Metadata XML:   " << (metadataXml.empty() ? "(none)" : metadataXml) << std::endl;
+    std::cout << "SRSOrigin:      " << metadataOffset.x() << ", "
+              << metadataOffset.y() << ", " << metadataOffset.z() << std::endl;
+    std::cout << "Footprint mode: " << (useRasterMode ? "image mask" : "existing vector") << std::endl;
+    if (useRasterMode) {
+        std::cout << "Input raster:   " << inputRaster << std::endl;
+        std::cout << "Initial vector: " << inputVector << std::endl;
+    } else {
+        std::cout << "Input vector:   " << inputVector << std::endl;
+    }
+    std::cout << "Output vector:  " << outputVector << std::endl;
+
+    const Eigen::Vector3f cloudMin = sampled->boundingBox.min();
+    const Eigen::Vector3f cloudMax = sampled->boundingBox.max();
+    std::cout << "[Model extent local] X=" << cloudMin.x() << ".." << cloudMax.x()
+              << ", Y=" << cloudMin.y() << ".." << cloudMax.y() << std::endl;
+    std::cout << "[Model extent world] X=" << cloudMin.x() + metadataOffset.x()
+              << ".." << cloudMax.x() + metadataOffset.x()
+              << ", Y=" << cloudMin.y() + metadataOffset.y()
+              << ".." << cloudMax.y() + metadataOffset.y() << std::endl;
+
+    GDALDataset* inDataset = static_cast<GDALDataset*>(
+        GDALOpenEx(inputVector.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr));
+    if (!inDataset) {
+        std::cerr << "Cannot open input vector: " << inputVector << std::endl;
+        return 1;
+    }
+
+    OGRLayer* inLayer = inDataset->GetLayer(0);
+    if (!inLayer) {
+        std::cerr << "Input vector has no layer." << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+
+    // ---- 5) 鍒涘缓杈撳嚭 Shapefile(ESRI Shapefile 椹卞姩锛屼笁缁撮潰 wkbPolygon25D) ----
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) {
+        std::cerr << "Cannot find ESRI Shapefile driver." << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+
+    GDALDataset* outDataset = driver->Create(outputVector.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!outDataset) {
+        std::cerr << "Cannot create output vector: " << outputVector << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+
+    OGRLayer* outLayer = outDataset->CreateLayer(
+        "regularized_building", inLayer->GetSpatialRef(), wkbPolygon25D, nullptr);
+    if (!outLayer) {
+        std::cerr << "Cannot create output layer." << std::endl;
+        GDALClose(outDataset);
+        GDALClose(inDataset);
+        return 1;
+    }
+
+    CopyFields(inLayer, outLayer);   // 澶嶅埗瀛楁缁撴瀯
+    OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
+
+    auto ownershipStart = std::chrono::steady_clock::now();
+    SupportOwnershipContext supportOwnership =
+        BuildSupportOwnershipContext(inLayer, metadataOffset, sampled, kdtree);
+    auto ownershipEnd = std::chrono::steady_clock::now();
+    std::cout << "[Support ownership] indexed rings=" << supportOwnership.records.size()
+              << ", grid cells=" << supportOwnership.grid.size()
+              << ", build time="
+              << std::chrono::duration<double>(ownershipEnd - ownershipStart).count()
+              << " s" << std::endl;
+
+    // ---- 6) 閬嶅巻姣忎釜寤虹瓚鐗╄绱狅細瑙勫垯鍖栧嚑浣?+ 澶嶅埗灞炴€?+ 鍐欏嚭 ----
+    int total = 0;
+    int ok = 0;
+    RegularizationDebugCollector debugCollector;
+    auto loopStart = std::chrono::steady_clock::now();
+    inLayer->ResetReading();
+    while (OGRFeature* inFeature = inLayer->GetNextFeature()) {
+        ++total;
+        if (total % 50 == 0) {
+            std::cout << "  ...processing feature " << total << std::endl;
+        }
+        std::unique_ptr<OGRGeometry> outGeometry = RegularizeGeometry(
+            inFeature->GetGeometryRef(), sampled, kdtree, metadataOffset,
+            &supportOwnership,
+            inFeature->GetFID(), &debugCollector);
+        if (!outGeometry || outGeometry->IsEmpty()) {
+            std::cerr << "[Output] skip empty geometry for fid=" << inFeature->GetFID() << std::endl;
+            OGRFeature::DestroyFeature(inFeature);
+            continue;
+        }
+
+        OGRFeature* outFeature = OGRFeature::CreateFeature(outDefn);
+        if (!outFeature) {
+            std::cerr << "[Output] failed to create feature for fid=" << inFeature->GetFID() << std::endl;
+            OGRFeature::DestroyFeature(inFeature);
+            continue;
+        }
+
+        CopyFieldValues(inFeature, outFeature);
+        const OGRErr geomErr = outFeature->SetGeometry(outGeometry.get());
+        if (geomErr != OGRERR_NONE) {
+            std::cerr << "[Output] SetGeometry failed for fid=" << inFeature->GetFID()
+                      << ", geomType=" << outGeometry->getGeometryName()
+                      << ", err=" << static_cast<int>(geomErr) << std::endl;
+            OGRFeature::DestroyFeature(outFeature);
+            OGRFeature::DestroyFeature(inFeature);
+            continue;
+        }
+
+        const OGRErr createErr = outLayer->CreateFeature(outFeature);
+        if (createErr != OGRERR_NONE) {
+            std::cerr << "[Output] CreateFeature failed for fid=" << inFeature->GetFID()
+                      << ", geomType=" << outGeometry->getGeometryName()
+                      << ", err=" << static_cast<int>(createErr) << std::endl;
+        } else {
+            ++ok;
+        }
+        OGRFeature::DestroyFeature(outFeature);
+        OGRFeature::DestroyFeature(inFeature);
+    }
+    auto loopEnd = std::chrono::steady_clock::now();
+
+    const std::filesystem::path debugDir = std::filesystem::path(inputVector).parent_path();
+    const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";
+    const std::filesystem::path debugSupportPath = debugDir / "debug_support_points.las";
+    if (SaveDebugBestHypotheses(debugBestPath, debugCollector,
+            inLayer->GetSpatialRef(), metadataOffset)) {
+        std::cout << "[Debug] best hypotheses saved: " << debugBestPath.string()
+                  << " (" << debugCollector.hypotheses.size() << " rings)" << std::endl;
+    } else {
+        std::cerr << "[Debug] failed to save best hypotheses: "
+                  << debugBestPath.string() << std::endl;
+    }
+    if (SaveDebugSupportLas(debugSupportPath, debugCollector, metadataOffset)) {
+        std::cout << "[Debug] support points saved: " << debugSupportPath.string()
+                  << " (" << (debugCollector.support ? debugCollector.support->size() : 0)
+                  << " points)" << std::endl;
+    } else {
+        std::cerr << "[Debug] failed to save support points: "
+                  << debugSupportPath.string() << std::endl;
+    }
+
+    // Temporarily skip output overlap repair until write-out stability is verified.
+    // OutputOverlapRepairStats overlapStats;
+    // if (!ResolveOutputOverlaps(outLayer, overlapStats)) {
+    //     std::cerr << "[Output overlap] failed to repair overlapping polygons." << std::endl;
+    // } else if (overlapStats.resolvedPairs > 0 || overlapStats.overlapPairs > 0) {
+    //     std::cout << "[Output overlap] candidate pairs=" << overlapStats.candidatePairs
+    //               << ", remaining overlap pairs=" << overlapStats.overlapPairs
+    //               << ", resolved pairs=" << overlapStats.resolvedPairs
+    //               << ", shifted features=" << overlapStats.shiftedFeatures
+    //               << ", optimized groups=" << overlapStats.optimizedGroups
+    //               << ", unresolved pairs=" << overlapStats.unresolvedPairs
+    //               << ", max remaining overlap area=" << overlapStats.maxOverlapArea
+    //               << ", max shift=" << overlapStats.maxShiftDistance << std::endl;
+    // }
+
+    // ---- 璁℃椂姹囨€伙細瀹氫綅"鏀拺鐐规彁鍙?杩樻槸"瑙勫垯鍖栦紭鍖?鏄摱棰?----
+    double loopSec = std::chrono::duration<double>(loopEnd - loopStart).count();
+    std::cout << "[Timing] feature loop: " << loopSec << " s (" << total << " features)" << std::endl;
+    std::cout << "[Timing]   support extraction: " << g_supportTime << " s" << std::endl;
+    std::cout << "[Timing]   regularization opt: " << g_optimizeTime << " s" << std::endl;
+    std::cout << "[Filter] removed polygons with bbox area < " << kMinPolygonBBoxArea
+              << " m^2: " << g_removedSmallPolygons << std::endl;
+    std::cout << "[Filter] removed polygons outside sampled model: "
+              << g_removedOutsideModel << std::endl;
+    std::cout << "[Support ownership] rejected shared/neighbor support points: "
+              << g_supportOwnershipRejected << std::endl;
+    if (total > 0) {
+        std::cout << "[Timing]   avg per feature: " << (loopSec / total) << " s" << std::endl;
+    }
+
+    GDALClose(outDataset);
+    GDALClose(inDataset);
+
+    // ---- 7) 鎵撳嵃缁撴灉缁熻 ----
+    std::cout << "Regularization finished. success=" << ok << " / total=" << total << std::endl;
+    std::cout << "Output: " << outputVector << std::endl;
+    return ok > 0 ? 0 : 2;
+}
+
