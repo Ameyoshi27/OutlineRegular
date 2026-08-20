@@ -109,3 +109,13 @@ if(EXISTS "${LOCAL_DEPS_ROOT}/bin/laszip3.dll")
                 "${LOCAL_DEPS_ROOT}/bin/laszip3.dll"
                 "$<TARGET_FILE_DIR:outlineRegularTool>")
 endif()
+
+# Standalone mask nesting inspector (read-only diagnostic).
+add_executable(inspect_mask_nesting tools/inspect_mask_nesting.cpp)
+target_compile_definitions(inspect_mask_nesting PRIVATE _USE_MATH_DEFINES NOMINMAX)
+if(TARGET GDAL::GDAL)
+    target_link_libraries(inspect_mask_nesting PRIVATE GDAL::GDAL)
+else()
+    target_include_directories(inspect_mask_nesting PRIVATE ${GDAL_INCLUDE_DIR})
+    target_link_libraries(inspect_mask_nesting PRIVATE ${GDAL_LIBRARY})
+endif()

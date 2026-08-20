@@ -110,11 +110,51 @@ long long RemoveContainedPolygons(OGRLayer* layer)
             // hole in the parent. Test against the exterior shell so that the
             // parent's corresponding hole does not hide this containment.
             if (outer.exteriorShell->Contains(inner.geometry.get())) {
-                inner.remove = true;
                 inner.containerIndex = outerIndex;
                 break;
             }
         }
+    }
+
+    // Decide removal direction. A mask mosaicked from several AI batches may
+    // draw a coarse outer instance around finer instances of another batch:
+    // the outer ring is then just a slightly padded duplicate of the inner
+    // union (measured on real data: inner coverage 90-100% of the outer).
+    // Such wrappers must be dropped and the finer inner outlines kept. Real
+    // containment (a courtyard building etc.) has low inner coverage and keeps
+    // the previous behaviour (drop inner).
+    std::vector<double> innerAreaSum(polygons.size(), 0.0);
+    std::vector<int> innerCount(polygons.size(), 0);
+    for (std::size_t i = 0; i < polygons.size(); ++i) {
+        if (polygons[i].containerIndex == std::numeric_limits<std::size_t>::max()) {
+            continue;
+        }
+        innerAreaSum[polygons[i].containerIndex] += polygons[i].area;
+        ++innerCount[polygons[i].containerIndex];
+    }
+    std::vector<bool> isWrapper(polygons.size(), false);
+    for (std::size_t i = 0; i < polygons.size(); ++i) {
+        if (innerCount[i] == 0) continue;
+        const double shellArea = std::max(polygons[i].area, 1e-9);
+        const double coverage = innerAreaSum[i] / shellArea;
+        const bool wrapper = (innerCount[i] >= 2 && coverage >= 0.60) ||
+                             (innerCount[i] == 1 && coverage >= 0.75);
+        if (wrapper) {
+            isWrapper[i] = true;
+            std::cerr << "[Mask] wrapper artifact: outer_area=" << polygons[i].area
+                      << " inner_count=" << innerCount[i]
+                      << " inner_coverage=" << coverage
+                      << " -> drop outer, keep inner" << std::endl;
+        }
+    }
+    for (std::size_t i = 0; i < polygons.size(); ++i) {
+        if (polygons[i].containerIndex == std::numeric_limits<std::size_t>::max()) {
+            continue;
+        }
+        polygons[i].remove = !isWrapper[polygons[i].containerIndex];
+    }
+    for (std::size_t i = 0; i < polygons.size(); ++i) {
+        if (isWrapper[i]) polygons[i].remove = true;
     }
 
     long long removed = 0;
@@ -178,6 +218,159 @@ constexpr std::size_t kMaxReliableColorLabels = 65536;
 constexpr double kNarrowWaistMaxWidthRatio = 0.38;
 constexpr double kNarrowWaistMinCoreAreaRatio = 0.10;
 constexpr double kNarrowWaistMinSplitGapPixels = 2.0;
+// Batch-overlay wrapper thresholds (pixel stage). A mosaicked mask from
+// several AI batches may draw one coarse outer instance around finer
+// instances of another batch; the outer ring is a slightly padded duplicate
+// of the inner union. Measured on production masks: wrapper inner coverage
+// is 90-100% while real containment (courtyard buildings) stays below 10%.
+constexpr double kWrapperMultiInnerCoverage = 0.60;   // >= 2 inner components
+constexpr double kWrapperSingleInnerCoverage = 0.75;  // single inner component
+constexpr double kWrapperContainerVoteFrac = 0.95;    // ring votes must be one-sided
+constexpr double kWrapperMinComponentArea = 4.0;      // m2, ignore specks on both sides
+
+// Removes wrapper rings at the pixel level, BEFORE the watershed labeling:
+// most inner instances are smaller than the seed-area threshold and would
+// otherwise be absorbed into the wrapper's label, so a later polygon-level
+// fix can never see them.
+long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
+{
+    const int w = colorImage.cols;
+    const int h = colorImage.rows;
+    std::vector<int> comp(static_cast<std::size_t>(w) * h, -1);
+
+    struct CompInfo {
+        std::size_t pixels = 0;
+        int minX = 0, minY = 0, maxX = 0, maxY = 0;
+        int container = -1;
+        double containerVoteFrac = 0.0;
+    };
+    std::vector<CompInfo> comps;
+    std::vector<int> stack;
+    for (int y = 0; y < h; ++y) {
+        const int* row = colorImage.ptr<int>(y);
+        for (int x = 0; x < w; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) * w + x;
+            if (row[x] == 0 || comp[idx] >= 0) continue;
+            const int id = static_cast<int>(comps.size());
+            CompInfo info;
+            info.minX = x; info.maxX = x; info.minY = y; info.maxY = y;
+            stack.clear();
+            stack.push_back(static_cast<int>(idx));
+            comp[idx] = id;
+            const int color = row[x];
+            while (!stack.empty()) {
+                const int cur = stack.back();
+                stack.pop_back();
+                const int cy = cur / w;
+                const int cx = cur % w;
+                info.pixels++;
+                info.minX = std::min(info.minX, cx);
+                info.maxX = std::max(info.maxX, cx);
+                info.minY = std::min(info.minY, cy);
+                info.maxY = std::max(info.maxY, cy);
+                const int nb[4] = {cur - 1, cur + 1, cur - w, cur + w};
+                const bool ok[4] = {cx > 0, cx < w - 1, cy > 0, cy < h - 1};
+                for (int k = 0; k < 4; ++k) {
+                    if (!ok[k]) continue;
+                    const int n = nb[k];
+                    if (comp[n] < 0 &&
+                        colorImage.ptr<int>(n / w)[n % w] == color) {
+                        comp[n] = id;
+                        stack.push_back(n);
+                    }
+                }
+            }
+            comps.push_back(info);
+        }
+    }
+
+    // Boundary votes between different components (both directions).
+    std::vector<std::unordered_map<int, std::size_t>> votes(comps.size());
+    for (int y = 0; y < h; ++y) {
+        const int* row = colorImage.ptr<int>(y);
+        for (int x = 0; x < w; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) * w + x;
+            const int a = comp[idx];
+            if (a < 0) continue;   // background never needs a container
+            if (x + 1 < w) {
+                const int b = comp[idx + 1];
+                if (b >= 0 && b != a) { ++votes[a][b]; ++votes[b][a]; }
+            }
+            if (y + 1 < h) {
+                const int b = comp[idx + w];
+                if (b >= 0 && b != a) { ++votes[a][b]; ++votes[b][a]; }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        // Container = the smallest component that actually surrounds us:
+        // it must touch us (shared boundary edges) AND its bbox must contain
+        // ours (direction check — votes alone are symmetric). Packed inner
+        // instances share boundaries with each other, so no single-vote
+        // fraction threshold works; contact + bbox containment does.
+        int best = -1;
+        std::size_t bestPixels = 0;
+        for (const auto& v : votes[i]) {
+            const std::size_t j = static_cast<std::size_t>(v.first);
+            if (v.second < 5) continue;                       // needs real contact
+            if (comps[j].pixels <= comps[i].pixels) continue;  // must be bigger
+            if (comps[j].minX > comps[i].minX || comps[j].minY > comps[i].minY ||
+                comps[j].maxX < comps[i].maxX || comps[j].maxY < comps[i].maxY) {
+                continue;                                     // must contain us
+            }
+            if (best < 0 || comps[j].pixels < bestPixels) {
+                best = v.first;
+                bestPixels = comps[j].pixels;
+            }
+        }
+        if (best >= 0) {
+            comps[i].container = best;
+            comps[i].containerVoteFrac = 1.0;
+        }
+    }
+
+    // Wrapper decision per container (specks below the minimum area are
+    // ignored on both sides: they are label noise, not batch duplicates).
+    const std::size_t minPixels = static_cast<std::size_t>(
+        std::max(1.0, kWrapperMinComponentArea / std::max(pixelAreaMeters, 1e-9)));
+    std::vector<std::size_t> innerPixels(comps.size(), 0);
+    std::vector<int> innerCount(comps.size(), 0);
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        if (comps[i].container < 0) continue;
+        if (comps[i].pixels < minPixels) continue;
+        if (comps[static_cast<std::size_t>(comps[i].container)].pixels < minPixels) continue;
+        innerPixels[comps[i].container] += comps[i].pixels;
+        ++innerCount[comps[i].container];
+    }
+    std::vector<bool> isWrapper(comps.size(), false);
+    long long wrappers = 0;
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        if (innerCount[i] == 0) continue;
+        const double coverage =
+            static_cast<double>(innerPixels[i]) / static_cast<double>(comps[i].pixels);
+        const bool wrapper = (innerCount[i] >= 2 && coverage >= kWrapperMultiInnerCoverage) ||
+                             (innerCount[i] == 1 && coverage >= kWrapperSingleInnerCoverage);
+        if (!wrapper) continue;
+        isWrapper[i] = true;
+        ++wrappers;
+        std::cerr << "[Mask] wrapper ring removed: outer=" << comps[i].pixels * pixelAreaMeters
+                  << " m2 at px[" << comps[i].minX << "," << comps[i].minY << " "
+                  << comps[i].maxX - comps[i].minX + 1 << "x" << comps[i].maxY - comps[i].minY + 1
+                  << "], inner_count=" << innerCount[i]
+                  << ", inner_coverage=" << coverage << std::endl;
+    }
+
+    if (wrappers > 0) {
+        for (int y = 0; y < h; ++y) {
+            int* row = colorImage.ptr<int>(y);
+            for (int x = 0; x < w; ++x) {
+                const int c = comp[static_cast<std::size_t>(y) * w + x];
+                if (c >= 0 && isWrapper[c]) row[x] = 0;
+            }
+        }
+    }
+    return wrappers;
+}
 
 struct PixelBounds {
     int minX = std::numeric_limits<int>::max();
@@ -689,6 +882,10 @@ bool VectorizeBuildingMask(const std::string& tifPath,
     }
     stats.sourceColorCount = static_cast<long long>(colors.size());
     stats.colorLabelsPreserved = !tooManyColors;
+    if (!tooManyColors) {
+        RemoveBatchWrapperRings(
+            colorImage, stats.pixelSizeX * stats.pixelSizeY);
+    }
     std::unordered_map<int, int> labelToParent;
     cv::Mat separated = SeparateColorComponents(
         colorImage, stats.erosionRadiusPixels,
