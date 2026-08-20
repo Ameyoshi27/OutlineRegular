@@ -113,6 +113,31 @@ constexpr int kNotchMinSupportPoints = 8;
 constexpr double kNotchPreserveMidpointTol = 1.2;  // meters, bottom-edge midpoint match
 constexpr double kNotchPreserveAngleDeg = 20.0;
 constexpr double kNotchPreserveLengthRatio = 0.5;
+// ---- Structure-aware hypothesis repair (single-spike -> rectangle) ----
+// VDP encodes a real rectangular notch/protrusion as ONE extreme vertex (a
+// spike); the energy's vertex-count model term actively prefers that
+// degenerate encoding for small structures. This stage inspects each spike
+// against the ORIGINAL outline points in a local chord frame and rebuilds a
+// 3-corner rectangular structure when the raw evidence supports it, BEFORE
+// direction regularization (so Ceres optimizes the correct edge set).
+constexpr double kSpikeMinDepth = 1.2;        // m, spike height over the P->N chord
+constexpr double kSpikeMaxDepth = 8.0;
+constexpr double kSpikeChordMin = 1.5;        // m, chord length window
+constexpr double kSpikeChordMax = 30.0;
+constexpr double kRepairMinWidth = 0.8;       // m, structure opening width
+constexpr double kRepairMaxWidth = 12.0;
+constexpr double kRepairBottomBand = 0.5;     // m, v-band collecting bottom points
+constexpr double kRepairWallBand = 0.6;       // m, u-band collecting wall points
+constexpr double kRepairMinWallSpan = 1.0;    // m, wall extent along v
+constexpr int kRepairMinRawWallPoints = 4;    // original points per wall
+constexpr double kRepairSupportRadius = 0.8;  // m, mesh support near the 3 segments
+constexpr int kRepairMinSupportPoints = 6;
+constexpr double kRepairDataWeight = 1.0;     // gain weights for acceptance
+constexpr double kRepairSupportWeight = 0.5;
+constexpr double kRepairPerVertexCost = 0.12; // m of gain demanded per added vertex
+constexpr int kRepairMaxPerPolygon = 4;       // accepted repairs per hypothesis
+constexpr double kRepairMinNewEdge = 0.35;    // m, shortest edge after insertion
+constexpr double kRepairMaxAreaChange = 0.06; // relative polygon area change
 
 bool isSimplePolygon2D(const std::vector<pcl::PointXYZ>& pts);
 double undirectedAngleDifference(double a, double b);
@@ -2004,6 +2029,360 @@ std::vector<bool> BuildNotchVertexMask(
     return mask;
 }
 
+// ===== Structure-aware hypothesis repair =====
+// A spike vertex V with hypothesis neighbours P,N defines a local frame:
+// u along the chord P->N, v toward V. Original outline points inside the
+// window should show a 3-segment rectangular structure (entry wall, bottom,
+// exit wall) when the spike actually represents a real notch/protrusion.
+struct SpikeStructure {
+    std::size_t spikeIndex = 0;
+    bool isNotch = true;
+    double depth = 0.0;         // structure depth along v
+    double width = 0.0;         // opening width along u
+    int rawBottom = 0;          // original points on the bottom band
+    int rawWallLeft = 0;        // original points on each wall
+    int rawWallRight = 0;
+    int cloudSupport = 0;       // mesh support points near the 3 segments
+    pcl::PointXYZ c1, c2, c3, c4;   // corners, v=0 entry line to v=depth
+};
+
+double MeanDistanceToPolygonBoundary(
+    const std::vector<pcl::PointXYZ>& points,
+    const std::vector<pcl::PointXYZ>& polygon,
+    const std::vector<std::size_t>& indices)
+{
+    if (indices.empty() || polygon.size() < 3) return 0.0;
+    double sum = 0.0;
+    for (std::size_t idx : indices) {
+        const auto& p = points[idx];
+        double best = std::numeric_limits<double>::max();
+        for (std::size_t e = 0; e < polygon.size(); ++e) {
+            double t = 0.0;
+            best = std::min(best, distancePointToSegmentWithProjection(
+                p, polygon[e], polygon[(e + 1) % polygon.size()], t));
+        }
+        sum += best;
+    }
+    return sum / static_cast<double>(indices.size());
+}
+
+bool DetectSpikeStructure(
+    const std::vector<pcl::PointXYZ>& polygon,
+    std::size_t spikeIndex,
+    const std::vector<pcl::PointXYZ>& original,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
+    SpikeStructure& out)
+{
+    const std::size_t n = polygon.size();
+    if (n < 4 || spikeIndex >= n || original.size() < 6) return false;
+    const auto& P = polygon[(spikeIndex + n - 1) % n];
+    const auto& V = polygon[spikeIndex];
+    const auto& N = polygon[(spikeIndex + 1) % n];
+    const double chordX = N.x - P.x;
+    const double chordY = N.y - P.y;
+    const double chordLen = std::hypot(chordX, chordY);
+    if (chordLen < kSpikeChordMin || chordLen > kSpikeChordMax) return false;
+
+    const double ux = chordX / chordLen;
+    const double uy = chordY / chordLen;
+    // Spike height: perpendicular distance of V from the chord line.
+    const double crossPN = chordX * (V.y - P.y) - chordY * (V.x - P.x);
+    const double height = std::abs(crossPN) / chordLen;
+    if (height < kSpikeMinDepth || height > kSpikeMaxDepth) return false;
+
+    // Orientation: polygon majority turn sign; V on the exterior side => notch.
+    double turnSum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = polygon[i];
+        const auto& b = polygon[(i + 1) % n];
+        const auto& c = polygon[(i + 2) % n];
+        turnSum += static_cast<double>(b.x - a.x) * (c.y - b.y) -
+                   static_cast<double>(b.y - a.y) * (c.x - b.x);
+    }
+    const double majority = turnSum >= 0.0 ? 1.0 : -1.0;
+    const double sideSign = crossPN >= 0.0 ? 1.0 : -1.0;
+    const bool isNotch = sideSign * majority < 0.0;
+
+    // Local frame: v points toward V.
+    const double vx = -uy * sideSign;
+    const double vy = ux * sideSign;
+
+    // Window of original points around the chord.
+    std::vector<std::size_t> window;
+    for (std::size_t i = 0; i < original.size(); ++i) {
+        const double dx = original[i].x - P.x;
+        const double dy = original[i].y - P.y;
+        const double u = dx * ux + dy * uy;
+        const double v = dx * vx + dy * vy;
+        if (u < -1.2 || u > chordLen + 1.2) continue;
+        if (v < -0.6 || v > height + 2.0) continue;
+        window.push_back(i);
+    }
+    if (window.size() < 6) return false;
+
+    auto uvOf = [&](std::size_t i, double& u, double& v) {
+        const double dx = original[i].x - P.x;
+        const double dy = original[i].y - P.y;
+        u = dx * ux + dy * uy;
+        v = dx * vx + dy * vy;
+    };
+    double vMax = 0.0;
+    for (std::size_t i : window) {
+        double u = 0.0, v = 0.0;
+        uvOf(i, u, v);
+        vMax = std::max(vMax, v);
+    }
+    if (vMax < 0.75 * height) return false;   // spike not backed by raw data
+
+    // Bottom band: deepest points define the opening [uLo, uHi].
+    std::vector<double> bottomU;
+    for (std::size_t i : window) {
+        double u = 0.0, v = 0.0;
+        uvOf(i, u, v);
+        if (v >= vMax - kRepairBottomBand) bottomU.push_back(u);
+    }
+    if (bottomU.size() < 3) return false;
+    std::sort(bottomU.begin(), bottomU.end());
+    const double uLo = bottomU[bottomU.size() / 10];
+    const double uHi = bottomU[bottomU.size() - 1 - bottomU.size() / 10];
+    const double width = uHi - uLo;
+    if (width < kRepairMinWidth || width > kRepairMaxWidth) return false;
+    if (uLo < -0.8 || uHi > chordLen + 0.8) return false;
+
+    // Walls: points hugging the u-bounds and spanning down in v.
+    int rawLeft = 0, rawRight = 0, rawBottom = 0;
+    double leftVMin = 1e9, leftVMax = -1e9;
+    double rightVMin = 1e9, rightVMax = -1e9;
+    for (std::size_t i : window) {
+        double u = 0.0, v = 0.0;
+        uvOf(i, u, v);
+        if (v >= vMax - kRepairBottomBand) ++rawBottom;
+        if (u <= uLo + kRepairWallBand && v >= 0.35 * vMax) {
+            ++rawLeft;
+            leftVMin = std::min(leftVMin, v);
+            leftVMax = std::max(leftVMax, v);
+        }
+        if (u >= uHi - kRepairWallBand && v >= 0.35 * vMax) {
+            ++rawRight;
+            rightVMin = std::min(rightVMin, v);
+            rightVMax = std::max(rightVMax, v);
+        }
+    }
+    if (rawLeft < kRepairMinRawWallPoints || rawRight < kRepairMinRawWallPoints) return false;
+    if (leftVMax - leftVMin < kRepairMinWallSpan || rightVMax - rightVMin < kRepairMinWallSpan) {
+        return false;
+    }
+
+    // Corners back in world coordinates.
+    auto toXY = [&](double u, double v, pcl::PointXYZ& p) {
+        p.x = static_cast<float>(P.x + u * ux + v * vx);
+        p.y = static_cast<float>(P.y + u * uy + v * vy);
+        p.z = V.z;
+    };
+    SpikeStructure s;
+    s.spikeIndex = spikeIndex;
+    s.isNotch = isNotch;
+    s.depth = vMax;
+    s.width = width;
+    s.rawBottom = rawBottom;
+    s.rawWallLeft = rawLeft;
+    s.rawWallRight = rawRight;
+    toXY(uLo, 0.0, s.c1);
+    toXY(uLo, vMax, s.c2);
+    toXY(uHi, vMax, s.c3);
+    toXY(uHi, 0.0, s.c4);
+
+    // Mesh support near the three new segments (weak branch below when the
+    // area is occluded in the model).
+    if (support && !support->empty()) {
+        const pcl::PointXYZ seg[3][2] = {{s.c1, s.c2}, {s.c2, s.c3}, {s.c3, s.c4}};
+        for (const auto& p : support->points) {
+            double best = std::numeric_limits<double>::max();
+            for (int k = 0; k < 3; ++k) {
+                double t = 0.0;
+                best = std::min(best, distancePointToSegmentWithProjection(
+                    p, seg[k][0], seg[k][1], t));
+            }
+            if (best <= kRepairSupportRadius) ++s.cloudSupport;
+        }
+    }
+    const bool strongSupport = s.cloudSupport >= kRepairMinSupportPoints;
+    const bool weakButConvincing =
+        s.cloudSupport >= 2 &&
+        s.rawWallLeft >= 2 * kRepairMinRawWallPoints &&
+        s.rawWallRight >= 2 * kRepairMinRawWallPoints &&
+        s.depth >= 1.5 * kSpikeMinDepth;
+    if (!strongSupport && !weakButConvincing) return false;
+
+    out = s;
+    return true;
+}
+
+// Global repair statistics, printed once per run.
+long long g_repairFeaturesExamined = 0;
+long long g_repairFeaturesWithCandidates = 0;
+long long g_repairFeaturesRepaired = 0;
+long long g_repairCandidatesDetected = 0;
+long long g_repairAccepted = 0;
+long long g_repairVerticesAdded = 0;
+long long g_repairMaxVerticesAdded = 0;
+
+// Greedy repair: each round picks the best-scoring structure whose
+// data/support gain beats the added-vertex cost, re-detects, and stops at
+// kRepairMaxPerPolygon insertions.
+void RepairHypothesisStructures(
+    std::vector<pcl::PointXYZ>& polygon,
+    const std::vector<pcl::PointXYZ>& original,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
+    long long sourceFid)
+{
+    ++g_repairFeaturesExamined;
+    if (polygon.size() < 4) return;
+    const double baseArea = polygonArea2D(polygon);
+
+    bool anyCandidate = false;
+    int accepted = 0;
+    int verticesAdded = 0;
+
+    for (int round = 0; round < kRepairMaxPerPolygon; ++round) {
+        const std::size_t n = polygon.size();
+        double bestScore = 0.0;   // must beat zero (cost included)
+        std::size_t bestSpike = n;
+        SpikeStructure bestStruct;
+        std::vector<pcl::PointXYZ> bestCandidate;
+
+        for (std::size_t i = 0; i < n; ++i) {
+            SpikeStructure s;
+            if (!DetectSpikeStructure(polygon, i, original, support, s)) continue;
+            anyCandidate = true;
+            ++g_repairCandidatesDetected;
+
+            // Build repaired polygon: P ... V ... N  ->  P c1 c2 c3 c4 N.
+            std::vector<pcl::PointXYZ> candidate;
+            candidate.reserve(n + 3);
+            for (std::size_t k = 0; k < n; ++k) {
+                if (k == s.spikeIndex) {
+                    candidate.push_back(s.c1);
+                    candidate.push_back(s.c2);
+                    candidate.push_back(s.c3);
+                    candidate.push_back(s.c4);
+                } else {
+                    candidate.push_back(polygon[k]);
+                }
+            }
+            removeDuplicatePoints2D(candidate, 1e-4f);
+            if (candidate.size() < 4 || !isSimplePolygon2D(candidate)) continue;
+            if (std::abs(polygonArea2D(candidate) - baseArea) >
+                    kRepairMaxAreaChange * std::max(baseArea, 1.0)) {
+                continue;
+            }
+            double minEdge = std::numeric_limits<double>::max();
+            for (std::size_t e = 0; e < candidate.size(); ++e) {
+                minEdge = std::min(minEdge, std::hypot(
+                    static_cast<double>(candidate[(e + 1) % candidate.size()].x - candidate[e].x),
+                    static_cast<double>(candidate[(e + 1) % candidate.size()].y - candidate[e].y)));
+            }
+            if (minEdge < kRepairMinNewEdge) continue;
+
+            // Gains: original points near the spike and nearby support points
+            // must get closer to the boundary by more than the vertex cost.
+            double dataGain = 0.0;
+            double supportGain = 0.0;
+            std::vector<std::size_t> rawIdx;
+            for (std::size_t q = 0; q < original.size(); ++q) {
+                if (std::hypot(original[q].x - polygon[s.spikeIndex].x,
+                               original[q].y - polygon[s.spikeIndex].y) <=
+                    s.depth + 1.5) {
+                    rawIdx.push_back(q);
+                }
+            }
+            std::vector<pcl::PointXYZ> rawStorage;
+            for (std::size_t q : rawIdx) rawStorage.push_back(original[q]);
+            std::vector<std::size_t> rawAll(rawIdx.size());
+            for (std::size_t q = 0; q < rawIdx.size(); ++q) rawAll[q] = q;
+            if (!rawAll.empty()) {
+                dataGain = MeanDistanceToPolygonBoundary(original, polygon, rawIdx) -
+                          MeanDistanceToPolygonBoundary(rawStorage, candidate, rawAll);
+            }
+            if (support && !support->empty()) {
+                const auto& V0 = polygon[s.spikeIndex];
+                std::vector<std::size_t> supIdx;
+                for (std::size_t q = 0; q < support->size(); ++q) {
+                    if (std::hypot(support->points[q].x - V0.x,
+                                   support->points[q].y - V0.y) <= s.depth + 1.5) {
+                        supIdx.push_back(q);
+                    }
+                }
+                if (!supIdx.empty()) {
+                    // support->points uses an aligned allocator; copy into a
+                    // plain vector for the shared distance helper.
+                    std::vector<pcl::PointXYZ> supStorage;
+                    for (std::size_t q : supIdx) supStorage.push_back(support->points[q]);
+                    std::vector<std::size_t> supAll(supIdx.size());
+                    for (std::size_t q = 0; q < supIdx.size(); ++q) supAll[q] = q;
+                    supportGain = MeanDistanceToPolygonBoundary(supStorage, polygon, supAll) -
+                                  MeanDistanceToPolygonBoundary(supStorage, candidate, supAll);
+                }
+            }
+
+            const double cost = 3.0 * kRepairPerVertexCost;
+            const double score = kRepairDataWeight * dataGain +
+                                 kRepairSupportWeight * supportGain - cost;
+            std::cerr << "[HypothesisRepair] source_fid=" << sourceFid
+                      << " feature=" << (s.isNotch ? "notch" : "protrusion")
+                      << " depth=" << s.depth << " width=" << s.width
+                      << " raw_bottom=" << s.rawBottom
+                      << " raw_wall=" << s.rawWallLeft << "/" << s.rawWallRight
+                      << " cloud_support=" << s.cloudSupport
+                      << " data_gain=" << dataGain
+                      << " support_gain=" << supportGain
+                      << " complexity_cost=" << cost
+                      << " score=" << score << std::endl;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestSpike = s.spikeIndex;
+                bestStruct = s;
+                bestCandidate = std::move(candidate);
+            }
+        }
+
+        if (bestSpike >= polygon.size() || bestCandidate.empty()) break;
+
+        std::cerr << "[HypothesisRepair] source_fid=" << sourceFid
+                  << " accepted=1 round=" << round
+                  << " vertices=" << polygon.size() << "->" << bestCandidate.size()
+                  << " score=" << bestScore << std::endl;
+        verticesAdded += static_cast<int>(bestCandidate.size() - polygon.size());
+        polygon = std::move(bestCandidate);
+        ++accepted;
+        ++g_repairAccepted;
+    }
+
+    if (anyCandidate) ++g_repairFeaturesWithCandidates;
+    if (accepted > 0) {
+        ++g_repairFeaturesRepaired;
+        g_repairVerticesAdded += verticesAdded;
+        g_repairMaxVerticesAdded = std::max(g_repairMaxVerticesAdded,
+                                            static_cast<long long>(verticesAdded));
+    }
+}
+
+void PrintHypothesisRepairStats()
+{
+    std::cerr << "[HypothesisRepair] summary examined=" << g_repairFeaturesExamined
+              << ", with_candidates=" << g_repairFeaturesWithCandidates
+              << ", repaired_features=" << g_repairFeaturesRepaired
+              << ", accepted_repairs=" << g_repairAccepted
+              << ", vertices_added_total=" << g_repairVerticesAdded
+              << ", avg_per_repaired="
+              << (g_repairFeaturesRepaired > 0
+                      ? static_cast<double>(g_repairVerticesAdded) /
+                            static_cast<double>(g_repairFeaturesRepaired)
+                      : 0.0)
+              << ", max_per_feature=" << g_repairMaxVerticesAdded << std::endl;
+}
+
 bool forceOrthogonalPolygonToAngle(
     const std::vector<pcl::PointXYZ>& input,
     double main_angle,
@@ -2799,6 +3178,13 @@ bool isSingleDirectionCandidateAcceptable(
 }
 }
 
+// Run-level summary of structure-aware hypothesis repairs (impl lives in the
+// anonymous namespace above).
+void outlineRegular::PrintHypothesisRepairSummary()
+{
+    PrintHypothesisRepairStats();
+}
+
 bool outlineRegular::estimateSupportDirection2D(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
     double& angle,
@@ -3435,10 +3821,27 @@ void outlineRegular::regular_Contour()
         //std::vector<std::pair<int, int>> perp_pairs, parallel_pairs;
         //computeConstraintPairs(best_hypothesis, perp_pairs, parallel_pairs);
         //ceresOptimize(best_hypothesis, ransac_inner_cloud, perp_pairs, parallel_pairs);
-        //优化final_points     
+        //优化final_points
         pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud(new pcl::PointCloud<pcl::PointXYZ>);
         for (auto& op : best_hypothesis) { input_cloud->points.push_back(op); }
-        
+
+        // Structure-aware hypothesis repair (R1): VDP collapses real
+        // rectangular notches/protrusions into single spike vertices, which
+        // the downstream orthogonal chain cannot recover. Runs AFTER the
+        // pre-cleanup (so the topology repair cannot dissolve freshly
+        // rebuilt structures) and BEFORE fallback_hypothesis is captured
+        // (so acceptance references and notch protection see them).
+        {
+            const std::size_t beforeRepair = best_hypothesis.size();
+            RepairHypothesisStructures(
+                best_hypothesis, original_points, fitting_cloud, source_feature_id_);
+            if (best_hypothesis.size() != beforeRepair) {
+                best_energy_hypothesis_ = best_hypothesis;
+                input_cloud->points.assign(
+                    best_hypothesis.begin(), best_hypothesis.end());
+            }
+        }
+
         std::vector<pcl::PointXYZ> fallback_hypothesis = best_hypothesis;
 
         const OutlineTuning model_tuning = makeOutlineTuning(

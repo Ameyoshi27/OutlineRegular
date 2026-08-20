@@ -124,6 +124,9 @@ public:
 
 	void regular_Contour();
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
+	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
+	// Prints the run-level summary of structure-aware hypothesis repairs.
+	static void PrintHypothesisRepairSummary();
 	static bool estimateSupportDirection2D(
 		const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
 		double& angle,
@@ -220,6 +223,7 @@ private:
 	double support_direction_hint_ = 0.0;
 	double support_direction_peak_ratio_ = 0.0;
 	std::size_t support_direction_pair_count_ = 0;
+	long long source_feature_id_ = -1;   // for [HypothesisRepair] logging only
 
 	double computeAdaptiveLambda(double resolution, const std::vector<pcl::PointXYZ>& points);
 

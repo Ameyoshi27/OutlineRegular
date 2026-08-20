@@ -882,7 +882,8 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     const SupportOwnershipContext* ownership = nullptr,
     std::size_t currentRingId = static_cast<std::size_t>(-1),
     std::vector<pcl::PointXYZ>* debugBestHypothesis = nullptr,
-    std::vector<pcl::PointXYZ>* debugSupport = nullptr)
+    std::vector<pcl::PointXYZ>* debugSupport = nullptr,
+    long long sourceFid = -1)
 {
     if (ring.size() < 3) return ring;
 
@@ -947,6 +948,7 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     // ---- 瑙勫垯鍖栦紭鍖?璁℃椂) ----
     // The AI mask is the initial contour, not an independent DLG observation.
     outlineRegular regularizer(ring, support, weightedSupport.weights);
+    regularizer.setSourceFeatureId(sourceFid);
     double wallDirection = 0.0;
     double wallPeakRatio = 0.0;
     std::size_t wallPairCount = 0;
@@ -3215,7 +3217,7 @@ std::unique_ptr<OGRGeometry> RegularizeGeometry(
         auto regularized = RegularizeRing(ring, sampled, kdtree,
             ownership, ringId,
             debug ? &bestHypothesis : nullptr,
-            debug ? &support : nullptr);
+            debug ? &support : nullptr, sourceFid);
         if (debug && bestHypothesis.size() >= 3) {
             debug->hypotheses.push_back({sourceFid, 0, bestHypothesis});
             AppendDebugSupportPoints(support, sourceFid, 0, debug);
@@ -3252,7 +3254,7 @@ std::unique_ptr<OGRGeometry> RegularizeGeometry(
             auto regularized = RegularizeRing(ring, sampled, kdtree,
                 ownership, ringId,
                 debug ? &bestHypothesis : nullptr,
-                debug ? &support : nullptr);
+                debug ? &support : nullptr, sourceFid);
             if (debug && bestHypothesis.size() >= 3) {
                 debug->hypotheses.push_back({sourceFid, partIndex, bestHypothesis});
                 AppendDebugSupportPoints(support, sourceFid, partIndex, debug);
@@ -3791,6 +3793,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         OGRFeature::DestroyFeature(inFeature);
     }
     auto loopEnd = std::chrono::steady_clock::now();
+    outlineRegular::PrintHypothesisRepairSummary();
 
     const std::filesystem::path debugDir = std::filesystem::path(inputVector).parent_path();
     const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";
