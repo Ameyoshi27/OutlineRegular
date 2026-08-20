@@ -3569,11 +3569,23 @@ void outlineRegular::regular_Contour()
                 const double notchMinDepth = std::max(
                     kNotchMinDepthFloor,
                     kNotchMinDepthFactor * model_tuning.repair_distance);
+                // Reference notches come from the RAW hypothesis, not from the
+                // candidate sources: the first source (post-repair topology
+                // candidate) may have already dissolved the notches, in which
+                // case source-local detection would find nothing to protect.
+                const auto referenceNotches = DetectEvidenceBackedNotches(
+                    fallback_hypothesis, fitting_cloud, notchMinDepth, kNotchMaxWidth);
+                if (!referenceNotches.empty()) {
+                    std::cerr << "[NotchProtect] reference_notches="
+                              << referenceNotches.size() << " (widths:";
+                    for (const auto& notch : referenceNotches) {
+                        std::cerr << " " << notch.width << "x" << notch.depth;
+                    }
+                    std::cerr << " m)" << std::endl;
+                }
                 for (const auto& source : single_sources) {
-                    // Evidence-backed notches of this source must survive the
-                    // orthogonal snap; otherwise the notch is rejected in
-                    // favour of the next candidate source (the raw hypothesis
-                    // is the last one and keeps them by construction).
+                    // Local (source-own) notches drive the vertex protection
+                    // mask inside the orthogonal snap.
                     const auto protectedNotches = DetectEvidenceBackedNotches(
                         source, fitting_cloud, notchMinDepth, kNotchMaxWidth);
                     std::vector<bool> notchMask;
@@ -3597,19 +3609,16 @@ void outlineRegular::regular_Contour()
                             candidate, fallback_hypothesis, model_tuning)) {
                         continue;
                     }
-                    if (!protectedNotches.empty()) {
+                    // Every REFERENCE notch must survive in the candidate.
+                    if (!referenceNotches.empty()) {
                         int preservedCount = 0;
-                        for (const auto& notch : protectedNotches) {
+                        for (const auto& notch : referenceNotches) {
                             if (NotchPreservedInCandidate(candidate, notch)) ++preservedCount;
                         }
-                        if (preservedCount < static_cast<int>(protectedNotches.size())) {
+                        if (preservedCount < static_cast<int>(referenceNotches.size())) {
                             std::cerr << "[NotchProtect] reject source: kept "
-                                      << preservedCount << "/" << protectedNotches.size()
-                                      << " notches (widths:";
-                            for (const auto& notch : protectedNotches) {
-                                std::cerr << " " << notch.width << "x" << notch.depth;
-                            }
-                            std::cerr << " m)" << std::endl;
+                                      << preservedCount << "/" << referenceNotches.size()
+                                      << " reference notches" << std::endl;
                             continue;
                         }
                     }

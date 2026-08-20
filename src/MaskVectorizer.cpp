@@ -769,6 +769,15 @@ bool VectorizeBuildingMask(const std::string& tifPath,
         std::cerr << "[Mask] Cannot create parent attribute." << std::endl;
         return false;
     }
+    // Stable per-polygon identifier assigned once at vectorization time. It
+    // survives the merge/split stages (CopyFieldValues propagates it to parts
+    // and merged features) while FIDs churn, so initial outlines, debug
+    // hypotheses and the regularized output can be joined on it.
+    OGRFieldDefn idField("id", OFTInteger64);
+    if (layer->CreateField(&idField) != OGRERR_NONE) {
+        std::cerr << "[Mask] Cannot create id attribute." << std::endl;
+        return false;
+    }
     if (GDALPolygonize(labels->GetRasterBand(1), valid->GetRasterBand(1),
                        layer, 0, nullptr, nullptr, nullptr) != CE_None) {
         std::cerr << "[Mask] GDALPolygonize failed." << std::endl;
@@ -779,7 +788,8 @@ bool VectorizeBuildingMask(const std::string& tifPath,
         OGRFeatureDefn* defn = layer->GetLayerDefn();
         const int maskIdx = defn->GetFieldIndex("mask");
         const int parentIdx = defn->GetFieldIndex("parent");
-        if (maskIdx >= 0 && parentIdx >= 0) {
+        const int idIdx = defn->GetFieldIndex("id");
+        if (maskIdx >= 0 && parentIdx >= 0 && idIdx >= 0) {
             layer->ResetReading();
             while (OGRFeature* feature = layer->GetNextFeature()) {
                 const int maskValue = feature->GetFieldAsInteger(maskIdx);
@@ -787,6 +797,7 @@ bool VectorizeBuildingMask(const std::string& tifPath,
                 if (it != labelToParent.end()) {
                     feature->SetField(parentIdx, it->second);
                 }
+                feature->SetField(idIdx, feature->GetFID());
                 layer->SetFeature(feature);
                 OGRFeature::DestroyFeature(feature);
             }

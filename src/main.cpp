@@ -3322,9 +3322,11 @@ if (!RemoveShapefileFamily(outputPath)) return false;
         return false;
     }
     OGRFieldDefn srcField("src_fid", OFTInteger64);
+    OGRFieldDefn idField("id", OFTInteger64);
     OGRFieldDefn ringField("ring_id", OFTInteger);
     OGRFieldDefn ptsField("npoints", OFTInteger);
     layer->CreateField(&srcField);
+    layer->CreateField(&idField);
     layer->CreateField(&ringField);
     layer->CreateField(&ptsField);
     OGRFeatureDefn* defn = layer->GetLayerDefn();
@@ -3335,6 +3337,9 @@ if (!RemoveShapefileFamily(outputPath)) return false;
         if (!polygon) continue;
         OGRFeature* feature = OGRFeature::CreateFeature(defn);
         feature->SetField("src_fid", static_cast<GIntBig>(record.sourceFid));
+        // Uniform stable building id (joins with initial_building_outline and
+        // the regularized output; equals src_fid for raster-mode inputs).
+        feature->SetField("id", static_cast<GIntBig>(record.sourceFid));
         feature->SetField("ring_id", record.ringIndex);
         feature->SetField("npoints", static_cast<int>(record.points.size()));
         feature->SetGeometry(polygon.get());
@@ -3705,6 +3710,17 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
     }
 
     CopyFields(inLayer, outLayer);   // 澶嶅埗瀛楁缁撴瀯
+    // Ensure the output carries the stable building id (assigned once at mask
+    // vectorization, propagated through merge/split stages); fall back to the
+    // input FID when the field is absent (existing-vector input mode).
+    const int inIdFieldIdx = inLayer->GetLayerDefn()->GetFieldIndex("id");
+    int outIdFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("id");
+    if (outIdFieldIdx < 0) {
+        OGRFieldDefn idField("id", OFTInteger64);
+        if (outLayer->CreateField(&idField) == OGRERR_NONE) {
+            outIdFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("id");
+        }
+    }
     OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
 
     auto ownershipStart = std::chrono::steady_clock::now();
@@ -3728,10 +3744,14 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         if (total % 50 == 0) {
             std::cout << "  ...processing feature " << total << std::endl;
         }
+        GIntBig buildingId = inFeature->GetFID();
+        if (inIdFieldIdx >= 0 && inFeature->IsFieldSetAndNotNull(inIdFieldIdx)) {
+            buildingId = inFeature->GetFieldAsInteger64(inIdFieldIdx);
+        }
         std::unique_ptr<OGRGeometry> outGeometry = RegularizeGeometry(
             inFeature->GetGeometryRef(), sampled, kdtree, metadataOffset,
             &supportOwnership,
-            inFeature->GetFID(), &debugCollector);
+            buildingId, &debugCollector);
         if (!outGeometry || outGeometry->IsEmpty()) {
             std::cerr << "[Output] skip empty geometry for fid=" << inFeature->GetFID() << std::endl;
             OGRFeature::DestroyFeature(inFeature);
@@ -3746,6 +3766,9 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         }
 
         CopyFieldValues(inFeature, outFeature);
+        if (outIdFieldIdx >= 0) {
+            outFeature->SetField(outIdFieldIdx, buildingId);
+        }
         const OGRErr geomErr = outFeature->SetGeometry(outGeometry.get());
         if (geomErr != OGRERR_NONE) {
             std::cerr << "[Output] SetGeometry failed for fid=" << inFeature->GetFID()
