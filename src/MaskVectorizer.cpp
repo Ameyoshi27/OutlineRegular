@@ -227,6 +227,98 @@ constexpr double kWrapperMultiInnerCoverage = 0.60;   // >= 2 inner components
 constexpr double kWrapperSingleInnerCoverage = 0.75;  // single inner component
 constexpr double kWrapperContainerVoteFrac = 0.95;    // ring votes must be one-sided
 constexpr double kWrapperMinComponentArea = 4.0;      // m2, ignore specks on both sides
+// Hairline seam/bridge components: the mosaic overlay of several AI batches
+// leaves 1-2 px wide anti-alias seams between instances (measured colors
+// d50400 / f70e00 families). When such a hairline runs BETWEEN two instances
+// it welds them into one foreground component after watershed absorption;
+// when it BRIDGES two instances it fuses them outright. Both destroy real
+// instance separation (cases id=1949 seam, id=3400 bridge). Hairlines are
+// turned into background so the instances stay disconnected. Real buildings
+// are never hairline-shaped, so the shape gate is safe.
+constexpr int kHairlineMaxThicknessPx = 3;   // bbox thin side
+constexpr int kHairlineMinLengthPx = 15;     // bbox long side
+constexpr double kHairlineFillRatio = 0.55;  // pixels / (thin x long bbox): line-like
+
+long long RemoveHairlineSeamComponents(cv::Mat& colorImage, double pixelAreaMeters)
+{
+    const int w = colorImage.cols;
+    const int h = colorImage.rows;
+    std::vector<int> comp(static_cast<std::size_t>(w) * h, -1);
+    struct HairInfo {
+        int minX = 0, minY = 0, maxX = 0, maxY = 0;
+        std::size_t pixels = 0;
+    };
+    std::vector<HairInfo> comps;
+    std::vector<int> stack;
+    for (int y = 0; y < h; ++y) {
+        const int* row = colorImage.ptr<int>(y);
+        for (int x = 0; x < w; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) * w + x;
+            if (row[x] == 0 || comp[idx] >= 0) continue;
+            const int id = static_cast<int>(comps.size());
+            HairInfo info;
+            info.minX = x; info.maxX = x; info.minY = y; info.maxY = y;
+            stack.clear();
+            stack.push_back(static_cast<int>(idx));
+            comp[idx] = id;
+            const int color = row[x];
+            while (!stack.empty()) {
+                const int cur = stack.back();
+                stack.pop_back();
+                const int cy = cur / w;
+                const int cx = cur % w;
+                info.pixels++;
+                info.minX = std::min(info.minX, cx);
+                info.maxX = std::max(info.maxX, cx);
+                info.minY = std::min(info.minY, cy);
+                info.maxY = std::max(info.maxY, cy);
+                const int nb[4] = {cur - 1, cur + 1, cur - w, cur + w};
+                const bool ok[4] = {cx > 0, cx < w - 1, cy > 0, cy < h - 1};
+                for (int k = 0; k < 4; ++k) {
+                    if (!ok[k]) continue;
+                    const int n = nb[k];
+                    if (comp[n] < 0 && colorImage.ptr<int>(n / w)[n % w] == color) {
+                        comp[n] = id;
+                        stack.push_back(n);
+                    }
+                }
+            }
+            comps.push_back(info);
+        }
+    }
+
+    std::vector<bool> isHairline(comps.size(), false);
+    long long removed = 0;
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        const int bw = comps[i].maxX - comps[i].minX + 1;
+        const int bh = comps[i].maxY - comps[i].minY + 1;
+        const int thin = std::min(bw, bh);
+        const int longSide = std::max(bw, bh);
+        if (thin > kHairlineMaxThicknessPx) continue;
+        if (longSide < kHairlineMinLengthPx) continue;
+        const double fill = static_cast<double>(comps[i].pixels) /
+                            static_cast<double>(thin * longSide);
+        if (fill < kHairlineFillRatio) continue;
+        isHairline[i] = true;
+        ++removed;
+        if (removed <= 40) {
+            std::cerr << "[Mask] hairline seam removed: color_id px=" << comps[i].pixels
+                      << " bbox=" << bw << "x" << bh
+                      << " at px[" << comps[i].minX << "," << comps[i].minY << "]"
+                      << " (" << comps[i].pixels * pixelAreaMeters << " m2)" << std::endl;
+        }
+    }
+    if (removed > 0) {
+        for (int y = 0; y < h; ++y) {
+            int* row = colorImage.ptr<int>(y);
+            for (int x = 0; x < w; ++x) {
+                const int c = comp[static_cast<std::size_t>(y) * w + x];
+                if (c >= 0 && isHairline[c]) row[x] = 0;
+            }
+        }
+    }
+    return removed;
+}
 
 // Removes wrapper rings at the pixel level, BEFORE the watershed labeling:
 // most inner instances are smaller than the seed-area threshold and would
@@ -962,6 +1054,8 @@ bool VectorizeBuildingMask(const std::string& tifPath,
     stats.sourceColorCount = static_cast<long long>(colors.size());
     stats.colorLabelsPreserved = !tooManyColors;
     if (!tooManyColors) {
+        RemoveHairlineSeamComponents(
+            colorImage, stats.pixelSizeX * stats.pixelSizeY);
         RemoveBatchWrapperRings(
             colorImage, stats.pixelSizeX * stats.pixelSizeY);
     }
