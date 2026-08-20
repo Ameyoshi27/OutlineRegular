@@ -348,9 +348,88 @@ long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
         if (innerCount[i] == 0) continue;
         const double coverage =
             static_cast<double>(innerPixels[i]) / static_cast<double>(comps[i].pixels);
-        const bool wrapper = (innerCount[i] >= 2 && coverage >= kWrapperMultiInnerCoverage) ||
-                             (innerCount[i] == 1 && coverage >= kWrapperSingleInnerCoverage);
-        if (!wrapper) continue;
+        const bool coveragePass = (innerCount[i] >= 2 && coverage >= kWrapperMultiInnerCoverage) ||
+                                  (innerCount[i] == 1 && coverage >= kWrapperSingleInnerCoverage);
+        if (!coveragePass) continue;
+
+        // Ring-thickness profile: a duplicate-batch artifact ring is a thin
+        // band (1-3 px) around the inner union everywhere, while a batch-edge
+        // REMAINDER (one real building, finer batch clipped by the tile, the
+        // coarse batch's leftover part visible as the "ring") has a thick lobe
+        // far from the inner boundary — that case must fall through to the
+        // merge stage instead of being erased here.
+        const bool thinRing = [&]() {
+            std::vector<int> innerSet;
+            for (std::size_t k = 0; k < comps.size(); ++k) {
+                if (comps[k].container == static_cast<int>(i) &&
+                    comps[k].pixels >= minPixels) {
+                    innerSet.push_back(static_cast<int>(k));
+                }
+            }
+            const int margin = 8;
+            const int wx0 = std::max(0, comps[i].minX - margin);
+            const int wy0 = std::max(0, comps[i].minY - margin);
+            const int wx1 = std::min(w - 1, comps[i].maxX + margin);
+            const int wy1 = std::min(h - 1, comps[i].maxY + margin);
+            const int ww = wx1 - wx0 + 1;
+            const int wh = wy1 - wy0 + 1;
+            std::vector<std::int16_t> dist(static_cast<std::size_t>(ww) * wh, -1);
+            std::vector<int> queue;
+            for (int y = wy0; y <= wy1; ++y) {
+                for (int x = wx0; x <= wx1; ++x) {
+                    const int c = comp[static_cast<std::size_t>(y) * w + x];
+                    bool isInner = false;
+                    for (int innerId : innerSet) {
+                        if (c == innerId) { isInner = true; break; }
+                    }
+                    if (isInner) {
+                        const std::size_t wi = static_cast<std::size_t>(y - wy0) * ww + (x - wx0);
+                        dist[wi] = 0;
+                        queue.push_back(static_cast<int>(wi));
+                    }
+                }
+            }
+            // BFS from the inner union, capped: everything farther than the
+            // cap stays "far" and counts against the thin-ring test.
+            const std::int16_t cap = 6;
+            for (std::size_t head = 0; head < queue.size(); ++head) {
+                const int wi = queue[head];
+                const std::int16_t d = dist[static_cast<std::size_t>(wi)];
+                if (d >= cap) continue;
+                const int cx = wi % ww;
+                const int cy = wi / ww;
+                const int nb[4] = {wi - 1, wi + 1, wi - ww, wi + ww};
+                const bool ok[4] = {cx > 0, cx < ww - 1, cy > 0, cy < wh - 1};
+                for (int k = 0; k < 4; ++k) {
+                    if (!ok[k]) continue;
+                    const std::size_t n = static_cast<std::size_t>(nb[k]);
+                    if (dist[n] >= 0) continue;
+                    dist[n] = static_cast<std::int16_t>(d + 1);
+                    queue.push_back(static_cast<int>(n));
+                }
+            }
+            std::vector<int> outerDists;
+            for (int y = comps[i].minY; y <= comps[i].maxY; ++y) {
+                for (int x = comps[i].minX; x <= comps[i].maxX; ++x) {
+                    if (comp[static_cast<std::size_t>(y) * w + x] != static_cast<int>(i)) continue;
+                    outerDists.push_back(dist[static_cast<std::size_t>(y - wy0) * ww + (x - wx0)]);
+                }
+            }
+            if (outerDists.empty()) return false;
+            std::sort(outerDists.begin(), outerDists.end());
+            const int p90 = outerDists[outerDists.size() / 10 * 9];
+            const int p98 = outerDists[outerDists.size() - 1 - outerDists.size() / 50];
+            return p90 <= 3 && p98 <= cap;
+        }();
+
+        if (!thinRing) {
+            std::cerr << "[Mask] contained-but-thick ring kept for merge: outer="
+                      << comps[i].pixels * pixelAreaMeters
+                      << " m2 at px[" << comps[i].minX << "," << comps[i].minY << "]"
+                      << ", inner_coverage=" << coverage
+                      << " (likely batch-edge remainder of one real building)" << std::endl;
+            continue;
+        }
         isWrapper[i] = true;
         ++wrappers;
         std::cerr << "[Mask] wrapper ring removed: outer=" << comps[i].pixels * pixelAreaMeters
