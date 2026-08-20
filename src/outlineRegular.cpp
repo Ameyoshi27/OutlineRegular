@@ -99,6 +99,20 @@ constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio)
 constexpr double kPcaDirectionUsableAxisRatio = 1.3;   // moderate elongation -> loose 12 deg gate
 constexpr double kPcaDirectionGateStrongDeg = 5.0;
 constexpr double kPcaDirectionGateWeakDeg = 12.0;
+// Evidence-backed notch protection: real rectangular notches (courtyard bays,
+// setbacks) survive the energy hypothesis but get dissolved by the orthogonal
+// clean-up chain (topology repair at repair_distance, axis-collinear vertex
+// erasure in forceOrthogonalPolygonToAngle). A notch is protected only when
+// it is deep enough to be a building feature (not mask noise) AND the mesh
+// support cloud confirms points along its walls.
+constexpr double kNotchMinDepthFactor = 0.6;    // x tuning.repair_distance
+constexpr double kNotchMinDepthFloor = 1.0;     // meters
+constexpr double kNotchMaxWidth = 15.0;         // meters; larger concavities are wings, not notches
+constexpr double kNotchSupportRadius = 0.8;     // meters around the notch's 3 edges
+constexpr int kNotchMinSupportPoints = 8;
+constexpr double kNotchPreserveMidpointTol = 1.2;  // meters, bottom-edge midpoint match
+constexpr double kNotchPreserveAngleDeg = 20.0;
+constexpr double kNotchPreserveLengthRatio = 0.5;
 
 bool isSimplePolygon2D(const std::vector<pcl::PointXYZ>& pts);
 double undirectedAngleDifference(double a, double b);
@@ -1823,15 +1837,191 @@ struct PreservedArcSegment {
     double curve_length = 0.0;
 };
 
+// ===== Evidence-backed notch protection =====
+// A notch = two nearby reflex vertices joined by a short bottom path. Real
+// notches (setback bays) carry mesh support points along their walls; mask
+// noise teeth do not. Only evidence-backed notches are protected from the
+// orthogonal clean-up chain.
+struct NotchFeature {
+    std::size_t entry = 0;      // reflex vertex index in the source polygon
+    std::size_t exit = 0;       // next nearby reflex vertex
+    double width = 0.0;         // bottom path length entry->exit
+    double depth = 0.0;         // min of the two adjacent wall lengths
+    double midX = 0.0, midY = 0.0;
+    double dirX = 1.0, dirY = 0.0;   // unit direction along the bottom
+};
+
+std::vector<NotchFeature> DetectEvidenceBackedNotches(
+    const std::vector<pcl::PointXYZ>& polygon,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
+    double minDepth,
+    double maxWidth)
+{
+    std::vector<NotchFeature> notches;
+    const std::size_t n = polygon.size();
+    if (n < 5 || !support || support->empty()) return notches;
+
+    // Orientation-majority reflex detection.
+    double turnSum = 0.0;
+    std::vector<double> turns(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = polygon[(i + n - 1) % n];
+        const auto& b = polygon[i];
+        const auto& c = polygon[(i + 1) % n];
+        turns[i] = static_cast<double>(b.x - a.x) * (c.y - b.y) -
+                   static_cast<double>(b.y - a.y) * (c.x - b.x);
+        turnSum += turns[i];
+    }
+    const double majority = turnSum >= 0.0 ? 1.0 : -1.0;
+    std::vector<std::size_t> reflex;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (turns[i] * majority < 0.0) reflex.push_back(i);
+    }
+    if (reflex.size() < 2) return notches;
+
+    // Candidate spans between consecutive nearby reflex vertices, then merge
+    // chains that share vertices: the VDP hypothesis often approximates one
+    // rectangular notch as a 2-3 vertex reflex chain, and each sub-notch
+    // alone is too small to protect.
+    struct NotchSpan {
+        std::size_t entry;
+        std::size_t exit;
+    };
+    std::vector<NotchSpan> spans;
+    for (std::size_t k = 0; k < reflex.size(); ++k) {
+        const std::size_t entry = reflex[k];
+        const std::size_t exit = reflex[(k + 1) % reflex.size()];
+        const std::size_t gap = (exit + n - entry) % n;
+        if (gap == 0 || gap > 2) continue;
+        if (!spans.empty() && spans.back().exit == entry) {
+            spans.back().exit = exit;
+        } else {
+            spans.push_back({entry, exit});
+        }
+    }
+
+    for (const auto& span : spans) {
+        const std::size_t entry = span.entry;
+        const std::size_t exit = span.exit;
+
+        double width = 0.0;
+        double midX = 0.0, midY = 0.0;
+        int edgeCount = 0;
+        for (std::size_t s = entry; s != exit; s = (s + 1) % n) {
+            const auto& a = polygon[s];
+            const auto& b = polygon[(s + 1) % n];
+            width += std::hypot(b.x - a.x, b.y - a.y);
+            midX += 0.5 * (a.x + b.x);
+            midY += 0.5 * (a.y + b.y);
+            ++edgeCount;
+        }
+        if (edgeCount == 0) continue;
+        midX /= edgeCount;
+        midY /= edgeCount;
+        const double wallIn = std::hypot(
+            polygon[entry].x - polygon[(entry + n - 1) % n].x,
+            polygon[entry].y - polygon[(entry + n - 1) % n].y);
+        const double wallOut = std::hypot(
+            polygon[(exit + 1) % n].x - polygon[exit].x,
+            polygon[(exit + 1) % n].y - polygon[exit].y);
+        const double depth = std::min(wallIn, wallOut);
+        if (depth < minDepth) continue;
+        if (width < 0.5 || width > maxWidth) continue;
+
+        // Evidence: support points near the notch's walls and bottom.
+        int supportCount = 0;
+        for (const auto& p : support->points) {
+            double best = std::numeric_limits<double>::max();
+            for (std::size_t s = (entry + n - 1) % n; ; s = (s + 1) % n) {
+                double t = 0.0;
+                best = std::min(best, distancePointToSegmentWithProjection(
+                    p, polygon[s], polygon[(s + 1) % n], t));
+                if (s == (exit + 1) % n) break;
+            }
+            if (best <= kNotchSupportRadius) ++supportCount;
+        }
+        if (supportCount < kNotchMinSupportPoints) continue;
+
+        NotchFeature notch;
+        notch.entry = entry;
+        notch.exit = exit;
+        notch.width = width;
+        notch.depth = depth;
+        notch.midX = midX;
+        notch.midY = midY;
+        const double dirLen = std::max(
+            std::hypot(static_cast<double>(polygon[exit].x - polygon[entry].x),
+                       static_cast<double>(polygon[exit].y - polygon[entry].y)), 1e-9);
+        notch.dirX = (polygon[exit].x - polygon[entry].x) / dirLen;
+        notch.dirY = (polygon[exit].y - polygon[entry].y) / dirLen;
+        notches.push_back(notch);
+    }
+    return notches;
+}
+
+// True when the candidate still carries an edge corresponding to the notch
+// bottom (midpoint + direction + length match). A dissolved notch fails this.
+bool NotchPreservedInCandidate(
+    const std::vector<pcl::PointXYZ>& candidate,
+    const NotchFeature& notch)
+{
+    const std::size_t n = candidate.size();
+    if (n < 4) return false;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = candidate[i];
+        const auto& b = candidate[(i + 1) % n];
+        const double len = std::hypot(b.x - a.x, b.y - a.y);
+        if (len < kNotchPreserveLengthRatio * notch.width) continue;
+        const double midX = 0.5 * (a.x + b.x);
+        const double midY = 0.5 * (a.y + b.y);
+        if (std::hypot(midX - notch.midX, midY - notch.midY) >
+                kNotchPreserveMidpointTol) {
+            continue;
+        }
+        const double ux = (b.x - a.x) / len;
+        const double uy = (b.y - a.y) / len;
+        const double dot = std::abs(ux * notch.dirX + uy * notch.dirY);
+        if (dot < std::cos(kNotchPreserveAngleDeg * M_PI / 180.0)) continue;
+        return true;
+    }
+    return false;
+}
+
+std::vector<bool> BuildNotchVertexMask(
+    const std::vector<pcl::PointXYZ>& polygon,
+    const std::vector<NotchFeature>& notches)
+{
+    std::vector<bool> mask(polygon.size(), false);
+    const std::size_t n = polygon.size();
+    for (const auto& notch : notches) {
+        std::size_t s = (notch.entry + n - 1) % n;   // include the incoming wall edge start
+        while (true) {
+            mask[s % n] = true;
+            if (s % n == (notch.exit + 1) % n) break;
+            s = (s + 1) % n;
+        }
+    }
+    return mask;
+}
+
 bool forceOrthogonalPolygonToAngle(
     const std::vector<pcl::PointXYZ>& input,
     double main_angle,
-    std::vector<pcl::PointXYZ>& result)
+    std::vector<pcl::PointXYZ>& result,
+    const std::vector<bool>* protectedVertices = nullptr)
 {
     result.clear();
     if (input.size() < 4) return false;
 
     std::vector<pcl::PointXYZ> working = input;
+    std::vector<char> protection;
+    if (protectedVertices && protectedVertices->size() == input.size()) {
+        protection.assign(protectedVertices->begin(), protectedVertices->end());
+    }
+    auto eraseWorking = [&working, &protection](std::size_t index) {
+        working.erase(working.begin() + index);
+        if (!protection.empty()) protection.erase(protection.begin() + index);
+    };
     auto axisOfEdge = [main_angle](const pcl::PointXYZ& a, const pcl::PointXYZ& b) {
         const double angle = std::atan2(b.y - a.y, b.x - a.x);
         return undirectedAngleDifference(angle, main_angle) <=
@@ -1842,15 +2032,19 @@ bool forceOrthogonalPolygonToAngle(
     // incoming and outgoing edges would snap to the same axis before solving
     // line intersections; otherwise the two lines are parallel and no corner
     // exists. Odd vertex counts are resolved by the same cyclic pass.
+    // Protected (evidence-backed notch) vertices are never erased here; if a
+    // protected vertex cannot fit the alternating pattern the reconstruction
+    // below fails and the caller falls back to another candidate source.
     bool changed = true;
     while (changed && working.size() >= 4) {
         changed = false;
         for (size_t i = 0; i < working.size(); ++i) {
+            if (!protection.empty() && protection[i]) continue;
             const size_t previous = (i + working.size() - 1) % working.size();
             const size_t next = (i + 1) % working.size();
             if (axisOfEdge(working[previous], working[i]) ==
                 axisOfEdge(working[i], working[next])) {
-                working.erase(working.begin() + i);
+                eraseWorking(i);
                 changed = true;
                 break;
             }
@@ -3372,10 +3566,26 @@ void outlineRegular::regular_Contour()
                 };
 
                 bool single_accepted = false;
+                const double notchMinDepth = std::max(
+                    kNotchMinDepthFloor,
+                    kNotchMinDepthFactor * model_tuning.repair_distance);
                 for (const auto& source : single_sources) {
+                    // Evidence-backed notches of this source must survive the
+                    // orthogonal snap; otherwise the notch is rejected in
+                    // favour of the next candidate source (the raw hypothesis
+                    // is the last one and keeps them by construction).
+                    const auto protectedNotches = DetectEvidenceBackedNotches(
+                        source, fitting_cloud, notchMinDepth, kNotchMaxWidth);
+                    std::vector<bool> notchMask;
+                    const std::vector<bool>* notchMaskPtr = nullptr;
+                    if (!protectedNotches.empty()) {
+                        notchMask = BuildNotchVertexMask(source, protectedNotches);
+                        notchMaskPtr = &notchMask;
+                    }
                     std::vector<pcl::PointXYZ> candidate;
                     if (!forceOrthogonalPolygonToAngle(
-                            source, single_line_angles.front(), candidate)) {
+                            source, single_line_angles.front(), candidate,
+                            notchMaskPtr)) {
                         continue;
                     }
                     if (!isStrictOrthogonalToMainAngle(
@@ -3386,6 +3596,22 @@ void outlineRegular::regular_Contour()
                     if (!isSingleDirectionCandidateAcceptable(
                             candidate, fallback_hypothesis, model_tuning)) {
                         continue;
+                    }
+                    if (!protectedNotches.empty()) {
+                        int preservedCount = 0;
+                        for (const auto& notch : protectedNotches) {
+                            if (NotchPreservedInCandidate(candidate, notch)) ++preservedCount;
+                        }
+                        if (preservedCount < static_cast<int>(protectedNotches.size())) {
+                            std::cerr << "[NotchProtect] reject source: kept "
+                                      << preservedCount << "/" << protectedNotches.size()
+                                      << " notches (widths:";
+                            for (const auto& notch : protectedNotches) {
+                                std::cerr << " " << notch.width << "x" << notch.depth;
+                            }
+                            std::cerr << " m)" << std::endl;
+                            continue;
+                        }
                     }
 
                     final_points->clear();
