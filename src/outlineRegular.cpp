@@ -90,6 +90,15 @@ constexpr double kSupportDirectionPairRadius = 2.5;
 constexpr double kSupportDirectionMinPairDistance = 0.35;
 constexpr double kSupportDirectionStrongPeakRatio = 0.14; // Uniform +/-5 degree background is 11/90.
 constexpr double kSupportDirectionCorrectionDeg = 9.0;
+// Original-ring PCA gate: a raster-staircase outline's overall trend is a
+// stable direction prior for elongated footprints (validated to ~0.5 deg on
+// real cases). A direction selection that deviates beyond these gates needs
+// strong wall evidence, otherwise it snaps back to the ring trend. Blocks the
+// "VDP hull diagonal" failure mode (18 deg chosen for a ~12 deg building).
+constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio) for a tight 5 deg gate
+constexpr double kPcaDirectionUsableAxisRatio = 1.3;   // moderate elongation -> loose 12 deg gate
+constexpr double kPcaDirectionGateStrongDeg = 5.0;
+constexpr double kPcaDirectionGateWeakDeg = 12.0;
 
 bool isSimplePolygon2D(const std::vector<pcl::PointXYZ>& pts);
 double undirectedAngleDifference(double a, double b);
@@ -3300,12 +3309,50 @@ void outlineRegular::regular_Contour()
                 const bool corrected = strongWallDirection &&
                     difference > kWallDirectionCorrectionThreshold;
                 if (corrected) single_line_angles.front() = wallAngle;
+
+                // PCA gate on the ORIGINAL outline ring (not the VDP
+                // hypothesis): without strong wall evidence a selection far
+                // from the outline's overall trend is a hull-diagonal
+                // artifact, so snap it back. Wall-corrected selections are
+                // exempt (geometry evidence outranks the outline prior).
+                bool pcaFallback = false;
+                double pcaAngleDeg = 0.0;
+                double pcaAxisRatio = 1.0;
+                double pcaDeviationDeg = 0.0;
+                {
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr ringCloud(
+                        new pcl::PointCloud<pcl::PointXYZ>);
+                    ringCloud->points.assign(
+                        original_points.begin(), original_points.end());
+                    double ringPcaAngle = 0.0;
+                    if (!corrected &&
+                        estimatePcaDirection2D(ringCloud, ringPcaAngle, pcaAxisRatio)) {
+                        const double gateDeg =
+                            pcaAxisRatio >= kPcaDirectionReliableAxisRatio
+                                ? kPcaDirectionGateStrongDeg
+                                : (pcaAxisRatio >= kPcaDirectionUsableAxisRatio
+                                       ? kPcaDirectionGateWeakDeg
+                                       : 1e9);
+                        pcaDeviationDeg =
+                            foldedAngleDistance90(single_line_angles.front(), ringPcaAngle) *
+                            180.0 / M_PI;
+                        if (pcaDeviationDeg > gateDeg && !strongWallDirection) {
+                            single_line_angles.front() = ringPcaAngle;
+                            pcaFallback = true;
+                        }
+                        pcaAngleDeg = ringPcaAngle * 180.0 / M_PI;
+                    }
+                }
                 std::cerr << "[DirectionDecision] mbr_deg=" << originalAngle * 180.0 / M_PI
                           << " wall_deg=" << wallAngle * 180.0 / M_PI
                           << " diff_deg=" << difference * 180.0 / M_PI
                           << " peak_ratio=" << wallPeakRatio
                           << " pairs=" << wallPairCount
                           << " strong=" << (strongWallDirection ? 1 : 0)
+                          << " pca_deg=" << pcaAngleDeg
+                          << " pca_axis=" << pcaAxisRatio
+                          << " pca_dev=" << pcaDeviationDeg
+                          << " pca_fallback=" << (pcaFallback ? 1 : 0)
                           << " selected_deg=" << single_line_angles.front() * 180.0 / M_PI
                           << " corrected=" << (corrected ? 1 : 0) << std::endl;
             }
