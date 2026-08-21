@@ -874,6 +874,167 @@ bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring);
 
 // ===== RegularizeRing =====
 // 浣滅敤锛氬鍗曟潯澶氳竟褰㈣竟鐣屽仛瑙勫垯鍖栥€?//       浼樺厛鐢?澧欓潰鏀拺鐐?锛岀偣澶皯鍒欓€€鍖栦负"鍏ㄩ儴鏀拺鐐?锛屽啀灏戝垯鐢ㄨ竟鐣岃嚜韬姞瀵嗙偣鍏滃簳锛?//       鐒跺悗鏋勯€?outlineRegular 骞舵墽琛?regular_Contour() 寰楀埌瑙勫垯鍖栫粨鏋溿€?
+// ===== Support evidence (pseudo-footprint filter) =====
+// Mask tails that survive neck splitting can form standalone polygons above
+// the 20 m2 floor with no real building behind them. Evidence MUST come from
+// the RAW wall-only support (right after extraction, before any fallback to
+// non-wall points, boundary densification or voxel downsampling) — the final
+// "support" count mixes neighbour points and densified boundary points and
+// says nothing about building existence.
+struct SupportEvidence {
+    std::size_t wallPointCount = 0;
+    std::size_t associatedWallPointCount = 0;
+    std::size_t coveredBins = 0;
+    std::size_t totalBins = 0;
+    double boundaryCoverage = 0.0;
+    double maxEmptyGap = 0.0;        // metres, circular longest unoccupied arc
+    double perimeter = 0.0;
+    double associatedDensity = 0.0;  // associated points per metre
+    bool hasEvidence = false;
+};
+
+constexpr bool kSupportEvidenceFilterDryRun = true;   // calibration phase: log only
+constexpr double kSupportEvidenceSmallArea = 100.0;         // m2
+constexpr double kSupportEvidenceMinCoverage = 0.25;        // occupied-bin fraction
+constexpr double kSupportEvidenceMaxGapRatio = 0.50;        // x perimeter
+constexpr std::size_t kSupportEvidenceMinAssociatedPoints = 8;
+constexpr double kSupportEvidenceBinLength = 1.8;           // m per boundary bin
+constexpr double kSupportEvidenceAssociationDistance = 0.8; // m, point-to-edge
+
+// Point-to-segment distance that also reports the raw projection parameter
+// (not clamped) for the [0.05, 0.95] association test.
+double PointSegmentDistanceWithT(
+    const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b, double& t)
+{
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-12) {
+        t = 0.0;
+        return std::hypot(p.x - a.x, p.y - a.y);
+    }
+    t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+    const double tc = std::max(0.0, std::min(1.0, t));
+    return std::hypot(p.x - a.x - tc * dx, p.y - a.y - tc * dy);
+}
+
+SupportEvidence ComputeSupportEvidence(
+    const std::vector<pcl::PointXYZ>& ring,
+    const WeightedSupportCloud& wallOnlySupport)
+{
+    SupportEvidence evidence;
+    const std::size_t n = ring.size();
+    if (n < 3 || !wallOnlySupport.points || wallOnlySupport.points->empty()) {
+        return evidence;
+    }
+    std::vector<double> prefix(n + 1, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        prefix[i + 1] = prefix[i] + Distance2D(ring[i], ring[(i + 1) % n]);
+    }
+    const double perimeter = prefix[n];
+    evidence.perimeter = perimeter;
+    evidence.wallPointCount = wallOnlySupport.points->size();
+    if (perimeter < 2.0) return evidence;   // degenerate guard
+
+    const std::size_t totalBins = std::max<std::size_t>(
+        4, static_cast<std::size_t>(std::ceil(perimeter / kSupportEvidenceBinLength)));
+    std::vector<bool> occupied(totalBins, false);
+
+    const double associationDistance = std::max(
+        kSupportEvidenceAssociationDistance, 0.25 * kBoundarySupportBuffer);
+    std::size_t associated = 0;
+    for (const auto& p : *wallOnlySupport.points) {
+        double bestDistance = std::numeric_limits<double>::max();
+        std::size_t bestEdge = n;
+        double bestT = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            double t = 0.0;
+            const double d = PointSegmentDistanceWithT(
+                p, ring[i], ring[(i + 1) % n], t);
+            if (d < bestDistance) {
+                bestDistance = d;
+                bestEdge = i;
+                bestT = t;
+            }
+        }
+        if (bestEdge >= n) continue;
+        if (bestDistance > associationDistance) continue;
+        // Ignore projections hugging a vertex: they carry no per-edge evidence.
+        if (bestT < 0.05 || bestT > 0.95) continue;
+        ++associated;
+        const double arc = prefix[bestEdge] +
+            bestT * (prefix[bestEdge + 1] - prefix[bestEdge]);
+        const std::size_t bin = std::min(
+            totalBins - 1,
+            static_cast<std::size_t>(std::floor(arc / perimeter * totalBins)));
+        occupied[bin] = true;
+    }
+    evidence.associatedWallPointCount = associated;
+    evidence.totalBins = totalBins;
+    evidence.coveredBins = static_cast<std::size_t>(
+        std::count(occupied.begin(), occupied.end(), true));
+    evidence.boundaryCoverage =
+        static_cast<double>(evidence.coveredBins) / static_cast<double>(totalBins);
+
+    // Longest circular run of unoccupied bins, converted back to arc length.
+    if (evidence.coveredBins == totalBins) {
+        evidence.maxEmptyGap = 0.0;
+    } else {
+        std::size_t bestRun = 0;
+        std::size_t run = 0;
+        bool wrapped = false;
+        for (std::size_t k = 0; k < 2 * totalBins; ++k) {
+            if (!occupied[k % totalBins]) {
+                ++run;
+                if (run > bestRun) bestRun = run;
+            } else {
+                if (k >= totalBins) break;
+                if (k == 0) continue;
+                run = 0;
+            }
+        }
+        bestRun = std::min(bestRun, totalBins - evidence.coveredBins);
+        evidence.maxEmptyGap =
+            static_cast<double>(bestRun) * perimeter / static_cast<double>(totalBins);
+    }
+    evidence.associatedDensity =
+        static_cast<double>(associated) / std::max(perimeter, 1.0);
+    evidence.hasEvidence =
+        associated >= kSupportEvidenceMinAssociatedPoints ||
+        evidence.boundaryCoverage >= kSupportEvidenceMinCoverage;
+    return evidence;
+}
+
+// Conservative three-level decision. Level 3 keeps everything else: large
+// buildings are never dropped here (features without model coverage are
+// already removed upstream by RingHasModelCoverage in RegularizeGeometry).
+bool ShouldDropForLackOfSupport(
+    const SupportEvidence& evidence,
+    double ringArea,
+    std::string& reason)
+{
+    if (evidence.associatedWallPointCount == 0 &&
+        evidence.boundaryCoverage < 0.10 &&
+        evidence.maxEmptyGap > 0.60 * evidence.perimeter &&
+        ringArea < kSupportEvidenceSmallArea) {
+        reason = "no_support";
+        return true;
+    }
+    if (ringArea < kSupportEvidenceSmallArea &&
+        evidence.associatedWallPointCount < kSupportEvidenceMinAssociatedPoints &&
+        evidence.boundaryCoverage < kSupportEvidenceMinCoverage &&
+        evidence.maxEmptyGap > kSupportEvidenceMaxGapRatio * evidence.perimeter) {
+        reason = "small_low_coverage";
+        return true;
+    }
+    if (ringArea < kSupportEvidenceSmallArea && !evidence.hasEvidence) {
+        reason = "low_confidence_keep";
+    } else {
+        reason = "ok";
+    }
+    return false;
+}
+
 std::vector<pcl::PointXYZ> RegularizeRing(
     const std::vector<pcl::PointXYZ>& ring,
     const MyCloudPtr& sampled,
@@ -882,7 +1043,8 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     std::size_t currentRingId = static_cast<std::size_t>(-1),
     std::vector<pcl::PointXYZ>* debugBestHypothesis = nullptr,
     std::vector<pcl::PointXYZ>* debugSupport = nullptr,
-    long long sourceFid = -1)
+    long long sourceFid = -1,
+    SupportEvidence* supportEvidence = nullptr)
 {
     if (ring.size() < 3) return ring;
 
@@ -890,6 +1052,39 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     auto t0 = std::chrono::steady_clock::now();
     auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
         sampled, ring, true, kdtree, ownership, currentRingId);   // 鍏堝彧鐢ㄥ闈㈢偣
+    // ---- Pseudo-footprint support evidence: computed on the RAW wall-only
+    // support BEFORE any fallback / densify / downsample replaces it. A drop
+    // here returns an empty ring so the feature never reaches VDP/Ceres.
+    {
+        SupportEvidence evidence = ComputeSupportEvidence(ring, wallOnlySupport);
+        if (supportEvidence) *supportEvidence = evidence;
+        const double ringArea = PolygonArea2D(ring);
+        std::string reason;
+        const bool drop = ShouldDropForLackOfSupport(evidence, ringArea, reason);
+        // source_fid here is the stable attribute id (initial outline "id"
+        // field when present, otherwise the OGR FID) — see main()'s loop.
+        std::cerr << "[SupportEvidence] source_fid=" << sourceFid
+                  << " area=" << ringArea
+                  << " perimeter=" << evidence.perimeter
+                  << " wall_points=" << evidence.wallPointCount
+                  << " associated_wall_points=" << evidence.associatedWallPointCount
+                  << " coverage=" << evidence.boundaryCoverage
+                  << " max_gap=" << evidence.maxEmptyGap
+                  << " density=" << evidence.associatedDensity
+                  << " decision=" << (drop ? (kSupportEvidenceFilterDryRun
+                                                 ? "would_drop" : "drop")
+                                           : "keep")
+                  << " reason=" << reason << std::endl;
+        if (ringArea < kSupportEvidenceSmallArea) {
+            std::cerr << "[SupportEvidence] small_area_detail source_fid=" << sourceFid
+                      << " covered_bins=" << evidence.coveredBins
+                      << "/" << evidence.totalBins << std::endl;
+        }
+        if (drop && !kSupportEvidenceFilterDryRun) {
+            return {};
+        }
+    }
+
     auto weightedSupport = wallOnlySupport;
     if (weightedSupport.points->size() < 20) {
         weightedSupport = ExtractWeightedBoundarySupportFromOSGB(
