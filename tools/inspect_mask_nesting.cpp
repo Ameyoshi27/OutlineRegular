@@ -45,8 +45,8 @@ int main(int argc, char** argv)
     const int bands = ds->GetRasterCount();
     double adf[6] = {0};
     ds->GetGeoTransform(adf);
-    std::printf("raster %dx%d bands=%d pixel=%.3fx%.3f type=%s\n",
-                width, height, bands, adf[1], adf[5],
+    std::printf("raster %dx%d bands=%d pixel=%.3fx%.3f origin=(%.2f,%.2f) type=%s\n",
+                width, height, bands, adf[1], adf[5], adf[0], adf[3],
                 GDALGetDataTypeName(ds->GetRasterBand(1)->GetRasterDataType()));
 
     // 读取前3个band为uint32颜色 (背景=0)
@@ -179,6 +179,48 @@ int main(int argc, char** argv)
     }
     std::printf("\n统计: 含内层的外层=%d (薄壳wrapper=%d, 大间隙=%d), 被包含内层总数=%d\n",
                 wrapperCount + bigGapCount, wrapperCount, bigGapCount, containedCount);
+
+    // --geo x y w h: 世界坐标窗口的ASCII颜色渲染
+    if (argc >= 7 && std::strcmp(argv[2], "--geo") == 0) {
+        const double gx = atof(argv[3]), gy = atof(argv[4]);
+        const double gw = atof(argv[5]), gh = atof(argv[6]);
+        const int px0 = static_cast<int>((gx - adf[0]) / adf[1]);
+        const int py0 = static_cast<int>((gy - adf[3]) / adf[5]);
+        const int pw = static_cast<int>(gw / adf[1]);
+        const int ph = static_cast<int>(std::abs(gh / adf[5]));
+        std::printf("\n--geo 窗口 世界[%.1f,%.1f %.0fx%.0fm] -> 像素[%d,%d %dx%d]\n",
+                    gx, gy, gw, gh, px0, py0, pw, ph);
+        // 颜色频率排序分配字母
+        std::unordered_map<uint32_t, int64_t> cnt;
+        for (int y = py0; y < py0 + ph && y < height; ++y) {
+            for (int x = px0; x < px0 + pw && x < width; ++x) {
+                ++cnt[color[static_cast<size_t>(y) * width + x]];
+            }
+        }
+        std::vector<std::pair<uint32_t, int64_t>> v(cnt.begin(), cnt.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b){return a.second > b.second;});
+        char letter[3] = {0};
+        std::unordered_map<uint32_t, char> sym;
+        for (size_t k = 0; k < v.size() && k < 25; ++k) {
+            if (v[k].second < 20) break;
+            letter[0] = k < 24 ? static_cast<char>('A' + k) : 'Z';
+            sym[v[k].first] = letter[0];
+            std::printf("  %c = %06x (%lld px)\n", letter[0],
+                        v[k].first, static_cast<long long>(v[k].second));
+        }
+        const int stride = std::max(1, pw / 100);
+        std::printf("  (采样步长=%d px, 每字符≈%.1fm, y从上到下)\n", stride, stride * adf[1]);
+        for (int y = py0; y < py0 + ph && y < height; y += stride) {
+            std::string line;
+            for (int x = px0; x < px0 + pw && x < width; x += stride) {
+                const auto it = sym.find(color[static_cast<size_t>(y) * width + x]);
+                line.push_back(it == sym.end() ? '.' : it->second);
+            }
+            line.push_back('\n');
+            std::printf("%s", line.c_str());
+        }
+        return 0;
+    }
 
     // 可选窗口转储
     if (argc >= 7 && std::strcmp(argv[2], "--window") == 0) {

@@ -3180,6 +3180,107 @@ bool isSingleDirectionCandidateAcceptable(
     }
     return ok;
 }
+
+// A second geometric direction is only credible when the support cloud has an
+// independent direction peak as well.  Polygon edges alone are unreliable on
+// raster staircases and short repaired notches.
+struct SupportDirectionPeaks2D {
+    bool valid = false;
+    double primaryAngle = 0.0;
+    double primaryRatio = 0.0;
+    double secondaryAngle = 0.0;
+    double secondaryRatio = 0.0;
+    std::size_t pairCount = 0;
+};
+
+SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& support)
+{
+    SupportDirectionPeaks2D result;
+    constexpr std::size_t kMaxSamples = 5000;
+    if (!support || support->size() < kSupportDirectionMinPoints) return result;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr support2D(
+        new pcl::PointCloud<pcl::PointXYZ>);
+    support2D->resize(support->size());
+    for (std::size_t i = 0; i < support->size(); ++i) {
+        support2D->points[i].x = support->points[i].x;
+        support2D->points[i].y = support->points[i].y;
+        support2D->points[i].z = 0.0f;
+    }
+
+    pcl::KdTreeFLANN<pcl::PointXYZ> tree;
+    tree.setInputCloud(support2D);
+    std::array<double, 90> bins{};
+    const std::size_t stride = std::max<std::size_t>(
+        1, support->size() / kMaxSamples);
+    std::vector<int> indices;
+    std::vector<float> distances;
+    double totalWeight = 0.0;
+
+    for (std::size_t i = 0; i < support->size(); i += stride) {
+        indices.clear();
+        distances.clear();
+        tree.radiusSearch(support2D->points[i],
+            static_cast<float>(kSupportDirectionPairRadius),
+            indices, distances, 96);
+        for (std::size_t k = 0; k < indices.size(); ++k) {
+            const int j = indices[k];
+            if (j <= static_cast<int>(i) ||
+                distances[k] < kSupportDirectionMinPairDistance *
+                    kSupportDirectionMinPairDistance) {
+                continue;
+            }
+            const auto& a = support->points[i];
+            const auto& b = support->points[static_cast<std::size_t>(j)];
+            const double degrees = foldedLineAngle90(
+                std::atan2(b.y - a.y, b.x - a.x)) * 180.0 / M_PI;
+            const int bin = std::min(89, std::max(0,
+                static_cast<int>(std::floor(degrees))));
+            const double weight = std::sqrt(std::max(0.0f, distances[k]));
+            bins[static_cast<std::size_t>(bin)] += weight;
+            totalWeight += weight;
+            ++result.pairCount;
+        }
+    }
+    if (result.pairCount < kSupportDirectionMinPairs ||
+        totalWeight <= 1e-9) {
+        return result;
+    }
+
+    std::array<double, 90> windows{};
+    for (int center = 0; center < 90; ++center) {
+        for (int d = -5; d <= 5; ++d) {
+            windows[static_cast<std::size_t>(center)] +=
+                bins[static_cast<std::size_t>((center + d + 90) % 90)];
+        }
+    }
+
+    auto bestPeak = [&windows](int excludedCenter) {
+        int best = 0;
+        double bestValue = -1.0;
+        for (int center = 0; center < 90; ++center) {
+            const int distance = std::abs(center - excludedCenter);
+            const int circularDistance = std::min(distance, 90 - distance);
+            if (excludedCenter >= 0 && circularDistance < 15) continue;
+            if (windows[static_cast<std::size_t>(center)] > bestValue) {
+                bestValue = windows[static_cast<std::size_t>(center)];
+                best = center;
+            }
+        }
+        return std::pair<int, double>(best, bestValue);
+    };
+
+    const auto primary = bestPeak(-1);
+    const auto secondary = bestPeak(primary.first);
+    result.primaryAngle = (primary.first + 0.5) * M_PI / 180.0;
+    result.secondaryAngle = (secondary.first + 0.5) * M_PI / 180.0;
+    result.primaryRatio = primary.second / totalWeight;
+    result.secondaryRatio = secondary.second / totalWeight;
+    result.valid = result.primaryRatio >= kSupportDirectionStrongPeakRatio &&
+        result.secondaryRatio >= kSupportDirectionStrongPeakRatio;
+    return result;
+}
 }
 
 // Run-level summary of structure-aware hypothesis repairs (impl lives in the
@@ -3860,17 +3961,45 @@ void outlineRegular::regular_Contour()
         // 检测不到多方向证据的建筑仍走原 SingleFirst 路径，行为不变。
         std::vector<DirectionSystem> direction_systems =
             detectDirectionSystems(best_hypothesis, fitting_cloud, model_tuning);
-        bool credible_multi_direction =
+        const SupportDirectionPeaks2D supportPeaks =
+            estimateSupportDirectionPeaks2D(fitting_cloud);
+        const bool independentWallSecondary =
+            supportPeaks.valid &&
+            foldedAngleDistance90(
+                supportPeaks.primaryAngle, supportPeaks.secondaryAngle) >=
+                15.0 * M_PI / 180.0;
+        std::cerr << "[MultiDirectionWallEvidence] valid="
+            << (supportPeaks.valid ? 1 : 0)
+            << " primary_deg=" << supportPeaks.primaryAngle * 180.0 / M_PI
+            << " primary_ratio=" << supportPeaks.primaryRatio
+            << " secondary_deg=" << supportPeaks.secondaryAngle * 180.0 / M_PI
+            << " secondary_ratio=" << supportPeaks.secondaryRatio
+            << " pairs=" << supportPeaks.pairCount
+            << " independent=" << (independentWallSecondary ? 1 : 0)
+            << std::endl;
+
+        bool geometric_multi_direction =
             direction_systems.size() >= 2 &&
             hasCredibleMultiDirectionChains(best_hypothesis, direction_systems, model_tuning);
+        bool credible_multi_direction = geometric_multi_direction &&
+            independentWallSecondary;
+        if (geometric_multi_direction && !independentWallSecondary) {
+            std::cerr << "[BuildingMode] strict multi-direction rejected: "
+                         "no independent wall secondary peak" << std::endl;
+        }
         if (!credible_multi_direction) {
             std::vector<DirectionSystem> relaxed_systems =
                 buildMultiDirectionCandidates(best_hypothesis, resolution);
-            if (relaxed_systems.size() >= 2 &&
-                hasCredibleMultiDirectionChains(best_hypothesis, relaxed_systems, model_tuning)) {
+            const bool relaxedGeometricEvidence = relaxed_systems.size() >= 2 &&
+                hasCredibleMultiDirectionChains(
+                    best_hypothesis, relaxed_systems, model_tuning);
+            if (relaxedGeometricEvidence && independentWallSecondary) {
                 direction_systems = std::move(relaxed_systems);
                 credible_multi_direction = true;
                 std::cerr << "[BuildingMode] relaxed multi-direction evidence accepted" << std::endl;
+            } else if (relaxedGeometricEvidence && !independentWallSecondary) {
+                std::cerr << "[BuildingMode] relaxed multi-direction rejected: "
+                             "geometry-only secondary direction" << std::endl;
             }
         }
 
@@ -4225,11 +4354,13 @@ void outlineRegular::regular_Contour()
                     break;
                 }
                 if (!strict_recovered) {
-                    std::cerr << "[Orthogonal] strict candidate unavailable; rollback to pre-Ceres hypothesis"
-                        << std::endl;
-                    final_points->clear();
-                    best_hypothesis = fallback_hypothesis;
-                    for (const auto& p : fallback_hypothesis) final_points->push_back(p);
+                    // Do not overwrite the current result with the raw
+                    // pre-Ceres ring here.  That ring may contain diagonal
+                    // edges even though this building is in StrictOrthogonal
+                    // mode.  The common acceptance block below will try a
+                    // conservative orthogonal fallback first.
+                    std::cerr << "[Orthogonal] strict candidate unavailable; "
+                                 "defer fallback decision" << std::endl;
                 }
             }
         }
@@ -4285,20 +4416,20 @@ void outlineRegular::regular_Contour()
                 accepted = true;
             }
             if (!accepted) {
-                // Last resort for small buildings: the raw hypothesis would
-                // keep staircase/diagonal edges, so orthogonal-snap it before
-                // falling back to it verbatim.
+                // Strict mode must not end by emitting a diagonal raw
+                // hypothesis.  A quality-rejected orthogonal candidate is
+                // still preferable to violating the mode contract; it is
+                // bounded by the same validity/angle checks as normal output.
                 bool snappedFallback = false;
-                if (forceSingleDirection) {
+                if (!allow_diagonal_edges && !preferred_line_angles.empty()) {
                     std::vector<pcl::PointXYZ> snapped;
-                    const double snapAngle =
-                        preferred_line_angles.empty()
-                            ? dominantLineAngles2D(fallback_hypothesis, 1).front()
-                            : preferred_line_angles.front();
+                    const double snapAngle = preferred_line_angles.front();
                     if (forceOrthogonalPolygonToAngle(fallback_hypothesis, snapAngle, snapped) &&
-                        isSingleDirectionCandidateAcceptable(
-                            snapped, fallback_hypothesis, model_tuning)) {
-                        std::cerr << "[outlineRegular] small building orthogonal-snap fallback" << std::endl;
+                        isSimplePolygon2D(snapped) &&
+                        isStrictOrthogonalToMainAngle(
+                            snapped, snapAngle, 3.0,
+                            model_tuning.fine_prune_distance)) {
+                        std::cerr << "[outlineRegular] strict orthogonal fallback" << std::endl;
                         final_points->clear();
                         for (const auto& p : snapped) final_points->push_back(p);
                         snappedFallback = true;
@@ -4330,10 +4461,28 @@ void outlineRegular::regular_Contour()
                 }
             }
             if (out_of_bounds) {
-                std::cerr << "[outlineRegular] 检测到越界点，回退到pre-Ceres hypothesis" << std::endl;
-                final_points->clear();
-                best_hypothesis = fallback_hypothesis;
-                for (auto& op : best_hypothesis) { final_points->points.push_back(op); }
+                bool snappedFallback = false;
+                if (!allow_diagonal_edges && !preferred_line_angles.empty()) {
+                    std::vector<pcl::PointXYZ> snapped;
+                    if (forceOrthogonalPolygonToAngle(
+                            fallback_hypothesis, preferred_line_angles.front(), snapped) &&
+                        isSimplePolygon2D(snapped) &&
+                        isStrictOrthogonalToMainAngle(
+                            snapped, preferred_line_angles.front(), 3.0,
+                            model_tuning.fine_prune_distance)) {
+                        std::cerr << "[outlineRegular] out-of-bounds result; "
+                                     "using strict orthogonal fallback" << std::endl;
+                        final_points->clear();
+                        for (const auto& p : snapped) final_points->points.push_back(p);
+                        snappedFallback = true;
+                    }
+                }
+                if (!snappedFallback) {
+                    std::cerr << "[outlineRegular] 检测到越界点，回退到pre-Ceres hypothesis" << std::endl;
+                    final_points->clear();
+                    best_hypothesis = fallback_hypothesis;
+                    for (auto& op : best_hypothesis) { final_points->points.push_back(op); }
+                }
             }
         }
 
