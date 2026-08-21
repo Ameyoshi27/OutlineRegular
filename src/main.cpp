@@ -174,6 +174,7 @@ const double kSupportNormalEdgeMaxAngleDeg = 25.0;   // deg, wall XY normal vs e
 const double kSupportExtendedMinRunLength = 2.0;     // m, chain length required for extended band
 const double kSupportExtendedChainGap = 0.9;         // m, arc gap linking extended-band points
 const double kSupportFallbackWeight = 0.30;          // fallback (non-wall) support weight
+const double kSupportWideWallWeight = 0.50;          // wide-band wall tier weight (below effective)
 const double kSupportDensifyWeight = 0.25;           // last-resort densified boundary weight
 const double kNarrowNeckMaxWidth = 4.0;            // meters. Post-vectorization split threshold for missed building separations.
 const double kNarrowNeckMinBoundarySeparation = 4.0;
@@ -192,6 +193,7 @@ std::size_t g_supportOwnershipAmbiguousRejected = 0;
 std::size_t g_supportFilterCoarseWallTotal = 0;
 std::size_t g_supportFilterEffectiveWallTotal = 0;
 std::size_t g_supportFilterFallbackUsedTotal = 0;
+std::size_t g_supportFilterWideWallTotal = 0;
 
 bool RemoveShapefileFamily(const std::filesystem::path& shpPath, bool verbose = true)
 {
@@ -808,10 +810,21 @@ struct SupportFilterStats {
 double PointSegmentDistanceWithT(
     const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b, double& t);
 
+// Extraction modes:
+//  EffectiveWall — narrow band (<=0.85 m) + chain-verified extended band
+//                  (<=1.5 m), unambiguous ownership, normal/edge consistency.
+//  WideWall      — the legacy 3 m wall band (wall normals + unambiguous
+//                  ownership only): fallback tier for footprints whose mask
+//                  offset exceeds the narrow/extended bands, so their edges
+//                  still get REAL wall anchoring instead of roof points.
+//  NonWall       — 3 m / interior points without the wall-normal gate
+//                  (last-resort Ceres fallback; never feeds direction).
+enum class SupportExtractMode { EffectiveWall, WideWall, NonWall };
+
 WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     const MyCloudPtr& sampled,
     const std::vector<pcl::PointXYZ>& ring,
-    bool wallOnly,
+    SupportExtractMode mode,
     const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
     const SupportOwnershipContext* ownership = nullptr,
     std::size_t currentRingId = static_cast<std::size_t>(-1),
@@ -884,14 +897,16 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         }
 
         // 鍙彇澧欓潰鐐规椂锛氭硶鍚?z 鍒嗛噺杩囧ぇ(鎺ヨ繎姘村钩闈?鐨勭偣璺宠繃
+        const bool wallMode =
+            mode == SupportExtractMode::EffectiveWall || mode == SupportExtractMode::WideWall;
         double normalWeight = 1.0;
         if (sampled->normal && static_cast<std::size_t>(idx) < sampled->normal->size()) {
             const auto& n = sampled->normal->points[idx];
             const double absNormalZ = std::abs(n.normal_z);
-            if (wallOnly && absNormalZ > kVerticalNormalMaxAbsZ) {
+            if (wallMode && absNormalZ > kVerticalNormalMaxAbsZ) {
                 continue;
             }
-            if (wallOnly) {
+            if (wallMode) {
                 normalWeight = NormalSupportWeightFromZ(n.normal_z);
             }
         }
@@ -917,7 +932,7 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         const bool nearBoundary =
             bestEdge < n && boundaryDistance <= kBoundarySupportBuffer;
 
-        if (wallOnly) {
+        if (mode == SupportExtractMode::EffectiveWall) {
             // ---- Effective wall-support pipeline ----
             if (!nearBoundary) continue;
             bump(&SupportFilterStats::coarseWall);
@@ -975,6 +990,29 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
             continue;
         }
 
+        if (mode == SupportExtractMode::WideWall) {
+            // ---- Legacy 3 m wall band: wall normals + unambiguous ownership
+            // only (no band/t/normal-edge gates). Restores real-wall
+            // anchoring for footprints whose mask offset exceeds the
+            // narrow/extended bands. Weights are lowered by the caller. ----
+            if (!nearBoundary) continue;
+            if (ownership) {
+                const auto own = ownership->classifySupportPoint(
+                    p, currentRingId, boundaryDistance);
+                if (own != SupportOwnershipContext::SupportOwnership::Owned) {
+                    if (own == SupportOwnershipContext::SupportOwnership::Ambiguous) {
+                        ++g_supportOwnershipAmbiguousRejected;
+                    } else {
+                        ++g_supportOwnershipRejected;
+                    }
+                    continue;
+                }
+            }
+            support.points->push_back(p);
+            support.weights.push_back(normalWeight);
+            continue;
+        }
+
         // ---- Non-wall fallback extraction (wide band allowed, ambiguous
         // ownership still excluded; weights are lowered by the caller) ----
         const bool inside = PointInPolygon2D(p, ring);
@@ -1001,7 +1039,7 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     // Extended-band chain filter: only keep chains whose projected span
     // proves continuous wall support (chains crossing the ring seam get
     // split — acceptable minimal implementation).
-    if (wallOnly && !extendedCandidates.empty()) {
+    if (mode == SupportExtractMode::EffectiveWall && !extendedCandidates.empty()) {
         std::sort(extendedCandidates.begin(), extendedCandidates.end(),
                   [](const ExtendedCandidate& a, const ExtendedCandidate& b) {
                       return a.arc < b.arc;
@@ -1027,19 +1065,6 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     }
 
     return support;
-}
-
-// Compatibility wrapper for callers that only need support point coordinates.
-pcl::PointCloud<pcl::PointXYZ>::Ptr ExtractBoundarySupportFromOSGB(
-    const MyCloudPtr& sampled,
-    const std::vector<pcl::PointXYZ>& ring,
-    bool wallOnly,
-    const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
-    const SupportOwnershipContext* ownership = nullptr,
-    std::size_t currentRingId = static_cast<std::size_t>(-1))
-{
-    return ExtractWeightedBoundarySupportFromOSGB(
-        sampled, ring, wallOnly, kdtree, ownership, currentRingId).points;
 }
 
 struct DebugHypothesisRecord {
@@ -1240,7 +1265,8 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     // extended band + ownership + normal-edge filtering inside) ----
     SupportFilterStats filterStats;
     auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
-        sampled, ring, true, kdtree, ownership, currentRingId, &filterStats);
+        sampled, ring, SupportExtractMode::EffectiveWall,
+        kdtree, ownership, currentRingId, &filterStats);
     // Raw effective set snapshot: downsampling below replaces
     // weightedSupport's cloud, but the direction hint must keep the raw
     // effective wall points.
@@ -1286,13 +1312,30 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     }
 
     auto weightedSupport = wallOnlySupport;
+    std::size_t wideWallCount = 0;
     std::size_t fallbackCount = 0;
     std::size_t densifyCount = 0;
     if (weightedSupport.points->size() < 20) {
+        // Wide-wall tier: the legacy 3 m wall band (unambiguous ownership,
+        // wall normals). Footprints whose mask offset exceeds the narrow/
+        // extended bands still get REAL wall anchoring here instead of
+        // roof points, so their edges are pulled back to the walls.
+        auto wideWallSupport = ExtractWeightedBoundarySupportFromOSGB(
+            sampled, ring, SupportExtractMode::WideWall,
+            kdtree, ownership, currentRingId);
+        wideWallCount = wideWallSupport.points->size();
+        g_supportFilterWideWallTotal += wideWallCount;
+        for (std::size_t i = 0; i < wideWallSupport.points->size(); ++i) {
+            weightedSupport.points->push_back(wideWallSupport.points->points[i]);
+            weightedSupport.weights.push_back(kSupportWideWallWeight);
+        }
+    }
+    if (weightedSupport.points->size() < 20) {
         // Non-wall fallback: ambiguous ownership is already excluded inside
-        // the extractor; weights stay clearly below effective wall points.
+        // the extractor; weights stay clearly below wall points.
         auto fallbackSupport = ExtractWeightedBoundarySupportFromOSGB(
-            sampled, ring, false, kdtree, ownership, currentRingId);
+            sampled, ring, SupportExtractMode::NonWall,
+            kdtree, ownership, currentRingId);
         fallbackCount = fallbackSupport.points->size();
         g_supportFilterFallbackUsedTotal += fallbackCount;
         for (std::size_t i = 0; i < fallbackSupport.points->size(); ++i) {
@@ -1328,6 +1371,7 @@ std::vector<pcl::PointXYZ> RegularizeRing(
               << " effective_wall=" << filterStats.narrowBand + filterStats.extendedBand
               << " narrow_band=" << filterStats.narrowBand
               << " extended_band=" << filterStats.extendedBand
+              << " wall_wide=" << wideWallCount
               << " fallback=" << fallbackCount
               << " densify=" << densifyCount
               << " ambiguous_rejected=" << filterStats.ambiguousRejected
@@ -4310,6 +4354,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
               << ", ambiguous_rejected=" << g_supportOwnershipAmbiguousRejected << std::endl;
     std::cout << "[Support filter] coarse_wall=" << g_supportFilterCoarseWallTotal
               << ", effective_wall=" << g_supportFilterEffectiveWallTotal
+              << ", wall_wide=" << g_supportFilterWideWallTotal
               << ", fallback_used=" << g_supportFilterFallbackUsedTotal << std::endl;
     if (total > 0) {
         std::cout << "[Timing]   avg per feature: " << (loopSec / total) << " s" << std::endl;
