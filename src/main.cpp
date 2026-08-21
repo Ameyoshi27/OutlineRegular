@@ -3279,6 +3279,45 @@ void CopyFieldValues(OGRFeature* src, OGRFeature* dst)
     }
 }
 
+// Adds or refreshes an "area" attribute (square metres) on every feature of
+// the shapefile. Used to stamp the initial outline after the mask stages:
+// merge/split recreate features, so areas written earlier would go stale.
+bool StampAreaField(const std::string& shpPath)
+{
+    GDALDataset* dataset = static_cast<GDALDataset*>(
+        GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                   nullptr, nullptr, nullptr));
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->GetLayer(0);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+    OGRFeatureDefn* defn = layer->GetLayerDefn();
+    int areaIdx = defn->GetFieldIndex("area");
+    if (areaIdx < 0) {
+        OGRFieldDefn areaField("area", OFTReal);
+        if (layer->CreateField(&areaField) != OGRERR_NONE) {
+            GDALClose(dataset);
+            return false;
+        }
+        areaIdx = layer->GetLayerDefn()->GetFieldIndex("area");
+    }
+    long long updated = 0;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            feature->SetField(areaIdx, GeometryArea(geometry));
+            if (layer->SetFeature(feature) == OGRERR_NONE) ++updated;
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+    layer->SyncToDisk();
+    GDALClose(dataset);
+    return updated > 0;
+}
+
 bool SaveDebugBestHypotheses(
     const std::filesystem::path& outputPath,
     const RegularizationDebugCollector& debug,
@@ -3302,10 +3341,12 @@ if (!RemoveShapefileFamily(outputPath)) return false;
     OGRFieldDefn idField("id", OFTInteger64);
     OGRFieldDefn ringField("ring_id", OFTInteger);
     OGRFieldDefn ptsField("npoints", OFTInteger);
+    OGRFieldDefn areaField("area", OFTReal);
     layer->CreateField(&srcField);
     layer->CreateField(&idField);
     layer->CreateField(&ringField);
     layer->CreateField(&ptsField);
+    layer->CreateField(&areaField);
     OGRFeatureDefn* defn = layer->GetLayerDefn();
 
     for (const auto& record : debug.hypotheses) {
@@ -3319,6 +3360,7 @@ if (!RemoveShapefileFamily(outputPath)) return false;
         feature->SetField("id", static_cast<GIntBig>(record.sourceFid));
         feature->SetField("ring_id", record.ringIndex);
         feature->SetField("npoints", static_cast<int>(record.points.size()));
+        feature->SetField("area", polygon->get_Area());
         feature->SetGeometry(polygon.get());
         layer->CreateFeature(feature);
         OGRFeature::DestroyFeature(feature);
@@ -3600,6 +3642,9 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
               << std::endl;
     std::cout << "[Mask extent] X=" << maskStats.minX << ".." << maskStats.maxX
               << ", Y=" << maskStats.minY << ".." << maskStats.maxY << std::endl;
+    // Stamp the area attribute after all mask stages (merge/split recreate
+    // features, so any earlier area values would be stale).
+    StampAreaField(inputVector);
     std::cout << "[Mask] Initial outlines saved: " << inputVector << std::endl;
     std::cout << "[Timing] mask vectorization: "
               << std::chrono::duration<double>(maskEnd - maskStart).count() << " s" << std::endl;
@@ -3698,6 +3743,13 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
             outIdFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("id");
         }
     }
+    int outAreaFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("area");
+    if (outAreaFieldIdx < 0) {
+        OGRFieldDefn areaField("area", OFTReal);
+        if (outLayer->CreateField(&areaField) == OGRERR_NONE) {
+            outAreaFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("area");
+        }
+    }
     OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
 
     auto ownershipStart = std::chrono::steady_clock::now();
@@ -3747,6 +3799,9 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
             outFeature->SetField(outIdFieldIdx, buildingId);
         }
         const OGRErr geomErr = outFeature->SetGeometry(outGeometry.get());
+        if (outAreaFieldIdx >= 0) {
+            outFeature->SetField(outAreaFieldIdx, GeometryArea(outGeometry.get()));
+        }
         if (geomErr != OGRERR_NONE) {
             std::cerr << "[Output] SetGeometry failed for fid=" << inFeature->GetFID()
                       << ", geomType=" << outGeometry->getGeometryName()
