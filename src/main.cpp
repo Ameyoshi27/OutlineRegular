@@ -162,6 +162,19 @@ const int kMinSeamEvidenceSamples = 6;
 const int kMinSeamHeightPairs = 3;
 const double kSupportOwnershipTieTolerance = 0.20; // meters. Prevents dense-neighbor wall points from supporting both footprints.
 const double kSupportOwnershipGridSize = 20.0;     // meters. Spatial index cell size for initial footprint ownership tests.
+// ---- Effective wall-support association (dense-neighbour protection) ----
+// kBoundarySupportBuffer stays the KD-tree COARSE search radius (tolerating
+// local mask offset). Points entering direction estimation, support evidence
+// and Ceres must additionally pass narrow-band / extended-band association,
+// unambiguous ownership and wall-normal/edge-normal consistency.
+const double kSupportNarrowBandDistance = 0.85;      // m, high-confidence wall band
+const double kSupportExtendedBandDistance = 1.50;    // m, only via continuous chains
+const double kSupportAmbiguousDistanceGap = 0.40;    // m, nearest-vs-second gap below this = ambiguous
+const double kSupportNormalEdgeMaxAngleDeg = 25.0;   // deg, wall XY normal vs edge normal
+const double kSupportExtendedMinRunLength = 2.0;     // m, chain length required for extended band
+const double kSupportExtendedChainGap = 0.9;         // m, arc gap linking extended-band points
+const double kSupportFallbackWeight = 0.30;          // fallback (non-wall) support weight
+const double kSupportDensifyWeight = 0.25;           // last-resort densified boundary weight
 const double kNarrowNeckMaxWidth = 4.0;            // meters. Post-vectorization split threshold for missed building separations.
 const double kNarrowNeckMinBoundarySeparation = 4.0;
 const double kNarrowNeckBoundarySeparationRatio = 0.02;
@@ -175,6 +188,10 @@ double g_optimizeTime = 0.0;
 std::size_t g_removedSmallPolygons = 0;
 std::size_t g_removedOutsideModel = 0;
 std::size_t g_supportOwnershipRejected = 0;
+std::size_t g_supportOwnershipAmbiguousRejected = 0;
+std::size_t g_supportFilterCoarseWallTotal = 0;
+std::size_t g_supportFilterEffectiveWallTotal = 0;
+std::size_t g_supportFilterFallbackUsedTotal = 0;
 
 bool RemoveShapefileFamily(const std::filesystem::path& shpPath, bool verbose = true)
 {
@@ -672,30 +689,44 @@ struct SupportOwnershipContext {
         }
     }
 
-    bool ownsSupportPoint(const pcl::PointXYZ& p,
-                          std::size_t currentId,
-                          double currentDistance) const {
-        if (currentId >= records.size()) return true;
+    // Three-state ownership: a point between two footprints whose distances
+    // differ by less than kSupportAmbiguousDistanceGap is AMBIGUOUS and must
+    // not feed either building's independent regularization (the old binary
+    // ownsSupportPoint force-assigned such points by ring id, interleaving
+    // one mixed point cloud across both footprints).
+    enum class SupportOwnership { Owned, Ambiguous, OwnedByOther };
+
+    SupportOwnership classifySupportPoint(const pcl::PointXYZ& p,
+                                          std::size_t currentId,
+                                          double currentDistance) const {
+        if (currentId >= records.size()) return SupportOwnership::Owned;
         const auto cell = cellFor(p.x, p.y);
         const auto found = grid.find(cell);
-        if (found == grid.end()) return true;
+        if (found == grid.end()) return SupportOwnership::Owned;
 
+        double nearestOther = std::numeric_limits<double>::max();
         for (std::size_t otherId : found->second) {
             if (otherId == currentId || otherId >= records.size()) continue;
             const auto& other = records[otherId];
             if (!EnvelopeContainsPoint(other.envelope, p, kBoundarySupportBuffer)) continue;
             const double otherDistance = DistanceToRingBoundary2D(p, other.ring);
             if (otherDistance > kBoundarySupportBuffer) continue;
-
-            if (otherDistance + kSupportOwnershipTieTolerance < currentDistance) {
-                return false;
-            }
-            if (std::abs(otherDistance - currentDistance) <= kSupportOwnershipTieTolerance &&
-                otherId < currentId) {
-                return false;
-            }
+            nearestOther = std::min(nearestOther, otherDistance);
         }
-        return true;
+        if (nearestOther < currentDistance) {
+            return SupportOwnership::OwnedByOther;
+        }
+        if (nearestOther - currentDistance < kSupportAmbiguousDistanceGap) {
+            return SupportOwnership::Ambiguous;
+        }
+        return SupportOwnership::Owned;
+    }
+
+    bool ownsSupportPoint(const pcl::PointXYZ& p,
+                          std::size_t currentId,
+                          double currentDistance) const {
+        return classifySupportPoint(p, currentId, currentDistance) ==
+               SupportOwnership::Owned;
     }
 };
 
@@ -761,13 +792,30 @@ OGRPolygon* MakePolygon(
 // ===== ExtractBoundarySupportFromOSGB =====
 // 浣滅敤锛氫粠閲囨牱鐨勭偣浜戦噷锛屾寫鍑?鏀拺杈圭晫瑙勫垯鍖?鐢ㄧ殑鐐广€?//       銆怟dTree 鐗堛€戠敤棰勫厛寤哄ソ鐨?kdtree 鍋氫竴娆?2D 鍗婂緞鏌ヨ锛屽彧鍙栧杈瑰舰鎵╁睍鍖呭洿鐩掕寖鍥村唴鐨?//       鍊欓€夌偣锛屽啀鎸夊師閫昏緫(澧欓潰鐐?/ 闈犺繎杈圭晫 / 钀藉湪澶氳竟褰㈠唴)绛涢€夈€?//       鍊欓€夐泦 鈯?鍘熷叏閲忔壂鎻忚兘閫氳繃鐨勬墍鏈夌偣锛屽洜姝ょ粨鏋滀笌鍘熺増瀹屽叏涓€鑷达紝鍙槸蹇緢澶氥€?// 鍙傛暟锛歴ampled  - OSGB 閲囨牱鐐逛簯锛況ing - 澶氳竟褰㈣竟鐣岋紱
 //       wallOnly- 鏄惁鍙彇澧欓潰鐐癸紱kdtree - 棰勫缓鐨?2D KdTree(Z 宸茬疆 0)銆?// 杩斿洖锛氭敮鎾戠偣浜戙€?
+// Per-building filter statistics for the effective-wall-support pipeline.
+struct SupportFilterStats {
+    std::size_t coarseWall = 0;        // 3 m coarse candidates passing the wall-normal gate
+    std::size_t narrowBand = 0;        // effective points inside the narrow band
+    std::size_t extendedBand = 0;      // effective points from surviving chains
+    std::size_t extendedRaw = 0;       // extended-band candidates before chain filter
+    std::size_t ambiguousRejected = 0; // ownership == Ambiguous
+    std::size_t otherOwnerRejected = 0;
+    std::size_t normalRejected = 0;    // wall/edge normal inconsistency or degenerate XY normal
+    std::size_t tRejected = 0;         // projection parameter outside [0.05, 0.95]
+};
+
+// Point-to-segment distance reporting the raw projection parameter.
+double PointSegmentDistanceWithT(
+    const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b, double& t);
+
 WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     const MyCloudPtr& sampled,
     const std::vector<pcl::PointXYZ>& ring,
     bool wallOnly,
     const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
     const SupportOwnershipContext* ownership = nullptr,
-    std::size_t currentRingId = static_cast<std::size_t>(-1))
+    std::size_t currentRingId = static_cast<std::size_t>(-1),
+    SupportFilterStats* filterStats = nullptr)
 {
     WeightedSupportCloud support;
     if (!sampled || !sampled->cloud || sampled->cloud->empty() || ring.size() < 3 || !kdtree) return support;
@@ -797,6 +845,34 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     std::vector<float> dists2;
     kdtree->radiusSearch(center, radius, candidates, dists2);
 
+    // Nearest-edge association helpers: prefix arc lengths + XY edge normals.
+    const std::size_t n = ring.size();
+    std::vector<double> prefix(n + 1, 0.0);
+    std::vector<double> edgeNx(n, 0.0);
+    std::vector<double> edgeNy(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % n];
+        prefix[i + 1] = prefix[i] + Distance2D(a, b);
+        const double len = Distance2D(a, b);
+        if (len > 1e-9) {
+            edgeNx[i] = -(b.y - a.y) / len;
+            edgeNy[i] = (b.x - a.x) / len;
+        }
+    }
+    const double perimeter = prefix[n];
+    const double normalEdgeCos =
+        std::cos(kSupportNormalEdgeMaxAngleDeg * M_PI / 180.0);
+    struct ExtendedCandidate {
+        pcl::PointXYZ p;
+        double weight = 1.0;
+        double arc = 0.0;
+    };
+    std::vector<ExtendedCandidate> extendedCandidates;
+    auto bump = [&filterStats](std::size_t SupportFilterStats::*field) {
+        if (filterStats) ++(filterStats->*field);
+    };
+
     for (int idx : candidates) {
         if (idx < 0 || static_cast<std::size_t>(idx) >= sampled->cloud->size()) continue;
         const auto& src = sampled->cloud->points[idx];
@@ -825,17 +901,128 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         p.y = src.y;
         p.z = src.z;
 
-        const double boundaryDistance = DistanceToRingBoundary2D(p, ring);
-        const bool nearBoundary = boundaryDistance <= kBoundarySupportBuffer;
+        // Nearest edge, distance and projection parameter.
+        double boundaryDistance = std::numeric_limits<double>::max();
+        std::size_t bestEdge = n;
+        double bestT = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            double t = 0.0;
+            const double d = PointSegmentDistanceWithT(p, ring[i], ring[(i + 1) % n], t);
+            if (d < boundaryDistance) {
+                boundaryDistance = d;
+                bestEdge = i;
+                bestT = t;
+            }
+        }
+        const bool nearBoundary =
+            bestEdge < n && boundaryDistance <= kBoundarySupportBuffer;
 
-        if (nearBoundary || (!wallOnly && PointInPolygon2D(p, ring))) {
-            if (nearBoundary && ownership &&
-                !ownership->ownsSupportPoint(p, currentRingId, boundaryDistance)) {
-                ++g_supportOwnershipRejected;
+        if (wallOnly) {
+            // ---- Effective wall-support pipeline ----
+            if (!nearBoundary) continue;
+            bump(&SupportFilterStats::coarseWall);
+            if (ownership) {
+                const auto own = ownership->classifySupportPoint(
+                    p, currentRingId, boundaryDistance);
+                if (own == SupportOwnershipContext::SupportOwnership::OwnedByOther) {
+                    ++g_supportOwnershipRejected;
+                    bump(&SupportFilterStats::otherOwnerRejected);
+                    continue;
+                }
+                if (own == SupportOwnershipContext::SupportOwnership::Ambiguous) {
+                    ++g_supportOwnershipAmbiguousRejected;
+                    bump(&SupportFilterStats::ambiguousRejected);
+                    continue;
+                }
+            }
+            if (bestT < 0.05 || bestT > 0.95) {
+                bump(&SupportFilterStats::tRejected);
                 continue;
+            }
+            // Wall XY normal vs nearest-edge normal consistency. Points whose
+            // XY normal degenerates are not effective wall support either.
+            bool normalOk = true;
+            if (sampled->normal &&
+                static_cast<std::size_t>(idx) < sampled->normal->size()) {
+                const auto& nv = sampled->normal->points[idx];
+                const double nLen = std::hypot(nv.normal_x, nv.normal_y);
+                if (nLen < 1e-6) {
+                    normalOk = false;
+                } else {
+                    const double dot = std::abs(
+                        (nv.normal_x * edgeNx[bestEdge] +
+                         nv.normal_y * edgeNy[bestEdge]) / nLen);
+                    if (dot < normalEdgeCos) normalOk = false;
+                }
+            }
+            if (!normalOk) {
+                bump(&SupportFilterStats::normalRejected);
+                continue;
+            }
+            if (boundaryDistance <= kSupportNarrowBandDistance) {
+                support.points->push_back(p);
+                support.weights.push_back(normalWeight);
+                bump(&SupportFilterStats::narrowBand);
+            } else if (boundaryDistance <= kSupportExtendedBandDistance) {
+                ExtendedCandidate c;
+                c.p = p;
+                c.weight = normalWeight;
+                c.arc = prefix[bestEdge] +
+                    bestT * (prefix[bestEdge + 1] - prefix[bestEdge]);
+                extendedCandidates.push_back(c);
+                bump(&SupportFilterStats::extendedRaw);
+            }
+            continue;
+        }
+
+        // ---- Non-wall fallback extraction (wide band allowed, ambiguous
+        // ownership still excluded; weights are lowered by the caller) ----
+        const bool inside = PointInPolygon2D(p, ring);
+        if (nearBoundary || inside) {
+            if (nearBoundary && ownership) {
+                const auto own = ownership->classifySupportPoint(
+                    p, currentRingId, boundaryDistance);
+                if (own == SupportOwnershipContext::SupportOwnership::OwnedByOther) {
+                    ++g_supportOwnershipRejected;
+                    bump(&SupportFilterStats::otherOwnerRejected);
+                    continue;
+                }
+                if (own == SupportOwnershipContext::SupportOwnership::Ambiguous) {
+                    ++g_supportOwnershipAmbiguousRejected;
+                    bump(&SupportFilterStats::ambiguousRejected);
+                    continue;
+                }
             }
             support.points->push_back(p);
             support.weights.push_back(normalWeight);
+        }
+    }
+
+    // Extended-band chain filter: only keep chains whose projected span
+    // proves continuous wall support (chains crossing the ring seam get
+    // split — acceptable minimal implementation).
+    if (wallOnly && !extendedCandidates.empty()) {
+        std::sort(extendedCandidates.begin(), extendedCandidates.end(),
+                  [](const ExtendedCandidate& a, const ExtendedCandidate& b) {
+                      return a.arc < b.arc;
+                  });
+        std::size_t start = 0;
+        for (std::size_t k = 1; k <= extendedCandidates.size(); ++k) {
+            const bool chainEnd =
+                k == extendedCandidates.size() ||
+                extendedCandidates[k].arc - extendedCandidates[k - 1].arc >
+                    kSupportExtendedChainGap;
+            if (!chainEnd) continue;
+            const double span =
+                extendedCandidates[k - 1].arc - extendedCandidates[start].arc;
+            if (span >= kSupportExtendedMinRunLength) {
+                for (std::size_t m = start; m < k; ++m) {
+                    support.points->push_back(extendedCandidates[m].p);
+                    support.weights.push_back(extendedCandidates[m].weight);
+                    if (filterStats) ++filterStats->extendedBand;
+                }
+            }
+            start = k;
         }
     }
 
@@ -940,8 +1127,9 @@ SupportEvidence ComputeSupportEvidence(
         4, static_cast<std::size_t>(std::ceil(perimeter / kSupportEvidenceBinLength)));
     std::vector<bool> occupied(totalBins, false);
 
-    const double associationDistance = std::max(
-        kSupportEvidenceAssociationDistance, 0.25 * kBoundarySupportBuffer);
+    // Evidence input is PRE-FILTERED effective wall support (narrow band or
+    // verified extended chains), so association only re-confirms binning.
+    const double associationDistance = kSupportExtendedBandDistance;
     std::size_t associated = 0;
     for (const auto& p : *wallOnlySupport.points) {
         double bestDistance = std::numeric_limits<double>::max();
@@ -1048,10 +1236,21 @@ std::vector<pcl::PointXYZ> RegularizeRing(
 {
     if (ring.size() < 3) return ring;
 
+    // ---- Effective wall support extraction (3 m coarse search, narrow/
+    // extended band + ownership + normal-edge filtering inside) ----
+    SupportFilterStats filterStats;
+    auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
+        sampled, ring, true, kdtree, ownership, currentRingId, &filterStats);
+    // Raw effective set snapshot: downsampling below replaces
+    // weightedSupport's cloud, but the direction hint must keep the raw
+    // effective wall points.
+    const WeightedSupportCloud effectiveWallSupportRaw = wallOnlySupport;
+    g_supportFilterCoarseWallTotal += filterStats.coarseWall;
+    g_supportFilterEffectiveWallTotal +=
+        filterStats.narrowBand + filterStats.extendedBand;
+
     // ---- 鏀拺鐐规彁鍙?璁℃椂) ----
     auto t0 = std::chrono::steady_clock::now();
-    auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
-        sampled, ring, true, kdtree, ownership, currentRingId);   // 鍏堝彧鐢ㄥ闈㈢偣
     // ---- Pseudo-footprint support evidence: computed on the RAW wall-only
     // support BEFORE any fallback / densify / downsample replaces it. A drop
     // here returns an empty ring so the feature never reaches VDP/Ceres.
@@ -1064,6 +1263,7 @@ std::vector<pcl::PointXYZ> RegularizeRing(
         // source_fid here is the stable attribute id (initial outline "id"
         // field when present, otherwise the OGR FID) — see main()'s loop.
         std::cerr << "[SupportEvidence] source_fid=" << sourceFid
+                  << " evidence_source=effective_wall_support"
                   << " area=" << ringArea
                   << " perimeter=" << evidence.perimeter
                   << " wall_points=" << evidence.wallPointCount
@@ -1086,21 +1286,35 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     }
 
     auto weightedSupport = wallOnlySupport;
+    std::size_t fallbackCount = 0;
+    std::size_t densifyCount = 0;
     if (weightedSupport.points->size() < 20) {
-        weightedSupport = ExtractWeightedBoundarySupportFromOSGB(
+        // Non-wall fallback: ambiguous ownership is already excluded inside
+        // the extractor; weights stay clearly below effective wall points.
+        auto fallbackSupport = ExtractWeightedBoundarySupportFromOSGB(
             sampled, ring, false, kdtree, ownership, currentRingId);
+        fallbackCount = fallbackSupport.points->size();
+        g_supportFilterFallbackUsedTotal += fallbackCount;
+        for (std::size_t i = 0; i < fallbackSupport.points->size(); ++i) {
+            weightedSupport.points->push_back(fallbackSupport.points->points[i]);
+            weightedSupport.weights.push_back(kSupportFallbackWeight);
+        }
     }
     if (weightedSupport.points->size() < 20) {
-        weightedSupport.points = DensifyBoundary(ring, kDensifyStep);
-        weightedSupport.weights.assign(weightedSupport.points->size(), 1.0);
+        // Last resort for Ceres only: densified boundary of the outline
+        // itself, lowest weight.
+        auto densified = DensifyBoundary(ring, kDensifyStep);
+        densifyCount = densified->size();
+        for (const auto& p : *densified) {
+            weightedSupport.points->push_back(p);
+            weightedSupport.weights.push_back(kSupportDensifyWeight);
+        }
     }
     // 鏀拺鐐硅繃澶氭椂闄嶉噰鏍凤細computeModelResolution 鏄?O(N虏)锛孋eres/鎷撴墤淇涔熼殢鐐规暟鍙樿吹
     // Ceres only uses XY. A 3D voxel grid keeps repeated wall locations at
     // different heights and unintentionally gives tall walls more influence.
     auto downsampled = DownsampleSupport2DWithWeights(weightedSupport, kSupportVoxelLeaf);
     if (downsampled.points && !downsampled.points->empty()) weightedSupport = downsampled;
-    auto downsampledWall = DownsampleSupport2DWithWeights(wallOnlySupport, kSupportVoxelLeaf);
-    if (downsampledWall.points && !downsampledWall.points->empty()) wallOnlySupport = downsampledWall;
     ApplySupportDensityWeights(weightedSupport);
     auto support = weightedSupport.points;
     if (debugSupport) {
@@ -1108,6 +1322,20 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     }
     auto t1 = std::chrono::steady_clock::now();
     g_supportTime += std::chrono::duration<double>(t1 - t0).count();
+
+    std::cerr << "[SupportFilter] fid=" << sourceFid
+              << " coarse_wall=" << filterStats.coarseWall
+              << " effective_wall=" << filterStats.narrowBand + filterStats.extendedBand
+              << " narrow_band=" << filterStats.narrowBand
+              << " extended_band=" << filterStats.extendedBand
+              << " fallback=" << fallbackCount
+              << " densify=" << densifyCount
+              << " ambiguous_rejected=" << filterStats.ambiguousRejected
+              << " other_owner_rejected=" << filterStats.otherOwnerRejected
+              << " normal_rejected=" << filterStats.normalRejected
+              << " t_rejected=" << filterStats.tRejected
+              << " direction_input=" << effectiveWallSupportRaw.points->size()
+              << " ceres_input=" << support->size() << std::endl;
 
     // Small buildings no longer take the oriented-rectangle fast path here;
     // they run the normal pipeline and outlineRegular forces a single main
@@ -1123,7 +1351,7 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     double wallPeakRatio = 0.0;
     std::size_t wallPairCount = 0;
     outlineRegular::estimateSupportDirection2D(
-        wallOnlySupport.points, wallDirection, wallPeakRatio, wallPairCount);
+        effectiveWallSupportRaw.points, wallDirection, wallPeakRatio, wallPairCount);
     regularizer.setSupportDirectionHint(wallDirection, wallPeakRatio, wallPairCount);
     auto t2 = std::chrono::steady_clock::now();
     regularizer.regular_Contour();
@@ -4064,8 +4292,11 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
               << " m^2: " << g_removedSmallPolygons << std::endl;
     std::cout << "[Filter] removed polygons outside sampled model: "
               << g_removedOutsideModel << std::endl;
-    std::cout << "[Support ownership] rejected shared/neighbor support points: "
-              << g_supportOwnershipRejected << std::endl;
+    std::cout << "[Support ownership] rejected_other=" << g_supportOwnershipRejected
+              << ", ambiguous_rejected=" << g_supportOwnershipAmbiguousRejected << std::endl;
+    std::cout << "[Support filter] coarse_wall=" << g_supportFilterCoarseWallTotal
+              << ", effective_wall=" << g_supportFilterEffectiveWallTotal
+              << ", fallback_used=" << g_supportFilterFallbackUsedTotal << std::endl;
     if (total > 0) {
         std::cout << "[Timing]   avg per feature: " << (loopSec / total) << " s" << std::endl;
     }
