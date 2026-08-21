@@ -95,10 +95,8 @@ constexpr double kSupportDirectionCorrectionDeg = 9.0;
 // real cases). A direction selection that deviates beyond these gates needs
 // strong wall evidence, otherwise it snaps back to the ring trend. Blocks the
 // "VDP hull diagonal" failure mode (18 deg chosen for a ~12 deg building).
-constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio) for a tight 5 deg gate
-constexpr double kPcaDirectionUsableAxisRatio = 1.3;   // moderate elongation -> loose 12 deg gate
+constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio) for the PCA fallback gate
 constexpr double kPcaDirectionGateStrongDeg = 5.0;
-constexpr double kPcaDirectionGateWeakDeg = 12.0;
 // Small buildings run the normal pipeline (the oriented-rectangle fast path
 // was removed) but their best hypothesis must regularize to ONE main
 // direction: multi-direction regularization produces diagonal edges that
@@ -3881,9 +3879,10 @@ void outlineRegular::regular_Contour()
         // diagonal edges on them.
         const double smallBuildingHypothesisArea =
             polygonArea2D(fallback_hypothesis);
-        if (smallBuildingHypothesisArea > 0.0 &&
-            smallBuildingHypothesisArea < kSmallBuildingSingleDirectionArea &&
-            credible_multi_direction) {
+        const bool forceSingleDirection =
+            smallBuildingHypothesisArea > 0.0 &&
+            smallBuildingHypothesisArea < kSmallBuildingSingleDirectionArea;
+        if (forceSingleDirection && credible_multi_direction) {
             std::cerr << "[SmallBuilding] hypothesis_area=" << smallBuildingHypothesisArea
                       << " < " << kSmallBuildingSingleDirectionArea
                       << " -> force single direction" << std::endl;
@@ -3945,12 +3944,15 @@ void outlineRegular::regular_Contour()
                     double ringPcaAngle = 0.0;
                     if (!corrected &&
                         estimatePcaDirection2D(ringCloud, ringPcaAngle, pcaAxisRatio)) {
+                        // Only well-elongated rings get a PCA fallback: a
+                        // near-isotropic blob's PCA axis is unstable (+-20 deg
+                        // noise) and once overrode a wall-consistent MBR angle
+                        // by 27 deg on a ratio-1.37 footprint, wrecking the
+                        // small building's regularization.
                         const double gateDeg =
                             pcaAxisRatio >= kPcaDirectionReliableAxisRatio
                                 ? kPcaDirectionGateStrongDeg
-                                : (pcaAxisRatio >= kPcaDirectionUsableAxisRatio
-                                       ? kPcaDirectionGateWeakDeg
-                                       : 1e9);
+                                : 1e9;
                         pcaDeviationDeg =
                             foldedAngleDistance90(single_line_angles.front(), ringPcaAngle) *
                             180.0 / M_PI;
@@ -4228,6 +4230,18 @@ void outlineRegular::regular_Contour()
         }
 
         auto regularizedCandidateOk = [&](const std::vector<pcl::PointXYZ>& candidate) {
+            // Small buildings must end up strictly orthogonal: the loose
+            // acceptable branch below would otherwise pass Ceres results
+            // whose free edges stayed diagonal (real leak: results id=2168/
+            // 2154 came out with mixed angles despite force-single).
+            if (forceSingleDirection &&
+                !isStrictOrthogonalToMainAngle(
+                    candidate,
+                    preferred_line_angles.empty() ? dominantLineAngles2D(fallback_hypothesis, 1).front()
+                                                  : preferred_line_angles.front(),
+                    3.0, model_tuning.fine_prune_distance)) {
+                return false;
+            }
             if (isRegularizedPolygonAcceptable(candidate, fallback_hypothesis)) return true;
             if (!allow_diagonal_edges &&
                 isStrictOrthogonalToMainAngle(
@@ -4266,11 +4280,32 @@ void outlineRegular::regular_Contour()
                 accepted = true;
             }
             if (!accepted) {
-                std::cerr << "[outlineRegular] final polygon invalid, rollback to pre-Ceres hypothesis" << std::endl;
-                final_points->clear();
-                best_hypothesis = fallback_hypothesis;
-                for (const auto& op : best_hypothesis) {
-                    final_points->points.push_back(op);
+                // Last resort for small buildings: the raw hypothesis would
+                // keep staircase/diagonal edges, so orthogonal-snap it before
+                // falling back to it verbatim.
+                bool snappedFallback = false;
+                if (forceSingleDirection) {
+                    std::vector<pcl::PointXYZ> snapped;
+                    const double snapAngle =
+                        preferred_line_angles.empty()
+                            ? dominantLineAngles2D(fallback_hypothesis, 1).front()
+                            : preferred_line_angles.front();
+                    if (forceOrthogonalPolygonToAngle(fallback_hypothesis, snapAngle, snapped) &&
+                        isSingleDirectionCandidateAcceptable(
+                            snapped, fallback_hypothesis, model_tuning)) {
+                        std::cerr << "[outlineRegular] small building orthogonal-snap fallback" << std::endl;
+                        final_points->clear();
+                        for (const auto& p : snapped) final_points->push_back(p);
+                        snappedFallback = true;
+                    }
+                }
+                if (!snappedFallback) {
+                    std::cerr << "[outlineRegular] final polygon invalid, rollback to pre-Ceres hypothesis" << std::endl;
+                    final_points->clear();
+                    best_hypothesis = fallback_hypothesis;
+                    for (const auto& op : best_hypothesis) {
+                        final_points->points.push_back(op);
+                    }
                 }
             }
         }
