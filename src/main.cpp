@@ -1350,8 +1350,22 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     double wallDirection = 0.0;
     double wallPeakRatio = 0.0;
     std::size_t wallPairCount = 0;
-    outlineRegular::estimateSupportDirection2D(
-        effectiveWallSupportRaw.points, wallDirection, wallPeakRatio, wallPairCount);
+    {
+        // The direction histogram's strength gate (kSupportDirectionMinPairs)
+        // is calibrated on VOXEL-DOWNSAMPLED wall points. Feeding the raw
+        // effective set (30 pts/m2) inflates pair counts ~20x, letting a
+        // single short anomalous wall pass as "strong" evidence and rotate
+        // the building (observed: 15-45 deg corrections from 400-8000 pairs).
+        // Restore scale parity by downsampling before the hint.
+        auto downsampledEffective =
+            DownsampleSupport2DWithWeights(effectiveWallSupportRaw, kSupportVoxelLeaf);
+        const auto directionInput =
+            (downsampledEffective.points && !downsampledEffective.points->empty())
+                ? downsampledEffective.points
+                : effectiveWallSupportRaw.points;
+        outlineRegular::estimateSupportDirection2D(
+            directionInput, wallDirection, wallPeakRatio, wallPairCount);
+    }
     regularizer.setSupportDirectionHint(wallDirection, wallPeakRatio, wallPairCount);
     auto t2 = std::chrono::steady_clock::now();
     regularizer.regular_Contour();

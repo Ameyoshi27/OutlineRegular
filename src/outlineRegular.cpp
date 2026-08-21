@@ -90,6 +90,12 @@ constexpr double kSupportDirectionPairRadius = 2.5;
 constexpr double kSupportDirectionMinPairDistance = 0.35;
 constexpr double kSupportDirectionStrongPeakRatio = 0.14; // Uniform +/-5 degree background is 11/90.
 constexpr double kSupportDirectionCorrectionDeg = 9.0;
+// Wall corrections beyond this magnitude are suspect: with sparse wall
+// evidence the histogram peak can be a short anomalous wall fragment
+// (observed 15-45 deg "corrections" from only 400-8000 pairs rotating
+// buildings away from outline/hypothesis/wall majority). Genuine
+// corrections (validated case: 32.1 -> 16.5 deg) stay below this cap.
+constexpr double kWallDirectionCorrectionMaxDeg = 25.0;
 // Original-ring PCA gate: a raster-staircase outline's overall trend is a
 // stable direction prior for elongated footprints (validated to ~0.5 deg on
 // real cases). A direction selection that deviates beyond these gates needs
@@ -4053,8 +4059,21 @@ void outlineRegular::regular_Contour()
                 const double difference = foldedAngleDistance90(originalAngle, wallAngle);
                 constexpr double kWallDirectionCorrectionThreshold =
                     kSupportDirectionCorrectionDeg * M_PI / 180.0;
-                const bool corrected = strongWallDirection &&
+                constexpr double kWallDirectionCorrectionMax =
+                    kWallDirectionCorrectionMaxDeg * M_PI / 180.0;
+                bool corrected = strongWallDirection &&
                     difference > kWallDirectionCorrectionThreshold;
+                if (corrected && difference > kWallDirectionCorrectionMax) {
+                    // Sparse-evidence guard: a wall peak that far from the
+                    // selection is usually a short anomalous wall fragment,
+                    // not the building's dominant direction.
+                    std::cerr << "[DirectionDecision] reject correction: diff_deg="
+                              << difference * 180.0 / M_PI
+                              << " exceeds cap " << kWallDirectionCorrectionMaxDeg
+                              << " (pairs=" << wallPairCount
+                              << " peak_ratio=" << wallPeakRatio << ")" << std::endl;
+                    corrected = false;
+                }
                 if (corrected) single_line_angles.front() = wallAngle;
 
                 // PCA gate on the ORIGINAL outline ring (not the VDP
