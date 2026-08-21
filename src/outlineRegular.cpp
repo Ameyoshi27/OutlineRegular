@@ -3655,7 +3655,8 @@ void outlineRegular::regular_Contour()
     // ---- 计时(定位规则化各阶段耗时) ----
     auto _t_total = std::chrono::steady_clock::now();
     auto _t0 = _t_total;
-    std::cerr << "[RegTime] === polygon: original_points=" << original_points.size()
+    std::cerr << "[RegTime] === polygon: fid=" << source_feature_id_
+              << " original_points=" << original_points.size()
               << " support=" << fitting_cloud->size() << " ===" << std::endl;
 
     // 计算点云分辨率 (平均点间距)
@@ -4057,7 +4058,7 @@ void outlineRegular::regular_Contour()
                 }
 
                 auto _single_t1 = std::chrono::steady_clock::now();
-                std::cerr << "[SingleFirst] angle_deg="
+                std::cerr << "[SingleFirst] fid=" << source_feature_id_ << " angle_deg="
                     << single_line_angles.front() * 180.0 / M_PI
                     << " accepted=" << (single_accepted ? 1 : 0)
                     << " time="
@@ -4099,9 +4100,13 @@ void outlineRegular::regular_Contour()
                 preferred_line_angles.push_back(system.angle);
             }
         }
-        std::cerr << "[BuildingMode] "
-            << (allow_diagonal_edges ? "AllowDiagonal" : "StrictOrthogonal")
-            << std::endl;
+        std::cerr << "[BuildingMode] fid=" << source_feature_id_
+            << " " << (allow_diagonal_edges ? "AllowDiagonal" : "StrictOrthogonal")
+            << " angles=";
+        for (double a : preferred_line_angles) {
+            std::cerr << a * 180.0 / M_PI << ",";
+        }
+        std::cerr << std::endl;
 
         if (allow_diagonal_edges) {
             std::vector<pcl::PointXYZ> local_chain_candidate;
