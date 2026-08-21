@@ -131,11 +131,10 @@ const double kSupportDensityRadius = 1.0;        // XY radius for local support-
 const double kSupportDensityMinWeight = 0.40;    // Sparse support is downweighted, not discarded.
 const double kSupportDensityMaxWeight = 1.15;    // Dense support gets only a mild boost.
 const double kMinPolygonBBoxArea = 20.0;
-const double kSmallBuildingArea = 60.0;         // Footprints with polygon area below this use a stable oriented-MBR
-                                                 // fast path. Criterion is the true polygon area, not the axis-aligned
-                                                 // bbox: rotated or irregular small buildings have inflated bboxes
-                                                 // (up to ~2x at 45 degrees) and would otherwise systematically
-                                                 // miss the fast path.
+// Small-building threshold moved to outlineRegular.cpp
+// (kSmallBuildingSingleDirectionArea): small footprints no longer take a
+// rectangle fast path, they run the normal pipeline with a forced single
+// main direction.
 const double kMinOutputPolygonArea = 15.0;      // Final write-out safety floor in square meters.
 const double kMinOutputPolygonBBoxArea = 20.0;  // Final write-out bbox safety floor in square meters.
 const double kModelCoverageBuffer = 3.0;
@@ -163,7 +162,7 @@ const int kMinSeamEvidenceSamples = 6;
 const int kMinSeamHeightPairs = 3;
 const double kSupportOwnershipTieTolerance = 0.20; // meters. Prevents dense-neighbor wall points from supporting both footprints.
 const double kSupportOwnershipGridSize = 20.0;     // meters. Spatial index cell size for initial footprint ownership tests.
-const double kNarrowNeckMaxWidth = 3.0;            // meters. Post-vectorization split threshold for missed building separations.
+const double kNarrowNeckMaxWidth = 4.0;            // meters. Post-vectorization split threshold for missed building separations.
 const double kNarrowNeckMinBoundarySeparation = 4.0;
 const double kNarrowNeckBoundarySeparationRatio = 0.02;
 const double kNarrowNeckMinPartArea = 20.0;
@@ -915,35 +914,11 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     auto t1 = std::chrono::steady_clock::now();
     g_supportTime += std::chrono::duration<double>(t1 - t0).count();
 
-    if (PolygonArea2D(ring) < kSmallBuildingArea) {
-        double direction = 0.0;
-        double peakRatio = 0.0;
-        double axisRatio = 1.0;
-        std::size_t pairCount = 0;
-        const char* source = "ring_pca";
-        if (outlineRegular::estimateSupportDirection2D(
-                wallOnlySupport.points, direction, peakRatio, pairCount)) {
-            source = "wall_pairs";
-        } else if (outlineRegular::estimatePcaDirection2D(
-                       support, direction, axisRatio)) {
-            source = "support_pca";
-        } else {
-            pcl::PointCloud<pcl::PointXYZ>::Ptr ringCloud(new pcl::PointCloud<pcl::PointXYZ>);
-            ringCloud->points.assign(ring.begin(), ring.end());
-            outlineRegular::estimatePcaDirection2D(ringCloud, direction, axisRatio);
-        }
-        std::vector<pcl::PointXYZ> rectangle = OrientedBoundingRectangle(ring, direction);
-        if (rectangle.size() == 4) {
-            if (debugBestHypothesis) *debugBestHypothesis = rectangle;
-            std::cerr << "[SmallBuilding] area=" << PolygonArea2D(ring)
-                      << " direction_deg=" << direction * 180.0 / M_PI
-                      << " source=" << source
-                      << " peak_ratio=" << peakRatio
-                      << " pairs=" << pairCount
-                      << " axis_ratio=" << axisRatio << std::endl;
-            return rectangle;
-        }
-    }
+    // Small buildings no longer take the oriented-rectangle fast path here;
+    // they run the normal pipeline and outlineRegular forces a single main
+    // direction for them (kSmallBuildingSingleDirectionArea) so multi-
+    // direction regularization cannot produce diagonal edges on small
+    // footprints.
 
     // ---- 瑙勫垯鍖栦紭鍖?璁℃椂) ----
     // The AI mask is the initial contour, not an independent DLG observation.

@@ -99,6 +99,12 @@ constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio)
 constexpr double kPcaDirectionUsableAxisRatio = 1.3;   // moderate elongation -> loose 12 deg gate
 constexpr double kPcaDirectionGateStrongDeg = 5.0;
 constexpr double kPcaDirectionGateWeakDeg = 12.0;
+// Small buildings run the normal pipeline (the oriented-rectangle fast path
+// was removed) but their best hypothesis must regularize to ONE main
+// direction: multi-direction regularization produces diagonal edges that
+// look wrong on small footprints. Same value as the former rectangle
+// fast-path threshold in main.cpp.
+constexpr double kSmallBuildingSingleDirectionArea = 60.0;
 // Evidence-backed notch protection: real rectangular notches (courtyard bays,
 // setbacks) survive the energy hypothesis but get dissolved by the orthogonal
 // clean-up chain (topology repair at repair_distance, axis-collinear vertex
@@ -3867,6 +3873,21 @@ void outlineRegular::regular_Contour()
                 credible_multi_direction = true;
                 std::cerr << "[BuildingMode] relaxed multi-direction evidence accepted" << std::endl;
             }
+        }
+
+        // Small footprints (by BEST HYPOTHESIS area, replacing the former
+        // rectangle fast path in main.cpp): force single-direction
+        // regularization so the multi-direction branch cannot produce
+        // diagonal edges on them.
+        const double smallBuildingHypothesisArea =
+            polygonArea2D(fallback_hypothesis);
+        if (smallBuildingHypothesisArea > 0.0 &&
+            smallBuildingHypothesisArea < kSmallBuildingSingleDirectionArea &&
+            credible_multi_direction) {
+            std::cerr << "[SmallBuilding] hypothesis_area=" << smallBuildingHypothesisArea
+                      << " < " << kSmallBuildingSingleDirectionArea
+                      << " -> force single direction" << std::endl;
+            credible_multi_direction = false;
         }
 
         // Prefer a single orthogonal direction first.  Many mask-derived
