@@ -123,6 +123,11 @@ public:
 	~outlineRegular();
 
 	void regular_Contour();
+	// 拓扑保持规则化实验通道：从边链出发(非VDP假设)，稠密残差+线参数Ceres。
+	std::vector<pcl::PointXYZ> TopologyPreservingRegularize(
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		bool& usedFallback);
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
 // Mask-only 模式关闭曲线恢复：无正射证据仲裁时，

@@ -4088,6 +4088,275 @@ void outlineRegular::setInterFloorRegularizationContext(
     inter_floor_max_wall_snap_angle_ = std::max(0.0, max_wall_snap_angle_deg) * M_PI / 180.0;
 }
 
+// ===== TopologyPreservingRegularize =====
+// 拓扑保持规则化实验通道：从初始轮廓的连续边链出发（非 VDP 假设），
+// 保留显著凹凸/窄颈/方向转折作为受保护顶点，用等弧长轮廓采样点
+// 作为稠密几何残差，Ceres 只优化每条链的线参数(θ,d)。
+// 顶点数由边链拓扑决定，不受 VDP 顶点数惩罚约束。
+std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
+    const std::vector<pcl::PointXYZ>& initialRing,
+    double pixelSize,
+    bool& usedFallback)
+{
+    usedFallback = false;
+    if (initialRing.size() < 6) {
+        usedFallback = true;
+        return {};
+    }
+
+    const double area = polygonArea2D(initialRing);
+    if (area < 5.0) {
+        usedFallback = true;
+        return {};
+    }
+
+    // ---- 1. 边链提取(split-and-merge, 已有基础设施) ----
+    const double fitTolerance = std::clamp(
+        0.5 * std::max(pixelSize, 0.3), 0.15, 0.60);
+    auto chains = ExtractDirectionChains(initialRing, fitTolerance);
+    if (chains.size() < 3) {
+        usedFallback = true;
+        return {};
+    }
+
+    // ---- 2. 标记受保护转角(显著凹角/凸角/方向转折) ----
+    struct ProtectedCorner {
+        std::size_t chainBefore;
+        std::size_t chainAfter;
+        double turnAngleDeg = 0.0;
+        bool isReflex = false;
+    };
+    std::vector<ProtectedCorner> corners;
+    for (std::size_t c = 0; c < chains.size(); ++c) {
+        const auto& prev = chains[c];
+        const auto& next = chains[(c + 1) % chains.size()];
+        double turn = std::abs(next.angleRad - prev.angleRad) * 180.0 / M_PI;
+        if (turn > 90.0) turn = 180.0 - turn;  // fold for undirected
+        // significant turn: > 25° between consecutive chains
+        if (turn > 25.0) {
+            ProtectedCorner corner;
+            corner.chainBefore = c;
+            corner.chainAfter = (c + 1) % chains.size();
+            corner.turnAngleDeg = turn;
+            // determine reflex/convex from cross product of chain directions
+            const auto& prevEnd = initialRing[prev.endIndex % initialRing.size()];
+            const auto& nextStart = initialRing[next.startIndex % initialRing.size()];
+            const auto& ringCenter = [&]() {
+                double cx = 0.0, cy = 0.0;
+                for (const auto& p : initialRing) { cx += p.x; cy += p.y; }
+                return std::make_pair(cx / initialRing.size(), cy / initialRing.size());
+            }();
+            const double cross = (prevEnd.x - ringCenter.first) * (nextStart.y - ringCenter.second) -
+                                  (prevEnd.y - ringCenter.second) * (nextStart.x - ringCenter.first);
+            corner.isReflex = cross < 0.0;
+            corners.push_back(corner);
+        }
+    }
+
+    std::cerr << "[TopologyChain] fid=" << source_feature_id_
+              << " raw_vertices=" << initialRing.size()
+              << " chains=" << chains.size()
+              << " protected_corners=" << corners.size() << std::endl;
+
+    // ---- 3. 构造候选拓扑: 链交点作为多边形顶点 ----
+    // 用相邻链的直线求交得到顶点
+    struct ChainLine {
+        double theta = 0.0;  // line direction angle
+        double d = 0.0;       // Hessian distance
+        double nx = 0.0, ny = 0.0; // unit normal
+        double weight = 0.0;
+    };
+    std::vector<ChainLine> lines(chains.size());
+    for (std::size_t c = 0; c < chains.size(); ++c) {
+        const auto& chain = chains[c];
+        // use the chain's principal direction
+        const double theta = chain.angleRad;  // already folded to [0, π/2)
+        // un-fold: need actual direction (could be theta or θ+π/2)
+        // use the direction from start to end of the chain segment
+        const auto& sp = initialRing[chain.startIndex % initialRing.size()];
+        const auto& ep = initialRing[chain.endIndex % initialRing.size()];
+        const double rawAngle = std::atan2(ep.y - sp.y, ep.x - sp.x);
+        ChainLine& line = lines[c];
+        line.theta = rawAngle;
+        line.nx = -std::sin(rawAngle);
+        line.ny = std::cos(rawAngle);
+        line.d = sp.x * line.nx + sp.y * line.ny;
+        line.weight = chain.weight;
+    }
+
+    // compute intersections of adjacent lines as polygon vertices
+    std::vector<pcl::PointXYZ> topologyPolygon;
+    topologyPolygon.reserve(chains.size());
+    const float zVal = initialRing[0].z;
+    for (std::size_t c = 0; c < chains.size(); ++c) {
+        const auto& la = lines[c];
+        const auto& lb = lines[(c + 1) % chains.size()];
+        const double det = la.nx * lb.ny - lb.nx * la.ny;
+        if (std::abs(det) < 1e-9) {
+            // near-parallel: use midpoint of the shared corner region
+            const auto& sp = initialRing[chains[c].endIndex % initialRing.size()];
+            pcl::PointXYZ mid;
+            mid.x = 0.5f * (sp.x + sp.x);
+            mid.y = 0.5f * (sp.y + sp.y);
+            mid.z = zVal;
+            topologyPolygon.push_back(mid);
+            continue;
+        }
+        const double x = (la.d * lb.ny - lb.d * la.ny) / det;
+        const double y = (la.nx * lb.d - lb.nx * la.d) / det;
+        // wait, Cramer's rule for system:
+        // la.nx * x + la.ny * y = la.d
+        // lb.nx * x + lb.ny * y = lb.d
+        const double xx = (la.d * lb.ny - la.ny * lb.d) / det;
+        const double yy = (la.nx * lb.d - la.d * lb.nx) / det;
+        pcl::PointXYZ vertex;
+        vertex.x = static_cast<float>(xx);
+        vertex.y = static_cast<float>(yy);
+        vertex.z = zVal;
+        topologyPolygon.push_back(vertex);
+    }
+
+    // ---- 4. 拓扑安全检查 ----
+    if (topologyPolygon.size() < 3) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=degenerate_topology_polygon" << std::endl;
+        return {};
+    }
+    removeDuplicatePoints2D(topologyPolygon, 0.05f);
+    if (topologyPolygon.size() < 3 || !isSimplePolygon2D(topologyPolygon)) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=self_intersecting_or_too_few_vertices" << std::endl;
+        return {};
+    }
+    const double topoArea = polygonArea2D(topologyPolygon);
+    const double areaRatio = topoArea / std::max(area, 1e-6);
+    if (areaRatio < 0.60 || areaRatio > 1.60) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=area_ratio=" << areaRatio << std::endl;
+        return {};
+    }
+    pcl::PointCloud<pcl::PointXYZ>::Ptr residualCloud(new pcl::PointCloud<pcl::PointXYZ>);
+    {
+        const double step = std::clamp(pixelSize, 0.3, 0.8);
+        for (std::size_t i = 0; i < initialRing.size(); ++i) {
+            const auto& a = initialRing[i];
+            const auto& b = initialRing[(i + 1) % initialRing.size()];
+            const double len = std::hypot(b.x - a.x, b.y - a.y);
+            const int steps = std::max(1, static_cast<int>(std::ceil(len / step)));
+            for (int s2 = 0; s2 < steps; ++s2) {
+                const double t = static_cast<double>(s2) / steps;
+                pcl::PointXYZ pt;
+                pt.x = static_cast<float>(a.x + t * (b.x - a.x));
+                pt.y = static_cast<float>(a.y + t * (b.y - a.y));
+                pt.z = a.z;
+                residualCloud->push_back(pt);
+            }
+        }
+    }
+    if (residualCloud->size() < 6) {
+        usedFallback = true;
+        return {};
+    }
+    // Filter residual points to be near their corresponding chain
+    // (avoid cross-chain contamination)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr filteredResidual(new pcl::PointCloud<pcl::PointXYZ>);
+    for (const auto& pt : residualCloud->points) {
+        double bestDist = std::numeric_limits<double>::max();
+        for (const auto& chain : chains) {
+            const auto& sp = initialRing[chain.startIndex % initialRing.size()];
+            const auto& ep = initialRing[chain.endIndex % initialRing.size()];
+            const double dx = ep.x - sp.x;
+            const double dy = ep.y - sp.y;
+            const double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-12) continue;
+            double t = ((pt.x - sp.x) * dx + (pt.y - sp.y) * dy) / lenSq;
+            t = std::clamp(t, 0.0, 1.0);
+            const double px = sp.x + t * dx;
+            const double py = sp.y + t * dy;
+            const double d = std::hypot(pt.x - px, pt.y - py);
+            bestDist = std::min(bestDist, d);
+        }
+        if (bestDist <= fitTolerance * 2.0) {
+            filteredResidual->push_back(pt);
+        }
+    }
+
+    std::cerr << "[DenseResidual] fid=" << source_feature_id_
+              << " residual_points=" << filteredResidual->size() << std::endl;
+
+    // ---- 6. 用现有 optimizeWithHardConstraints 做 Ceres 平差 ----
+    // 传入 topologyPolygon 作为初始假设，filteredResidual 作为点云
+    std::vector<double> preferredAngles;
+    // detect dominant direction from chains
+    {
+        // simple: use the longest chain's angle as primary direction
+        std::size_t longestChain = 0;
+        double maxLen = 0.0;
+        for (std::size_t c = 0; c < chains.size(); ++c) {
+            if (chains[c].length > maxLen) {
+                maxLen = chains[c].length;
+                longestChain = c;
+            }
+        }
+        preferredAngles.push_back(chains[longestChain].angleRad);
+    }
+
+    std::vector<pcl::PointXYZ> ceresResult = topologyPolygon;
+    optimizeWithHardConstraints(
+        ceresResult, filteredResidual, false, preferredAngles);
+
+    // ---- 7. Ceres 结果拓扑验收 ----
+    removeDuplicatePoints2D(ceresResult, 0.05f);
+    if (ceresResult.size() < 3 || !isSimplePolygon2D(ceresResult)) {
+        // 回退到拓扑保持候选(非 VDP 假设)
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=ceres_result_invalid_using_topology" << std::endl;
+        return topologyPolygon;
+    }
+    const double ceresArea = polygonArea2D(ceresResult);
+    const double ceresAreaRatio = ceresArea / std::max(area, 1e-6);
+    if (ceresAreaRatio < 0.60 || ceresAreaRatio > 1.60) {
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=ceres_area_ratio=" << ceresAreaRatio
+                  << " using_topology" << std::endl;
+        return topologyPolygon;
+    }
+
+    // 简化偏差检查: Ceres 结果各顶点到初始环边界的最大距离
+    {
+        double maxDev = 0.0;
+        for (const auto& pt : ceresResult) {
+            double best = std::numeric_limits<double>::max();
+            for (std::size_t i = 0; i < initialRing.size(); ++i) {
+                const auto& a = initialRing[i];
+                const auto& b = initialRing[(i + 1) % initialRing.size()];
+                const double dx = b.x - a.x;
+                const double dy = b.y - a.y;
+                const double lenSq = dx * dx + dy * dy;
+                if (lenSq < 1e-12) continue;
+                double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+                t = std::clamp(t, 0.0, 1.0);
+                const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+                best = std::min(best, d);
+            }
+            maxDev = std::max(maxDev, best);
+        }
+        if (maxDev > 1.20) {
+            std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                      << " reason=max_deviation=" << maxDev << " using_topology" << std::endl;
+            return topologyPolygon;
+        }
+    }
+
+    std::cerr << "[CeresTopology] fid=" << source_feature_id_
+              << " chains=" << chains.size()
+              << " final_vertices=" << ceresResult.size() << std::endl;
+    return ceresResult;
+}
+
 // ===== regular_Contour =====
 // 作用：轮廓规则化的主入口。完整流程：分辨率估计 -> 圆/椭圆检测 ->
 //       生成假设 -> 能量选优 -> 共线点移除 -> Ceres 硬约束优化 ->

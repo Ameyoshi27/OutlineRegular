@@ -186,7 +186,7 @@ const double kSupportExtendedChainGap = 0.9;         // m, arc gap linking exten
 const double kSupportFallbackWeight = 0.30;          // fallback (non-wall) support weight
 const double kSupportWideWallWeight = 0.50;          // wide-band wall tier weight (below effective)
 const double kSupportDensifyWeight = 0.25;           // last-resort densified boundary weight
-const double kNarrowNeckMaxWidth = 4.0;            // meters. Post-vectorization split threshold for missed building separations.
+const double kNarrowNeckMaxWidth = 3.0;            // meters. Post-vectorization split threshold for missed building separations.
 const double kNarrowNeckMinBoundarySeparation = 4.0;
 const double kNarrowNeckBoundarySeparationRatio = 0.02;
 const double kNarrowNeckMinPartArea = 20.0;
@@ -4360,6 +4360,24 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     outlineRegular regularizer(ring, contourCloud, weights);
     regularizer.setSourceFeatureId(sourceFid);
     regularizer.setSupportDirectionHint(contourDir, contourRatio, contourPairs);
+
+    // ---- 拓扑保持实验通道(可选) ----
+    // 从边链出发而非VDP假设，保留真实凹凸/窄颈拓扑。
+    {
+        bool topoFallback = false;
+        auto topoResult = regularizer.TopologyPreservingRegularize(
+            ring, kMaskResidualSpacing, topoFallback);
+        if (!topoResult.empty()) {
+            std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
+                      << " vertices=" << topoResult.size() << std::endl;
+            return topoResult;
+        }
+        if (topoFallback) {
+            std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
+                      << " fallback to normal pipeline" << std::endl;
+        }
+    }
+
     // 无正射证据仲裁栅格楼梯上的曲线检测；
     // Mask-only 不得恢复伪曲线。
     regularizer.setCurveRestorationEnabled(false);
