@@ -215,6 +215,11 @@ constexpr double kMinSeedAreaSquareMeters = 5.0;
 // 普通 RGB 掩膜保留实例颜色。
 // (如渲染叠加图)才走二值兜底。
 constexpr std::size_t kMaxReliableColorLabels = 65536;
+// 近黑背景阈值：三通道均 <= 此值的像素判为背景。
+// 生产掩膜实测：裁剪瓦片含 ~140 万个 RGB=(1,1,1) 像素，视觉上是黑色
+// 背景但通过了旧的"任一通道非零"前景测试，形成包裹全部建筑的巨型
+// 连通域。真实实例色标都是饱和色(be1401/e91501 等)，不会是近黑。
+constexpr int kMaskBackgroundMaxChannel = 2;
 constexpr double kNarrowWaistMaxWidthRatio = 0.38;
 constexpr double kNarrowWaistMinCoreAreaRatio = 0.10;
 constexpr double kNarrowWaistMinSplitGapPixels = 2.0;
@@ -1008,6 +1013,19 @@ bool VectorizeBuildingMask(const std::string& tifPath,
         hasNoData[b] = valid != FALSE;
     }
 
+    // GDAL mask band / validity mask (per color band). Any band explicitly
+    // marking a pixel invalid => background, regardless of channel values.
+    GDALRasterBand* firstBand = source->GetRasterBand(colorBands[0]);
+    GDALRasterBand* maskBand = firstBand ? firstBand->GetMaskBand() : nullptr;
+    const bool hasGdalMask =
+        maskBand && maskBand->GetMaskFlags() == GMF_PER_DATASET;
+    std::vector<uint8_t> maskRow(
+        hasGdalMask ? static_cast<std::size_t>(stats.width) : 0);
+
+    long long exactBlack = 0;
+    long long nearBlackBg = 0;
+    long long noDataBg = 0;
+    long long maskBg = 0;
     for (int y = 0; y < stats.height; ++y) {
         for (int b = 0; b < stats.usedBands; ++b) {
             if (source->GetRasterBand(colorBands[b])->RasterIO(
@@ -1017,13 +1035,53 @@ bool VectorizeBuildingMask(const std::string& tifPath,
                 return false;
             }
         }
+        if (hasGdalMask &&
+            maskBand->RasterIO(GF_Read, 0, y, stats.width, 1,
+                               maskRow.data(), stats.width, 1, GDT_Byte,
+                               0, 0, nullptr) != CE_None) {
+            std::cerr << "[Mask] Failed reading mask band row " << y << "." << std::endl;
+            return false;
+        }
         int* row = colorImage.ptr<int>(y);
         for (int x = 0; x < stats.width; ++x) {
+            if (hasGdalMask && maskRow[static_cast<std::size_t>(x)] == 0) {
+                row[x] = 0;
+                ++maskBg;
+                continue;
+            }
             row[x] = PackPixel(sourceRows, static_cast<std::size_t>(x),
                                hasNoData, noDataValues);
+            if (row[x] == 0) {
+                // Background via NoData or exact black: distinguish for log.
+                bool anyNoData = false;
+                for (int b = 0; b < stats.usedBands; ++b) {
+                    const double v = sourceRows[b][x];
+                    if (hasNoData[b] && v == noDataValues[b]) { anyNoData = true; break; }
+                }
+                if (anyNoData) ++noDataBg;
+                else ++exactBlack;
+                continue;
+            }
+            // Near-black foreground suppression: all channels <= threshold.
+            const int r = (row[x] >> 16) & 0xFF;
+            const int g = (row[x] >> 8) & 0xFF;
+            const int bch = row[x] & 0xFF;
+            if (r <= kMaskBackgroundMaxChannel &&
+                g <= kMaskBackgroundMaxChannel &&
+                bch <= kMaskBackgroundMaxChannel) {
+                row[x] = 0;
+                ++nearBlackBg;
+            }
             if (row[x] != 0) ++stats.buildingPixels;
         }
     }
+    std::cout << "[Mask background] rule=near_black_max_channel_"
+              << kMaskBackgroundMaxChannel
+              << " exact_black=" << exactBlack
+              << " near_black_bg=" << nearBlackBg
+              << " nodata_bg=" << noDataBg
+              << " gdal_mask_bg=" << maskBg
+              << " foreground=" << stats.buildingPixels << std::endl;
     if (stats.buildingPixels == 0) {
         std::cerr << "[Mask] No non-black building pixels were found." << std::endl;
         return false;
@@ -1053,6 +1111,13 @@ bool VectorizeBuildingMask(const std::string& tifPath,
     }
     stats.sourceColorCount = static_cast<long long>(colors.size());
     stats.colorLabelsPreserved = !tooManyColors;
+    if (tooManyColors) {
+        std::cout << "[Mask warn] color count exceeded " << kMaxReliableColorLabels
+                  << " — the mask may have been resampled with bilinear/cubic"
+                  << " interpolation instead of nearest-neighbour."
+                  << " Instance labels degrade; consider re-cropping with"
+                  << " gdalwarp -r near." << std::endl;
+    }
     if (!tooManyColors) {
         RemoveHairlineSeamComponents(
             colorImage, stats.pixelSizeX * stats.pixelSizeY);

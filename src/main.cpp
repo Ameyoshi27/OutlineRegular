@@ -3416,12 +3416,19 @@ bool ResolveOutputOverlaps(OGRLayer* layer,
 #endif
 
 // 作用：初始轮廓过分割合并阶段：按接缝证据/形状/大建筑兜底就地合并 Shapefile。
+// GeometryOnly 模式仅执行同 parent + 共享边下限的确定性合并，不调 OSGB 证据。
+enum class InitialMergeMode {
+    GeometryOnly,
+    GeometryAndOSGB
+};
+
 bool MergeOversegmentedInitialOutlines(
     const std::string& shpPath,
     const MyCloudPtr& sampled,
     const pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr& kdtree,
     const Eigen::Vector3d& metadataOffset,
-    InitialOutlineMergeStats& stats)
+    InitialOutlineMergeStats& stats,
+    InitialMergeMode mode = InitialMergeMode::GeometryAndOSGB)
 {
     stats = {};
     GDALDataset* dataset = static_cast<GDALDataset*>(
@@ -3476,6 +3483,17 @@ bool MergeOversegmentedInitialOutlines(
                 std::cerr << "[Merge diag] ROBUST exactShared=" << exactSharedLength
                           << " robustShared=" << sharedLength
                           << " areaA=" << a.area << " areaB=" << b.area << std::endl;
+            }
+
+            if (mode == InitialMergeMode::GeometryOnly) {
+                // 保守几何合并：仅同 parent + 共享边下限。
+                // 不调 ShouldMergeByFootprintShape、largePair、OSGB 接缝证据。
+                if (a.parent > 0 && a.parent == b.parent) {
+                    groups.unite(i, j);
+                    ++stats.mergedPairs;
+                    ++stats.mergedByParent;
+                }
+                continue;
             }
 
             const bool largePair = std::min(a.area, b.area) > 500.0;  // 澶у潡瀵?鐤戜技澶у缓绛戯紝鎵撹瘖鏂?
@@ -3626,7 +3644,10 @@ std::unique_ptr<OGRGeometry> SolidGeometry(const OGRGeometry* g, bool& changed)
 // 大建筑合并后，内部残留的分色/栅格化小碎片常以"大轮廓带洞+洞里套小轮廓"的形式存在；
 // 带洞的 A 对洞里的 B 调 Contains 返回 false 会漏检，故先全局去洞，再按实际几何做包含清理。
 // maxArea：只删面积 <= maxArea 的被包含者。
-long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxArea)
+// solidifyHoles：true(默认/OSGB)=先实心化再判包含(旧行为)；
+//                false(Mask-only)=保留原始孔洞，用外环壳体做候选判定。
+long long RemoveContainedSmallFootprints(
+    const std::string& shpPath, double maxArea, bool solidifyHoles = true)
 {
     GDALDataset* dataset = static_cast<GDALDataset*>(
         GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
@@ -3651,8 +3672,21 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
             ContainedRec rec;
             rec.fid = feature->GetFID();
             bool changed = false;
-            rec.geom = SolidGeometry(geometry, changed);   // 先实心化，让洞里的小轮廓可被 Contains
-            rec.solidified = changed;
+            if (solidifyHoles) {
+                rec.geom = SolidGeometry(geometry, changed);   // 先实心化，让洞里的小轮廓可被 Contains
+                rec.solidified = changed;
+            } else {
+                // Mask-only：保留原始几何不实心化；用外环壳体副本做包含候选判定。
+                if (wkbFlatten(geometry->getGeometryType()) == wkbPolygon) {
+                    OGRPolygon* polygon = geometry->toPolygon();
+                    if (polygon->getExteriorRing()) {
+                        auto* shell = new OGRPolygon();
+                        shell->addRing(new OGRLinearRing(*polygon->getExteriorRing()));
+                        rec.geom.reset(shell);
+                    }
+                }
+                if (!rec.geom) rec.geom.reset(geometry->clone());
+            }
             rec.geom->getEnvelope(&rec.env);
             rec.area = GeometryArea(rec.geom.get());
             if (rec.area > 0.0) recs.push_back(std::move(rec));
@@ -3680,6 +3714,7 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
     }
 
     long long removed = 0;
+    long long holesPreserved = 0;
     long long solidified = 0;
     for (const ContainedRec& rec : recs) {
         if (rec.remove) {
@@ -3698,7 +3733,11 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
         std::cout << "[Mask] solidified (removed holes) in " << solidified
                   << " footprints." << std::endl;
     }
-    GDALClose(dataset);
+        if (!solidifyHoles) {
+        std::cout << "[MaskOnly] holes_preserved=" << holesPreserved
+                  << " contained_removed=" << removed << std::endl;
+    }
+GDALClose(dataset);
     return removed;
 }
 
