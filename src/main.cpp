@@ -3595,7 +3595,7 @@ if (merged && wkbFlatten(merged->getGeometryType()) != wkbPolygon) {
             }
         }
     }
-    layer->SyncToDisk();
+    // Convergence guard: if pairs were identified but no features were actually
     GDALClose(dataset);
     return true;
 }
@@ -4466,15 +4466,51 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                   << std::endl;
         return 1;
     }
-    // 过分割合并阶段依赖 OSGB 接缝证据；没有
-    // 证据的盲合并有融合真实邻居的风险，故 Mask-only 跳过。
-    std::cout << "[MaskOnly] merge stage skipped: requires OSGB seam evidence" << std::endl;
+
+    // ---- Stage 1: GeometryOnly 合并(同连通域 + 共享边>=3m) ----
+    long long totalMergePasses = 0;
+    long long totalMergedPairs = 0;
+    for (int pass = 1; pass <= 20; ++pass) {
+        InitialOutlineMergeStats passStats;
+        const bool mergeOk = MergeOversegmentedInitialOutlines(
+            initialPath.string(), nullptr, nullptr, Eigen::Vector3d::Zero(),
+            passStats, InitialMergeMode::GeometryOnly);
+        if (!mergeOk && pass == 1) {
+            std::cerr << "[MaskOnly merge] failed to open initial outlines." << std::endl;
+            break;
+        }
+        ++totalMergePasses;
+        totalMergedPairs += passStats.mergedPairs;
+        std::cout << "[MaskOnly merge] pass " << pass
+                  << " candidates=" << passStats.adjacentCandidates
+                  << " same_parent=" << passStats.mergedByParent
+                  << " merged=" << passStats.mergedPairs
+                  << " removed=" << passStats.removedFeatures << std::endl;
+        if (passStats.mergedPairs == 0) break;
+        if (passStats.removedFeatures == 0 && pass > 1) break;
+    }
+
+    // ---- Stage 2: 包含清理(Mask-only 用 20m² 阈值，保留孔洞) ----
+    const long long containedRemoved1 =
+        RemoveContainedSmallFootprints(initialPath.string(),
+            kNarrowNeckMinPartArea, /*solidifyHoles=*/false);
+    std::cout << "[MaskOnly contained] pass1 removed=" << containedRemoved1 << std::endl;
+
+    // ---- Stage 3: 窄颈递归切分 ----
     NarrowNeckSplitStats neckStats;
     if (!SplitInitialOutlinesAtNarrowNecks(initialPath.string(), neckStats)) {
         std::cerr << "[MaskOnly] neck split failed." << std::endl;
+    } else {
+        std::cout << "[MaskOnly neck split] split=" << neckStats.splitFeatures
+                  << " cuts=" << neckStats.cuts
+                  << " parts=" << neckStats.createdParts << std::endl;
     }
-    const long long containedRemoved =
-        RemoveContainedSmallFootprints(initialPath.string(), kContainedFootprintMaxArea);
+
+    // ---- Stage 4: 合并后二次包含清理 ----
+    const long long containedRemoved2 =
+        RemoveContainedSmallFootprints(initialPath.string(),
+            kNarrowNeckMinPartArea, /*solidifyHoles=*/false);
+    std::cout << "[MaskOnly contained] pass2 removed=" << containedRemoved2 << std::endl;
 
     // 保拓扑平滑：在窄颈拆分和包含清理之后、StampAreaField 之前执行。
     // 先保存原始副本用于对比诊断。
