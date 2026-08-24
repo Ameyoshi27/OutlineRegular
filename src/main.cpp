@@ -192,6 +192,9 @@ const double kNarrowNeckBoundarySeparationRatio = 0.02;
 const double kNarrowNeckMinPartArea = 20.0;
 const double kNarrowNeckCutBuffer = 0.12;
 const int kNarrowNeckMaxCutsPerFeature = 12;
+// Experimental Mask-only branch. It is isolated from the OSGB pipeline and
+// falls back to the existing VDP path whenever topology checks fail.
+constexpr bool kUseTopologyPreservingResidualRegularization = true;
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -4363,11 +4366,12 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
 
     // ---- 拓扑保持实验通道(可选) ----
     // 从边链出发而非VDP假设，保留真实凹凸/窄颈拓扑。
-    {
+    if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
         auto topoResult = regularizer.TopologyPreservingRegularize(
             ring, kMaskResidualSpacing, topoFallback);
         if (!topoResult.empty()) {
+            if (bestHypothesisOut) *bestHypothesisOut = topoResult;
             std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
                       << " vertices=" << topoResult.size() << std::endl;
             return topoResult;

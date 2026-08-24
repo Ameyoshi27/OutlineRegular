@@ -218,7 +218,9 @@ private:
 	void optimizeWithHardConstraints(const std::vector<pcl::PointXYZ>& hypothesis_raw,
 		const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
 		bool allow_diagonal_edges,
-		const std::vector<double>& preferred_line_angles = std::vector<double>());
+		const std::vector<double>& preferred_line_angles = std::vector<double>(),
+		const std::vector<int>* fixed_edge_assignments = nullptr,
+		bool preserve_topology = false);
 	double computeDLGPriorEnergy(const std::vector<pcl::PointXYZ>& hypothesis);
 	void initializeDLGPrior();
 
