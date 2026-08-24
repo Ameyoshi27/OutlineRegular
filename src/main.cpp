@@ -1,6 +1,14 @@
 ﻿// =============================================================================
 // main.cpp
-// 浣滅敤锛氱▼搴忓叆鍙ｄ笌鏁翠綋璋冨害銆?// 鏁翠綋娴佺▼锛?//   1) 寮逛笁涓璇濇锛岃鐢ㄦ埛閫?杈撳叆OSGB鏂囦欢澶?/ 杈撳叆Shapefile / 杈撳嚭Shapefile锛?//   2) 鐢?OSGMeshSampler 鎶?OSGB 閲囨牱鎴愮偣浜?甯︽硶鍚戦噺)锛?//   3) 鐢?GDAL/OGR 鎵撳紑杈撳叆 shp锛岄€愪釜寤虹瓚鐗╁杈瑰舰锛?//        - 浠庣偣浜戦噷鍙栬竟鐣屾敮鎾戠偣 -> 璋?outlineRegular 鍋氳疆寤撹鍒欏寲锛?//   4) 鎶婅鍒欏寲鍚庣殑澶氳竟褰㈠啓鍑哄埌杈撳嚭 shp(淇濈暀鍘熷睘鎬у瓧娈?銆?// 鏂囦欢涓婂崐閮ㄥ垎鏄嫢骞?2D 鍑犱綍/Shapefile 杈呭姪鍑芥暟(鍖垮悕鍛藉悕绌洪棿)锛屼笅鍗婇儴鍒嗘槸 main()銆?// =============================================================================
+// 作用：程序入口与整体调度。
+// 整体流程：
+//   0) 选择数据模式：OSGB+XML(默认) 或 Mask-only(无点云)；
+//   1) [OSGB模式] 读 OSGB 采样成点云(含法向量)，建 2D KdTree；
+//   2) 从 AI 掩膜 TIF 提取初始轮廓(矢量化/合并/窄颈拆分/包含清理)；
+//   3) 逐要素：提取墙面支撑点 -> 调 outlineRegular 做规则化；
+//   4) 把规则化后的多边形写出 SHP(保留原属性字段)。
+// 文件上半部分是若干 2D 几何/Shapefile 辅助函数(匿名命名空间)，下半部分是 main()。
+// =============================================================================
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -32,11 +40,11 @@
 #include <cpl_minixml.h>
 #include <functional>
 
-#include <pcl/kdtree/kdtree_flann.h> // KdTree锛氬姞閫熷杈瑰舰閭诲煙鏌ヨ
-#include <pcl/io/ply_io.h>           // PLY 璇诲啓(澶囩敤)
-#include <laszip/laszip_api.h>       // LAS 鍐欏嚭(淇濆瓨閲囨牱鐐逛簯锛屽惈鍦扮悊鍙傝€?offset)
+#include <pcl/kdtree/kdtree_flann.h> // KdTree：加速多边形邻域查询
+#include <pcl/io/ply_io.h>           // PLY 读写(备用)
+#include <laszip/laszip_api.h>       // LAS 写出(保存采样点云，含地理参考 offset)
 
-// 娉細SetConsoleOutputCP / GetModuleFileNameA 鐢遍《閮ㄧ殑 <windows.h> 鎻愪緵
+// 注：SetConsoleOutputCP / GetModuleFileNameA 由顶部的 <windows.h> 提供
 
 namespace {
 
@@ -109,6 +117,7 @@ private:
     std::unique_ptr<TeeStreamBuffer> tee_cerr_;
 };
 
+// 作用：获取 exe 所在目录(失败时退回当前工作目录)。
 std::filesystem::path GetExecutableDirectory()
 {
     char module_path[MAX_PATH] = {};
@@ -119,19 +128,19 @@ std::filesystem::path GetExecutableDirectory()
     return std::filesystem::path(module_path).parent_path();
 }
 
-// ---- 鍏ㄥ眬绠楁硶鍙傛暟(鍙寜鏁版嵁鎯呭喌璋冩暣) ----
+// ---- 全局算法参数(可按数据情况调整) ----
 const float kSampleDensity = 30.0f;              // OSGB 缃戞牸閲囨牱瀵嗗害(鐐?骞虫柟绫?
-const int kMaxPagedLODDepth = 10;                // PagedLOD 鏈€澶ч€掑綊娣卞害
-const double kBoundarySupportBuffer = 3.0;      // 杈圭晫鏀拺鐐规悳绱㈢殑缂撳啿瀹藉害(绫?
-const double kDensifyStep = 0.5;                 // 鍏滃簳鍔犲瘑杈圭晫鏃剁殑姝ラ暱(绫?
-const double kVerticalNormalMaxAbsZ = 0.45;      // 鍒ゅ畾涓?澧欓潰鐐?鐨勬硶鍚?z 鍒嗛噺闃堝€硷紱
-                                                 // 瓒呰繃鍒欒涓烘按骞抽潰鐐癸紝鍦ㄥ彧鍙栧闈㈢偣鏃惰鎺掗櫎
+const int kMaxPagedLODDepth = 10;                // PagedLOD 最大递归深度
+const double kBoundarySupportBuffer = 3.0;      // 边界支撑点搜索的缓冲宽度(米)，仅作 KD-tree 粗搜索范围
+const double kDensifyStep = 0.5;                 // 兜底加密边界时的步长(米)
+const double kVerticalNormalMaxAbsZ = 0.45;      // 判定为墙面点的法向 z 分量阈值；超过则视为水平面点
+                                                 // 超过则视为水平面点，在只取墙面点时被排除
 const float kSupportVoxelLeaf = 0.15f;           // Support 2D voxel leaf size, meters.
 const double kSupportDensityRadius = 1.0;        // XY radius for local support-density reliability weight.
 const double kSupportDensityMinWeight = 0.40;    // Sparse support is downweighted, not discarded.
 const double kSupportDensityMaxWeight = 1.15;    // Dense support gets only a mild boost.
 const double kMinPolygonBBoxArea = 20.0;
-// Small-building threshold moved to outlineRegular.cpp
+// 小建筑阈值已移至 outlineRegular.cpp
 // (kSmallBuildingSingleDirectionArea): small footprints no longer take a
 // rectangle fast path, they run the normal pipeline with a forced single
 // main direction.
@@ -143,9 +152,10 @@ const double kMinSharedBoundaryLength = 0.6;
 const double kMinSharedPerimeterRatio = 0.025;
 const double kShapeMergeMinSharedLength = 2.0;
 const double kShapeMergeMinSharedPerimeterRatio = 0.015;
-const double kStrongSeamEvidenceRatio = 0.85;  // 鍙湁闈炲父寮虹殑璇佹嵁鎵嶉樆姝㈠悎骞讹紱璋冮珮浠ユ斁寮€琚敊鍒?Case B)鐨勫ぇ寤虹瓚
-const double kMergeSeamLength = 3.0;           // 瀹界紳闃堝€硷細鍏变韩杈?=姝ゅ€兼墠鍚堝苟(棰?绐勮繛鎺?涓嶅悓鏍嬶紝涓嶅悎)
-const double kLargeBuildingMergeArea = 1500.0; // 澶у缓绛戠洿鍚堝苟锛歮in(闈㈢Н)>姝ゅ€?涓斿叡浜竟>=kMergeSeamLength 鏃?                                              // 璺宠繃璇佹嵁闂哥洿鎺ュ悎骞躲€備袱鏍嬪悇鑷嫭绔嬬殑澶фゼ鍑犱箮涓嶅彲鑳藉叡浜嚑鍗佺背
+const double kStrongSeamEvidenceRatio = 0.85;  // 只有非常强的证据才阻止合并；调高以放宽被误分的大建筑
+const double kMergeSeamLength = 3.0;           // 宽缝阈值：共享边 >= 此值才合并(窄缝连接不同栋，不合)
+const double kLargeBuildingMergeArea = 1500.0; // 大建筑兜底合并：min(面积)>此值且共享边>=kMergeSeamLength 时
+                                                // 跳过证据间直接合并(两栋各自独立的大楼几乎不可能共享几十米长边)
 const double kMaxSplitCompactnessGainForMerge = 0.4;
 const double kContainedFootprintMaxArea = 1000.0;
 const double kOutputOverlapMinArea = 0.5;
@@ -183,8 +193,8 @@ const double kNarrowNeckMinPartArea = 20.0;
 const double kNarrowNeckCutBuffer = 0.12;
 const int kNarrowNeckMaxCutsPerFeature = 12;
 
-// ---- 璁℃椂绱(绉?锛岀敤浜庡畾浣嶈鍒欏寲鍚勯樁娈佃€楁椂 ----
-double g_supportTime = 0.0;   // 鏀拺鐐规彁鍙?鍚?KdTree 鏌ヨ)绱
+// ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
+double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
 double g_optimizeTime = 0.0;
 std::size_t g_removedSmallPolygons = 0;
 std::size_t g_removedOutsideModel = 0;
@@ -195,6 +205,7 @@ std::size_t g_supportFilterEffectiveWallTotal = 0;
 std::size_t g_supportFilterFallbackUsedTotal = 0;
 std::size_t g_supportFilterWideWallTotal = 0;
 
+// 作用：删除一个 Shapefile 的全部伴随文件(.shp/.shx/.dbf/.prj/.cpg 等)。返回是否删掉了主文件。
 bool RemoveShapefileFamily(const std::filesystem::path& shpPath, bool verbose = true)
 {
     static const char* const extensions[] = {
@@ -216,6 +227,7 @@ bool RemoveShapefileFamily(const std::filesystem::path& shpPath, bool verbose = 
     return true;
 }
 
+// 作用：判断某个 Shapefile 家族(任一伴随文件)是否已存在。
 bool ShapefileFamilyExists(const std::filesystem::path& shpPath)
 {
     static const char* const extensions[] = {
@@ -232,6 +244,7 @@ bool ShapefileFamilyExists(const std::filesystem::path& shpPath)
     return false;
 }
 
+// 作用：给路径加 _1/_2/... 后缀，返回第一个不存在的同族路径。
 std::filesystem::path MakeUniqueShapefilePath(const std::filesystem::path& desired)
 {
     const std::filesystem::path parent = desired.parent_path();
@@ -246,6 +259,7 @@ std::filesystem::path MakeUniqueShapefilePath(const std::filesystem::path& desir
     return parent / (stem + "_new" + extension);
 }
 
+// 作用：优先删除旧族；文件被占用时改写到唯一后缀路径并提示。
 std::filesystem::path PrepareWritableShapefilePath(
     const std::filesystem::path& desired,
     const std::string& label)
@@ -258,6 +272,7 @@ std::filesystem::path PrepareWritableShapefilePath(
     return fallback;
 }
 
+// 作用：从 OSGB 的 metadata.xml 解析 SRSOrigin 地理参考偏移。
 bool ReadMetadataOffset(const std::string& xmlPath, Eigen::Vector3d& offset)
 {
     CPLXMLNode* tree = CPLParseXMLFile(xmlPath.c_str());
@@ -301,7 +316,9 @@ bool ReadMetadataOffset(const std::string& xmlPath, Eigen::Vector3d& offset)
     return true;
 }
 
-// 灏嗛噰鏍风偣浜戜繚瀛樹负 LAS(鐐规暟鎹牸寮?3 = GPS+RGB锛屼簩杩涘埗 .las)銆?// 鍐呭瓨鐐逛簯涓虹浉瀵瑰潗鏍囷紝杩欓噷鍙犲姞 mc.offset 寰楀埌涓栫晫鍧愭爣鍚庡啓鍏ワ紱laszip 鎸?header 鐨?// offset/scale 鑷姩鎶?double 涓栫晫鍧愭爣閲忓寲涓烘暣鍨嬶紝鍏ㄧ▼鍙岀簿搴︼紝浼樹簬鎵嬪姩瀹氱偣銆?// 閫昏緫鍙傝€?E:\jt\src\FileIO::saveLAS / IO\lasio锛屽簱鏀圭敤寮€婧?laszip C API(鏈」鐩棤 LASlib)銆?
+// 将采样点云保存为 LAS(点数据格式 3 = GPS+RGB，二进制 .las)。
+// 内存点云为相对坐标，这里按 mc.offset 叠加成世界坐标后写入；laszip 按 header 的
+// offset/scale 自动把 double 转为整型存储，读回时再加回。
 bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
 {
     if (!mc.cloud || mc.cloud->empty()) {
@@ -315,10 +332,10 @@ bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
         return false;
     }
 
-    // 鐐规暟鎹牸寮?3(GPS time + RGB)锛岃褰曢暱搴?34 瀛楄妭
+    // 点数据格式 3(GPS time + RGB)，记录长度 34 字节
     if (laszip_set_point_type_and_size(writer, 3, 34) != 0) {
         laszip_CHAR* err = nullptr; laszip_get_error(writer, &err);
-        std::cerr << "[LAS] laszip_set_point_type_and_size 澶辫触: " << (err ? err : "?") << std::endl;
+        std::cerr << "[LAS] laszip_set_point_type_and_size 失败: " << (err ? err : "?") << std::endl;
         laszip_destroy(writer);
         return false;
     }
@@ -333,10 +350,10 @@ bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
     header->z_offset = mc.offset.z();
     header->number_of_point_records = static_cast<laszip_U32>(mc.cloud->size());
 
-    // FALSE = 涓嶅帇缂?.las)锛汿RUE 鍒欎负鍘嬬缉(.laz)
+    // FALSE = 不压缩(.las)；TRUE 则为压缩(.laz)
     if (laszip_open_writer(writer, path.c_str(), FALSE) != 0) {
         laszip_CHAR* err = nullptr; laszip_get_error(writer, &err);
-        std::cerr << "[LAS] laszip_open_writer 澶辫触: " << (err ? err : "?") << std::endl;
+        std::cerr << "[LAS] laszip_open_writer 失败: " << (err ? err : "?") << std::endl;
         laszip_destroy(writer);
         return false;
     }
@@ -350,14 +367,14 @@ bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
     const std::size_t n = mc.cloud->size();
     for (std::size_t i = 0; i < n; ++i) {
         const auto& p = mc.cloud->points[i];
-        // 涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + offset
+        // 世界坐标 = 相对坐标 + offset
         const laszip_F64 coords[3] = {
             static_cast<laszip_F64>(p.x) + ox,
             static_cast<laszip_F64>(p.y) + oy,
             static_cast<laszip_F64>(p.z) + oz
         };
         laszip_set_coordinates(writer, coords);
-        // 8bit RGB -> 16bit LAS RGB(涔?257锛屼笌璇诲彇鏃剁殑 /257 瀵圭О)
+        // 8bit RGB -> 16bit LAS RGB(乘 257，与读取时的 /257 对称)
         point->rgb[0] = static_cast<laszip_U16>(p.r) * 257;
         point->rgb[1] = static_cast<laszip_U16>(p.g) * 257;
         point->rgb[2] = static_cast<laszip_U16>(p.b) * 257;
@@ -371,6 +388,7 @@ bool SaveSampledCloudAsLas(const MyCloud& mc, const std::string& path)
     return true;
 }
 
+// 作用：对支撑点云做 XY 体素降采样，返回聚合后的点与权重。
 pcl::PointCloud<pcl::PointXYZ>::Ptr DownsampleSupport2D(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
     double leaf)
@@ -412,11 +430,13 @@ struct WeightedSupportCloud {
     std::vector<double> weights;
 };
 
+// 作用：把数值钳制到 [lo, hi] 区间。
 double ClampDoubleLocal(double value, double min_value, double max_value)
 {
     return std::max(min_value, std::min(max_value, value));
 }
 
+// 作用：由法向 z 分量计算墙面可信度权重(越竖直权重越高)。
 double NormalSupportWeightFromZ(double normal_z)
 {
     const double verticality = ClampDoubleLocal(
@@ -425,6 +445,7 @@ double NormalSupportWeightFromZ(double normal_z)
     return ClampDoubleLocal(0.15 + 0.85 * verticality * verticality, 0.15, 1.0);
 }
 
+// 作用：带权重的 XY 体素降采样，每个体素输出代表点与平均权重。
 WeightedSupportCloud DownsampleSupport2DWithWeights(
     const WeightedSupportCloud& support,
     double leaf)
@@ -460,6 +481,7 @@ WeightedSupportCloud DownsampleSupport2DWithWeights(
     return result;
 }
 
+// 作用：按局部点密度调整支撑点权重(稀疏降权、密集轻微加权)。
 void ApplySupportDensityWeights(WeightedSupportCloud& support)
 {
     if (!support.points || support.points->size() < 8) return;
@@ -524,7 +546,7 @@ void ApplySupportDensityWeights(WeightedSupportCloud& support)
 }
 
 // ===== Distance2D =====
-// 浣滅敤锛氫袱涓笁缁寸偣鐨勬按骞?XY)璺濈(蹇界暐 Z)銆?
+// 作用：两个三维点的水平(XY)距离(忽略 Z)。
 double Distance2D(const pcl::PointXYZ& a, const pcl::PointXYZ& b)
 {
     const double dx = static_cast<double>(a.x) - b.x;
@@ -533,7 +555,7 @@ double Distance2D(const pcl::PointXYZ& a, const pcl::PointXYZ& b)
 }
 
 // ===== PointToSegmentDistance2D =====
-// 浣滅敤锛氱偣 p 鍒扮嚎娈?a-b 鐨勬按骞虫渶鐭窛绂?鎶婂瀭瓒?clamp 鍒扮嚎娈佃寖鍥村唴)銆?
+// 作用：点 p 到线段 a-b 的水平最短距离(垂足被 clamp 到线段范围内)。
 double PointToSegmentDistance2D(const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b)
 {
     const double vx = static_cast<double>(b.x) - a.x;
@@ -551,7 +573,7 @@ double PointToSegmentDistance2D(const pcl::PointXYZ& p, const pcl::PointXYZ& a, 
 }
 
 // ===== PointInPolygon2D =====
-// 浣滅敤锛氬垽鏂偣 p 鏄惁鍦ㄥ杈瑰舰 poly 鍐呴儴(姘村钩闈紝灏勭嚎娉?銆?
+// 作用：判断点 p 是否在多边形 poly 内部(水平面，射线法)。
 bool PointInPolygon2D(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& poly)
 {
     bool inside = false;
@@ -568,6 +590,7 @@ bool PointInPolygon2D(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& 
     return inside;
 }
 
+// 作用：点到多边形边界的水平最短距离。
 double DistanceToRingBoundary2D(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& ring)
 {
     if (ring.empty()) return std::numeric_limits<double>::max();
@@ -600,6 +623,7 @@ RingEnvelope2D ComputeRingEnvelope2D(const std::vector<pcl::PointXYZ>& ring)
     return env;
 }
 
+// 作用：判断点是否在包围盒(可加边距)内。
 bool EnvelopeContainsPoint(const RingEnvelope2D& env, const pcl::PointXYZ& p, double buffer)
 {
     return p.x >= env.minX - buffer && p.x <= env.maxX + buffer &&
@@ -607,7 +631,7 @@ bool EnvelopeContainsPoint(const RingEnvelope2D& env, const pcl::PointXYZ& p, do
 }
 
 // ===== RemoveClosingDuplicate =====
-// 浣滅敤锛氬鏋滃杈瑰舰棣栧熬鐐瑰嚑涔庨噸鍚堬紝鍘绘帀鏈熬鐨勯噸澶嶉棴鍚堢偣銆?
+// 作用：如果多边形首尾点几乎重合，去掉末尾的重复闭合点。
 void RemoveClosingDuplicate(std::vector<pcl::PointXYZ>& points)
 {
     if (points.size() >= 2 && Distance2D(points.front(), points.back()) < 1e-6) {
@@ -616,7 +640,7 @@ void RemoveClosingDuplicate(std::vector<pcl::PointXYZ>& points)
 }
 
 // ===== ExtractExteriorRing =====
-// 浣滅敤锛氫粠 OGR 澶氳竟褰腑鍙栧嚭澶栫幆椤剁偣锛岃浆涓?pcl::PointXYZ 鐐瑰垪锛屽苟鍘婚棴鍚堥噸澶嶇偣銆?
+// 作用：从 OGR 多边形中取出外环顶点，转为 pcl::PointXYZ 点列，并去闭合重复点。
 std::vector<pcl::PointXYZ> ExtractExteriorRing(
     OGRPolygon* polygon, const Eigen::Vector3d& metadataOffset)
 {
@@ -691,11 +715,11 @@ struct SupportOwnershipContext {
         }
     }
 
-    // Three-state ownership: a point between two footprints whose distances
-    // differ by less than kSupportAmbiguousDistanceGap is AMBIGUOUS and must
-    // not feed either building's independent regularization (the old binary
-    // ownsSupportPoint force-assigned such points by ring id, interleaving
-    // one mixed point cloud across both footprints).
+    // 三态归属：一个点位于两个轮廓之间，且到两者的距离
+    // 差值小于 kSupportAmbiguousDistanceGap 时为"归属不明确"，必须
+    // 禁止进入任何一栋的独立规则化(旧的二值
+    // ownsSupportPoint 按 ring id 强制分配这类点，导致一片混合
+    // 点云被交错地分给两个轮廓)。
     enum class SupportOwnership { Owned, Ambiguous, OwnedByOther };
 
     SupportOwnership classifySupportPoint(const pcl::PointXYZ& p,
@@ -732,6 +756,7 @@ struct SupportOwnershipContext {
     }
 };
 
+// 作用：按 sourceFid+ringIndex 在归属索引里查环 id。
 std::size_t FindInitialRingRecordId(
     const SupportOwnershipContext* ownership,
     GIntBig sourceFid,
@@ -747,7 +772,7 @@ std::size_t FindInitialRingRecordId(
 }
 
 // ===== DensifyBoundary =====
-// 浣滅敤锛氭部澶氳竟褰㈣竟鐣屾寜姝ラ暱 step 鎻掑€煎姞瀵嗭紝鐢熸垚瀵嗛泦鐨勭偣浜?浣滀负鏀拺鐐圭殑鍏滃簳鏉ユ簮)銆?
+// 作用：沿多边形边界按步长 step 插值加密，生成密集点云作为支撑点的兜底来源。
 pcl::PointCloud<pcl::PointXYZ>::Ptr DensifyBoundary(const std::vector<pcl::PointXYZ>& ring, double step)
 {
     auto cloud = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
@@ -771,7 +796,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr DensifyBoundary(const std::vector<pcl::Point
 }
 
 // ===== MakePolygon =====
-// 浣滅敤锛氭妸鐐瑰垪閲嶆柊缁勮鎴愪竴涓?OGRPolygon(鑷姩闂悎澶栫幆)銆傜偣鏁?<3 杩斿洖 nullptr銆?
+// 作用：把点列重新组装成一个 OGRPolygon(自动闭合外环)。点数<3 返回 nullptr。
 OGRPolygon* MakePolygon(
     const std::vector<pcl::PointXYZ>& ring, const Eigen::Vector3d& metadataOffset)
 {
@@ -792,9 +817,12 @@ OGRPolygon* MakePolygon(
 }
 
 // ===== ExtractBoundarySupportFromOSGB =====
-// 浣滅敤锛氫粠閲囨牱鐨勭偣浜戦噷锛屾寫鍑?鏀拺杈圭晫瑙勫垯鍖?鐢ㄧ殑鐐广€?//       銆怟dTree 鐗堛€戠敤棰勫厛寤哄ソ鐨?kdtree 鍋氫竴娆?2D 鍗婂緞鏌ヨ锛屽彧鍙栧杈瑰舰鎵╁睍鍖呭洿鐩掕寖鍥村唴鐨?//       鍊欓€夌偣锛屽啀鎸夊師閫昏緫(澧欓潰鐐?/ 闈犺繎杈圭晫 / 钀藉湪澶氳竟褰㈠唴)绛涢€夈€?//       鍊欓€夐泦 鈯?鍘熷叏閲忔壂鎻忚兘閫氳繃鐨勬墍鏈夌偣锛屽洜姝ょ粨鏋滀笌鍘熺増瀹屽叏涓€鑷达紝鍙槸蹇緢澶氥€?// 鍙傛暟锛歴ampled  - OSGB 閲囨牱鐐逛簯锛況ing - 澶氳竟褰㈣竟鐣岋紱
-//       wallOnly- 鏄惁鍙彇澧欓潰鐐癸紱kdtree - 棰勫缓鐨?2D KdTree(Z 宸茬疆 0)銆?// 杩斿洖锛氭敮鎾戠偣浜戙€?
-// Per-building filter statistics for the effective-wall-support pipeline.
+// 作用：从采样的点云里，挑出支撑边界规则化用的点。
+//       [KdTree 版]用预先建好的 kdtree 做一次 2D 半径查询，只取多边形扩展包围盒范围内的
+//       候选点，再按模式筛选(有效墙面窄带/宽带墙面/非墙面兜底)。
+// 参数：sampled - OSGB 采样点云；ring - 多边形边界；mode - 提取模式；
+//       kdtree - 预建的 2D KdTree(Z 已置 0)。返回：支撑点云(点+权重)。
+// 有效墙面支撑管线的逐栋过滤统计。
 struct SupportFilterStats {
     std::size_t coarseWall = 0;        // 3 m coarse candidates passing the wall-normal gate
     std::size_t narrowBand = 0;        // effective points inside the narrow band
@@ -806,11 +834,11 @@ struct SupportFilterStats {
     std::size_t tRejected = 0;         // projection parameter outside [0.05, 0.95]
 };
 
-// Point-to-segment distance reporting the raw projection parameter.
+// 点到线段距离，同时返回原始投影参数(未钳制)。
 double PointSegmentDistanceWithT(
     const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b, double& t);
 
-// Extraction modes:
+// 提取模式：
 //  EffectiveWall — narrow band (<=0.85 m) + chain-verified extended band
 //                  (<=1.5 m), unambiguous ownership, normal/edge consistency.
 //  WideWall      — the legacy 3 m wall band (wall normals + unambiguous
@@ -818,9 +846,10 @@ double PointSegmentDistanceWithT(
 //                  offset exceeds the narrow/extended bands, so their edges
 //                  still get REAL wall anchoring instead of roof points.
 //  NonWall       — 3 m / interior points without the wall-normal gate
-//                  (last-resort Ceres fallback; never feeds direction).
+//                      (Ceres 最后兜底；绝不参与方向估计)。
 enum class SupportExtractMode { EffectiveWall, WideWall, NonWall };
 
+// 作用：按模式从采样点云提取边界支撑点(有效墙面/宽带墙面/非墙面)，含归属三态判定、法向-边一致性校验与扩展带链过滤。
 WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     const MyCloudPtr& sampled,
     const std::vector<pcl::PointXYZ>& ring,
@@ -842,7 +871,7 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         max_y = std::max(max_y, static_cast<double>(p.y));
     }
 
-    // 浠ユ墿灞曞寘鍥寸洅涓績涓哄渾蹇冦€佸崐瀵硅绾夸负鍗婂緞鍋氫竴娆?2D 鏌ヨ锛屽緱鍒板€欓€夌偣绱㈠紩
+    // 以扩展包围盒中心为圆心、半对角线为半径做一次 2D 查询，得到候选点索引
     const double cx = (min_x + max_x) * 0.5;
     const double cy = (min_y + max_y) * 0.5;
     const double half_w = (max_x - min_x) * 0.5 + kBoundarySupportBuffer;
@@ -858,7 +887,7 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
     std::vector<float> dists2;
     kdtree->radiusSearch(center, radius, candidates, dists2);
 
-    // Nearest-edge association helpers: prefix arc lengths + XY edge normals.
+    // 最近边关联所需的辅助量：前缀弧长 + XY 边法向。
     const std::size_t n = ring.size();
     std::vector<double> prefix(n + 1, 0.0);
     std::vector<double> edgeNx(n, 0.0);
@@ -890,13 +919,13 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         if (idx < 0 || static_cast<std::size_t>(idx) >= sampled->cloud->size()) continue;
         const auto& src = sampled->cloud->points[idx];
 
-        // 鍖呭洿鐩掔矖绛?淇濈暀锛屼繚璇佺粨鏋滀笌鍘熺増涓€鑷?
+        // 包围盒粗筛保留，保证结果与全量扫描一致
         if (src.x < min_x - kBoundarySupportBuffer || src.x > max_x + kBoundarySupportBuffer ||
             src.y < min_y - kBoundarySupportBuffer || src.y > max_y + kBoundarySupportBuffer) {
             continue;
         }
 
-        // 鍙彇澧欓潰鐐规椂锛氭硶鍚?z 鍒嗛噺杩囧ぇ(鎺ヨ繎姘村钩闈?鐨勭偣璺宠繃
+        // 只取墙面点时：法向 z 分量过大(接近平面)的点跳过
         const bool wallMode =
             mode == SupportExtractMode::EffectiveWall || mode == SupportExtractMode::WideWall;
         double normalWeight = 1.0;
@@ -916,7 +945,7 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         p.y = src.y;
         p.z = src.z;
 
-        // Nearest edge, distance and projection parameter.
+        // 最近边、距离和投影参数。
         double boundaryDistance = std::numeric_limits<double>::max();
         std::size_t bestEdge = n;
         double bestT = 0.0;
@@ -954,8 +983,8 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
                 bump(&SupportFilterStats::tRejected);
                 continue;
             }
-            // Wall XY normal vs nearest-edge normal consistency. Points whose
-            // XY normal degenerates are not effective wall support either.
+            // 墙面 XY 法向与最近边法向的一致性校验。
+            // XY 法向退化的点同样不算有效墙面支撑。
             bool normalOk = true;
             if (sampled->normal &&
                 static_cast<std::size_t>(idx) < sampled->normal->size()) {
@@ -1036,9 +1065,9 @@ WeightedSupportCloud ExtractWeightedBoundarySupportFromOSGB(
         }
     }
 
-    // Extended-band chain filter: only keep chains whose projected span
-    // proves continuous wall support (chains crossing the ring seam get
-    // split — acceptable minimal implementation).
+    // 扩展带链过滤：只保留投影跨度能证明存在
+    // 连续墙面支撑的链(跨环缝的链会被
+    // 切开——最小实现的取舍)。
     if (mode == SupportExtractMode::EffectiveWall && !extendedCandidates.empty()) {
         std::sort(extendedCandidates.begin(), extendedCandidates.end(),
                   [](const ExtendedCandidate& a, const ExtendedCandidate& b) {
@@ -1085,14 +1114,16 @@ std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
 bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring);
 
 // ===== RegularizeRing =====
-// 浣滅敤锛氬鍗曟潯澶氳竟褰㈣竟鐣屽仛瑙勫垯鍖栥€?//       浼樺厛鐢?澧欓潰鏀拺鐐?锛岀偣澶皯鍒欓€€鍖栦负"鍏ㄩ儴鏀拺鐐?锛屽啀灏戝垯鐢ㄨ竟鐣岃嚜韬姞瀵嗙偣鍏滃簳锛?//       鐒跺悗鏋勯€?outlineRegular 骞舵墽琛?regular_Contour() 寰楀埌瑙勫垯鍖栫粨鏋溿€?
+// 作用：对单条多边形边界做规则化。
+//       优先用有效墙面支撑点，不足退化为宽带墙面/全部点，再不足用边界自身加密点兜底；
+//       然后构造 outlineRegular 并执行 regular_Contour() 得到规则化结果。
 // ===== Support evidence (pseudo-footprint filter) =====
-// Mask tails that survive neck splitting can form standalone polygons above
-// the 20 m2 floor with no real building behind them. Evidence MUST come from
-// the RAW wall-only support (right after extraction, before any fallback to
-// non-wall points, boundary densification or voxel downsampling) — the final
-// "support" count mixes neighbour points and densified boundary points and
-// says nothing about building existence.
+// 掩膜尾巴经窄颈切分后可能形成大于 20m² 的独立多边形，
+// 背后却没有真实建筑。证据必须来自"原始"墙面专用
+// 支撑集(提取后立即计算，先于任何回退、
+// 加密或体素降采样)——最终的
+// "support" 数混入了邻楼点和边界加密点，
+// 不能作为建筑是否存在的依据。
 struct SupportEvidence {
     std::size_t wallPointCount = 0;
     std::size_t associatedWallPointCount = 0;
@@ -1113,8 +1144,8 @@ constexpr std::size_t kSupportEvidenceMinAssociatedPoints = 8;
 constexpr double kSupportEvidenceBinLength = 1.8;           // m per boundary bin
 constexpr double kSupportEvidenceAssociationDistance = 0.8; // m, point-to-edge
 
-// Point-to-segment distance that also reports the raw projection parameter
-// (not clamped) for the [0.05, 0.95] association test.
+// 点到线段距离，同时输出原始投影参数
+// (未钳制)，供 [0.05, 0.95] 关联测试使用。
 double PointSegmentDistanceWithT(
     const pcl::PointXYZ& p, const pcl::PointXYZ& a, const pcl::PointXYZ& b, double& t)
 {
@@ -1130,6 +1161,7 @@ double PointSegmentDistanceWithT(
     return std::hypot(p.x - a.x - tc * dx, p.y - a.y - tc * dy);
 }
 
+// 作用：在(预过滤的)有效墙面支撑上计算边界覆盖率/最大空缺/关联密度等存在性证据。
 SupportEvidence ComputeSupportEvidence(
     const std::vector<pcl::PointXYZ>& ring,
     const WeightedSupportCloud& wallOnlySupport)
@@ -1152,8 +1184,8 @@ SupportEvidence ComputeSupportEvidence(
         4, static_cast<std::size_t>(std::ceil(perimeter / kSupportEvidenceBinLength)));
     std::vector<bool> occupied(totalBins, false);
 
-    // Evidence input is PRE-FILTERED effective wall support (narrow band or
-    // verified extended chains), so association only re-confirms binning.
+    // 证据输入是已预过滤的有效墙面支撑(窄带或
+    // 已验证的扩展链)，关联只是再次确认分桶。
     const double associationDistance = kSupportExtendedBandDistance;
     std::size_t associated = 0;
     for (const auto& p : *wallOnlySupport.points) {
@@ -1172,7 +1204,7 @@ SupportEvidence ComputeSupportEvidence(
         }
         if (bestEdge >= n) continue;
         if (bestDistance > associationDistance) continue;
-        // Ignore projections hugging a vertex: they carry no per-edge evidence.
+        // 忽略紧贴顶点的投影：不携带任何边级证据。
         if (bestT < 0.05 || bestT > 0.95) continue;
         ++associated;
         const double arc = prefix[bestEdge] +
@@ -1189,7 +1221,7 @@ SupportEvidence ComputeSupportEvidence(
     evidence.boundaryCoverage =
         static_cast<double>(evidence.coveredBins) / static_cast<double>(totalBins);
 
-    // Longest circular run of unoccupied bins, converted back to arc length.
+    // 未占用桶的最长环形连续段，换算回弧长。
     if (evidence.coveredBins == totalBins) {
         evidence.maxEmptyGap = 0.0;
     } else {
@@ -1218,9 +1250,9 @@ SupportEvidence ComputeSupportEvidence(
     return evidence;
 }
 
-// Conservative three-level decision. Level 3 keeps everything else: large
-// buildings are never dropped here (features without model coverage are
-// already removed upstream by RingHasModelCoverage in RegularizeGeometry).
+// 保守的三级判定。第三级保留其余所有：大
+// 建筑绝不在此时删除(无模型覆盖的要素
+// 已被上游 RegularizeGeometry 的 RingHasModelCoverage 过滤)。
 bool ShouldDropForLackOfSupport(
     const SupportEvidence& evidence,
     double ringArea,
@@ -1248,6 +1280,7 @@ bool ShouldDropForLackOfSupport(
     return false;
 }
 
+// 作用：OSGB 模式的单环规则化入口：四级支撑阶梯(effective->宽带墙面->非墙面->加密) + 方向提示 + outlineRegular 全管线。
 std::vector<pcl::PointXYZ> RegularizeRing(
     const std::vector<pcl::PointXYZ>& ring,
     const MyCloudPtr& sampled,
@@ -1261,33 +1294,33 @@ std::vector<pcl::PointXYZ> RegularizeRing(
 {
     if (ring.size() < 3) return ring;
 
-    // ---- Effective wall support extraction (3 m coarse search, narrow/
-    // extended band + ownership + normal-edge filtering inside) ----
+    // ---- 有效墙面支撑提取(3m 粗搜 + 窄带/
+    // 扩展带 + 归属 + 法向-边过滤在内部完成) ----
     SupportFilterStats filterStats;
     auto wallOnlySupport = ExtractWeightedBoundarySupportFromOSGB(
         sampled, ring, SupportExtractMode::EffectiveWall,
         kdtree, ownership, currentRingId, &filterStats);
-    // Raw effective set snapshot: downsampling below replaces
-    // weightedSupport's cloud, but the direction hint must keep the raw
-    // effective wall points.
+    // 原始有效集快照：下面的降采样会替换
+    // weightedSupport 的点云，而方向提示必须使用原始的
+    // 有效墙面点。
     const WeightedSupportCloud effectiveWallSupportRaw = wallOnlySupport;
     g_supportFilterCoarseWallTotal += filterStats.coarseWall;
     g_supportFilterEffectiveWallTotal +=
         filterStats.narrowBand + filterStats.extendedBand;
 
-    // ---- 鏀拺鐐规彁鍙?璁℃椂) ----
+    // ---- 支撑点提取(计时) ----
     auto t0 = std::chrono::steady_clock::now();
-    // ---- Pseudo-footprint support evidence: computed on the RAW wall-only
-    // support BEFORE any fallback / densify / downsample replaces it. A drop
-    // here returns an empty ring so the feature never reaches VDP/Ceres.
+    // ---- 伪轮廓支撑证据：在"原始"墙面专用支撑集上计算
+    // (先于任何回退/加密/降采样)。判定删除时
+    // 返回空环，要素不会进入 VDP/Ceres。
     {
         SupportEvidence evidence = ComputeSupportEvidence(ring, wallOnlySupport);
         if (supportEvidence) *supportEvidence = evidence;
         const double ringArea = PolygonArea2D(ring);
         std::string reason;
         const bool drop = ShouldDropForLackOfSupport(evidence, ringArea, reason);
-        // source_fid here is the stable attribute id (initial outline "id"
-        // field when present, otherwise the OGR FID) — see main()'s loop.
+        // 此处 source_fid 是稳定属性 id(栅格模式下等于
+        // 初始轮廓的 "id" 字段，否则为 OGR FID)，见 main() 循环。
         std::cerr << "[SupportEvidence] source_fid=" << sourceFid
                   << " evidence_source=effective_wall_support"
                   << " area=" << ringArea
@@ -1316,10 +1349,10 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     std::size_t fallbackCount = 0;
     std::size_t densifyCount = 0;
     if (weightedSupport.points->size() < 20) {
-        // Wide-wall tier: the legacy 3 m wall band (unambiguous ownership,
-        // wall normals). Footprints whose mask offset exceeds the narrow/
-        // extended bands still get REAL wall anchoring here instead of
-        // roof points, so their edges are pulled back to the walls.
+        // 宽带墙面层：旧版 3m 墙面带(无歧义归属、
+        // 墙面法向)。掩膜偏移超出窄带/
+        // 扩展带的轮廓在这里仍能获得真实墙面锚定，
+        // 而不是屋面点，从而把边拉回墙面。
         auto wideWallSupport = ExtractWeightedBoundarySupportFromOSGB(
             sampled, ring, SupportExtractMode::WideWall,
             kdtree, ownership, currentRingId);
@@ -1331,8 +1364,8 @@ std::vector<pcl::PointXYZ> RegularizeRing(
         }
     }
     if (weightedSupport.points->size() < 20) {
-        // Non-wall fallback: ambiguous ownership is already excluded inside
-        // the extractor; weights stay clearly below wall points.
+        // 非墙面回退：歧义归属已在提取器内部排除；
+        // 权重明显低于墙面点。
         auto fallbackSupport = ExtractWeightedBoundarySupportFromOSGB(
             sampled, ring, SupportExtractMode::NonWall,
             kdtree, ownership, currentRingId);
@@ -1344,8 +1377,8 @@ std::vector<pcl::PointXYZ> RegularizeRing(
         }
     }
     if (weightedSupport.points->size() < 20) {
-        // Last resort for Ceres only: densified boundary of the outline
-        // itself, lowest weight.
+        // 仅作为 Ceres 的最后兜底：轮廓自身的
+        // 加密边界，权重最低。
         auto densified = DensifyBoundary(ring, kDensifyStep);
         densifyCount = densified->size();
         for (const auto& p : *densified) {
@@ -1353,9 +1386,9 @@ std::vector<pcl::PointXYZ> RegularizeRing(
             weightedSupport.weights.push_back(kSupportDensifyWeight);
         }
     }
-    // 鏀拺鐐硅繃澶氭椂闄嶉噰鏍凤細computeModelResolution 鏄?O(N虏)锛孋eres/鎷撴墤淇涔熼殢鐐规暟鍙樿吹
-    // Ceres only uses XY. A 3D voxel grid keeps repeated wall locations at
-    // different heights and unintentionally gives tall walls more influence.
+    // 支撑点过多时降采样：computeModelResolution 是 O(N²)，Ceres/拓扑修复也随点数变贵
+    // Ceres 只用 XY。三维体素会保留同一墙面不同高度
+    // 的重复点，无意中放大高墙的影响。
     auto downsampled = DownsampleSupport2DWithWeights(weightedSupport, kSupportVoxelLeaf);
     if (downsampled.points && !downsampled.points->empty()) weightedSupport = downsampled;
     ApplySupportDensityWeights(weightedSupport);
@@ -1381,26 +1414,26 @@ std::vector<pcl::PointXYZ> RegularizeRing(
               << " direction_input=" << effectiveWallSupportRaw.points->size()
               << " ceres_input=" << support->size() << std::endl;
 
-    // Small buildings no longer take the oriented-rectangle fast path here;
-    // they run the normal pipeline and outlineRegular forces a single main
-    // direction for them (kSmallBuildingSingleDirectionArea) so multi-
-    // direction regularization cannot produce diagonal edges on small
+    // 小建筑不再在此走方向矩形快通道；
+    // 它们走正常管线，由 outlineRegular 强制单一主方向
+    // (kSmallBuildingSingleDirectionArea)，避免多方向
+    // 规则化在小轮廓上产生斜边。
     // footprints.
 
-    // ---- 瑙勫垯鍖栦紭鍖?璁℃椂) ----
-    // The AI mask is the initial contour, not an independent DLG observation.
+    // ---- 规则化优化(计时) ----
+    // AI 掩膜即初始轮廓，不是独立的 DLG 观测。
     outlineRegular regularizer(ring, support, weightedSupport.weights);
     regularizer.setSourceFeatureId(sourceFid);
     double wallDirection = 0.0;
     double wallPeakRatio = 0.0;
     std::size_t wallPairCount = 0;
     {
-        // The direction histogram's strength gate (kSupportDirectionMinPairs)
-        // is calibrated on VOXEL-DOWNSAMPLED wall points. Feeding the raw
-        // effective set (30 pts/m2) inflates pair counts ~20x, letting a
-        // single short anomalous wall pass as "strong" evidence and rotate
-        // the building (observed: 15-45 deg corrections from 400-8000 pairs).
-        // Restore scale parity by downsampling before the hint.
+        // 方向直方图的强度门槛(kSupportDirectionMinPairs)
+        // 按体素降采样后的墙面点校准。直接喂入原始
+        // 有效集(30点/m²)会让配对数虚高约20倍，使一段
+        // 短异常墙就能冒充"强"证据，把建筑
+        // 旋转(实测：400-8000配对导致15-45°的"纠偏")。
+        // 提示前先降采样以恢复尺度一致性。
         auto downsampledEffective =
             DownsampleSupport2DWithWeights(effectiveWallSupportRaw, kSupportVoxelLeaf);
         const auto directionInput =
@@ -1432,6 +1465,7 @@ std::vector<pcl::PointXYZ> RegularizeRing(
     return result.size() >= 3 ? result : ring;
 }
 
+// 作用：计算点列的轴对齐包围盒面积(m²)。
 double BoundingBoxArea2D(const std::vector<pcl::PointXYZ>& ring)
 {
     if (ring.empty()) return 0.0;
@@ -1448,6 +1482,7 @@ double BoundingBoxArea2D(const std::vector<pcl::PointXYZ>& ring)
     return std::max(0.0, max_x - min_x) * std::max(0.0, max_y - min_y);
 }
 
+// 作用：计算 2D 多边形面积(鞋带公式，绝对值)。
 double PolygonArea2D(const std::vector<pcl::PointXYZ>& ring)
 {
     if (ring.size() < 3) return 0.0;
@@ -1460,6 +1495,7 @@ double PolygonArea2D(const std::vector<pcl::PointXYZ>& ring)
     return std::abs(area) * 0.5;
 }
 
+// 作用：按指定方向生成点列的最小旋转外接矩形(4 顶点)。
 std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
     const std::vector<pcl::PointXYZ>& ring,
     double angle)
@@ -1492,6 +1528,7 @@ std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
     return result;
 }
 
+// 作用：检查输出环是否通过面积/bbox 下限安全地板。
 bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring)
 {
     return ring.size() >= 3 &&
@@ -1499,6 +1536,7 @@ bool OutputRingPassesSizeFloor(const std::vector<pcl::PointXYZ>& ring)
         BoundingBoxArea2D(ring) >= kMinOutputPolygonBBoxArea;
 }
 
+// 作用：判断环内及环边 3m 范围内是否有足够的采样点(模型覆盖证据)。
 bool RingHasModelCoverage(
     const std::vector<pcl::PointXYZ>& ring,
     const MyCloudPtr& sampled,
@@ -1625,16 +1663,17 @@ struct InitialOutlineMergeStats {
     long long adjacentCandidates = 0;
     long long keptByModelEvidence = 0;
     long long keptByShape = 0;
-    long long keptNarrowSeam = 0;     // 鍏变韩杈?kMergeSeamLength(棰?绐勮繛鎺?锛屼笉鍚堝苟
+    long long keptNarrowSeam = 0;     // 共享边 < kMergeSeamLength(窄缝连接，不合并)
     long long mergedPairs = 0;
-    long long mergedByBigPair = 0;    // 澶у缓绛戠洿鍚堝苟(璺宠繃璇佹嵁闂?鐨勫鏁帮紝渚夸簬璋?kLargeBuildingMergeArea
+    long long mergedByBigPair = 0;    // 大建筑兜底合并(跳过证据间的计数，便于调 kLargeBuildingMergeArea)
     long long mergedByShape = 0;      // shared-boundary geometry strongly suggests an over-segmentation seam
     long long removedFeatures = 0;
-    // 褰㈢姸闂?keptByShape)鐨勫瓙鍘熷洜鎷嗗垎(璇婃柇鐢?
-    long long shapeUnionFailed = 0;       // A鈭狟 杩斿洖绌?    long long shapeNotSinglePolygon = 0;  // 骞堕泦涓嶆槸鍗曚釜 wkbPolygon(甯歌浜庢爡鏍煎皬缂濋殭鈫扢ultiPolygon)
-    long long shapePerimeterRatio = 0;    // 鍏变韩杈瑰崰鍛ㄩ暱姣?< kMinSharedPerimeterRatio
+    // 形状判定(keptByShape)的子原因拆分(诊断用)
+    long long shapeUnionFailed = 0;       // A∪B 返回空
+    long long shapeNotSinglePolygon = 0;  // 并集不是单个 wkbPolygon(常见于栅格小缺口→MultiPolygon)
+    long long shapePerimeterRatio = 0;    // 共享边占周长比 < kMinSharedPerimeterRatio
     long long shapeCompactness = 0;       // 绱у噾搴︽敹鐩?> kMaxSplitCompactnessGainForMerge
-    double maxCompactnessGain = 0.0;      // 瑙傚療鍒扮殑鏈€澶х揣鍑戝害澧炵泭(鍒ゆ柇闃堝€艰鏀惧澶氬皯)
+    double maxCompactnessGain = 0.0;      // 观察到的最大紧凑度增益(判断阈值要放宽多少)
     long long mergedByParent = 0;
 };
 
@@ -1644,7 +1683,7 @@ struct OutlineFeatureRecord {
     OGREnvelope envelope = {};
     double area = 0.0;
     double perimeter = 0.0;
-    int parent = -1;   // 鎵€灞炲師濮嬭繛閫氬垎閲?<=0 琛ㄧず鏈煡锛屼笉鍙備笌鍚屾簮鍚堝苟)
+    int parent = -1;   // 所属原始连通分量(<=0 表示未知，不参与同源合并)
 };
 
 struct OutputOverlapRepairStats {
@@ -1688,16 +1727,19 @@ constexpr int kNarrowNeckDebugRejectLogLimit = 24;
 
 void CopyFieldValues(OGRFeature* src, OGRFeature* dst);
 
+// 作用：计算 OGR 几何的长度(线)。
 double GeometryLength(OGRGeometry* geometry)
 {
     return geometry ? OGR_G_Length(OGRGeometry::ToHandle(geometry)) : 0.0;
 }
 
+// 作用：计算 OGR 几何的面积(面)。
 double GeometryArea(const OGRGeometry* geometry)
 {
     return geometry ? OGR_G_Area(OGRGeometry::ToHandle(const_cast<OGRGeometry*>(geometry))) : 0.0;
 }
 
+// 作用：计算 OGR 几何的周长(边界长度)。
 double GeometryPerimeter(OGRGeometry* geometry)
 {
     if (!geometry) return 0.0;
@@ -1722,11 +1764,13 @@ struct Point2D64 {
     double z = 0.0;
 };
 
+// 作用：两个 Point2D64 的水平距离。
 double Distance2D64(const Point2D64& a, const Point2D64& b)
 {
     return std::hypot(a.x - b.x, a.y - b.y);
 }
 
+// 作用：取出 OGR 多边形外环并转为 Point2D64 列(去闭合点)。
 std::vector<Point2D64> ExtractExteriorRing64(OGRPolygon* polygon)
 {
     std::vector<Point2D64> ring;
@@ -1741,6 +1785,7 @@ std::vector<Point2D64> ExtractExteriorRing64(OGRPolygon* polygon)
     return ring;
 }
 
+// 作用：Point2D64 环的有向面积(带符号)。
 double PolygonArea2D64(const std::vector<Point2D64>& ring)
 {
     if (ring.size() < 3) return 0.0;
@@ -1753,6 +1798,7 @@ double PolygonArea2D64(const std::vector<Point2D64>& ring)
     return std::abs(area) * 0.5;
 }
 
+// 作用：射线法判断点是否在 Point2D64 多边形内。
 bool PointInPolygon2D64(const Point2D64& p, const std::vector<Point2D64>& poly)
 {
     bool inside = false;
@@ -1768,11 +1814,13 @@ bool PointInPolygon2D64(const Point2D64& p, const std::vector<Point2D64>& poly)
     return inside;
 }
 
+// 作用：三点方向叉积。
 double Orient2D64(const Point2D64& a, const Point2D64& b, const Point2D64& c)
 {
     return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 }
 
+// 作用：判断点是否在线段上(含共线与范围检查)。
 bool OnSegment2D64(const Point2D64& a, const Point2D64& b, const Point2D64& p)
 {
     constexpr double eps = 1e-8;
@@ -1781,6 +1829,7 @@ bool OnSegment2D64(const Point2D64& a, const Point2D64& b, const Point2D64& p)
            p.y >= std::min(a.y, b.y) - eps && p.y <= std::max(a.y, b.y) + eps;
 }
 
+// 作用：判断两条线段是否真正相交(不含端点触碰)。
 bool SegmentsIntersect2D64(
     const Point2D64& a,
     const Point2D64& b,
@@ -1804,11 +1853,13 @@ bool SegmentsIntersect2D64(
     return false;
 }
 
+// 作用：判断边是否与顶点重合接触。
 bool EdgeTouchesVertex(std::size_t edgeIndex, std::size_t vertexIndex, std::size_t vertexCount)
 {
     return edgeIndex == vertexIndex || ((edgeIndex + 1) % vertexCount) == vertexIndex;
 }
 
+// 作用：判断窄颈切线(除端点外)是否在多边形内部。
 bool NeckCutLineInsidePolygon2D64(
     const std::vector<Point2D64>& ring,
     std::size_t vertexA,
@@ -1819,7 +1870,7 @@ bool NeckCutLineInsidePolygon2D64(
     const Point2D64& a = ring[vertexA];
     const Point2D64& b = ring[vertexB];
 
-    // Interior samples reject chords that pass through exterior space.
+    // 内部采样点拒绝穿过外部空间的弦。
     constexpr int sampleCount = 7;
     for (int s = 1; s < sampleCount; ++s) {
         const double t = static_cast<double>(s) / sampleCount;
@@ -1845,6 +1896,7 @@ bool NeckCutLineInsidePolygon2D64(
     return true;
 }
 
+// 作用：把 Point2D64 环组装成 OGRPolygon。
 OGRPolygon* MakePolygon64(const std::vector<Point2D64>& ring)
 {
     if (ring.size() < 3) return nullptr;
@@ -1868,6 +1920,7 @@ struct ClosestSegmentPoints2D {
     double distance = std::numeric_limits<double>::max();
 };
 
+// 作用：钳制到 [0,1]。
 double Clamp01(double value)
 {
     return std::max(0.0, std::min(1.0, value));
@@ -1909,7 +1962,7 @@ ClosestSegmentPoints2D ClosestPointsOnSegments2D(
         t = Clamp01(ee / cc);
     }
 
-    // Re-clamp once after fixing one parameter. This is enough for short
+    // 固定一个参数后重新钳制一次。对短
     // raster-outline segments and avoids pulling in a larger geometry library.
     const double px = a0.x + s * ux;
     const double py = a0.y + s * uy;
@@ -1929,6 +1982,7 @@ ClosestSegmentPoints2D ClosestPointsOnSegments2D(
     return result;
 }
 
+// 作用：判断切线是否大部分位于多边形内。
 bool CutLineMostlyInsidePolygon(
     const NarrowNeckCandidate& candidate,
     const std::vector<pcl::PointXYZ>& ring)
@@ -1948,6 +2002,7 @@ bool FindNarrowNeckCandidates(
     const std::vector<Point2D64>& ring,
     std::vector<NarrowNeckCandidate>& candidates);
 
+// 作用：从候选中选最优窄颈(宽度最小、边界弧最长)。
 bool FindBestNarrowNeckCandidate(
     const std::vector<Point2D64>& ring,
     NarrowNeckCandidate& best)
@@ -1958,6 +2013,7 @@ bool FindBestNarrowNeckCandidate(
     return true;
 }
 
+// 作用：枚举所有满足宽度/弧长/面积门槛的窄颈候选顶点对。
 bool FindNarrowNeckCandidates(
     const std::vector<Point2D64>& ring,
     std::vector<NarrowNeckCandidate>& candidates)
@@ -1976,7 +2032,7 @@ bool FindNarrowNeckCandidates(
     if (perimeter <= 2.0 * kNarrowNeckMinBoundarySeparation) return false;
 
     // A narrow neck is defined by two non-adjacent boundary vertices.
-    // The two arcs between them become the two new exterior rings.
+    // 两点之间的两段弧成为两个新的外环。
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = i + 1; j < n; ++j) {
             const std::size_t forwardEdges = j - i;
@@ -2037,6 +2093,7 @@ bool FindNarrowNeckCandidates(
     return !candidates.empty();
 }
 
+// 作用：把(多)多边形几何拆成面积达标的单多边形部件列表。
 void CollectPolygonParts(
     OGRGeometry* geometry,
     std::vector<std::unique_ptr<OGRGeometry>>& parts)
@@ -2055,6 +2112,7 @@ void CollectPolygonParts(
     }
 }
 
+// 作用：用一个窄颈候选切分单个多边形，输出各部件。
 bool SplitOnePolygonAtNarrowNeck(
 OGRPolygon* polygon,
     std::vector<std::unique_ptr<OGRGeometry>>& splitParts,
@@ -2216,6 +2274,7 @@ void SplitGeometryAtNarrowNecks(
     for (auto& item : pending) outputParts.push_back(std::move(item));
 }
 
+// 作用：初始轮廓窄颈拆分阶段入口：就地修改 Shapefile。
 bool SplitInitialOutlinesAtNarrowNecks(
     const std::string& shpPath,
     NarrowNeckSplitStats& stats)
@@ -2281,6 +2340,7 @@ struct BoundarySegment2D {
     double length = 0.0;
 };
 
+// 作用：把外环每条边加入边界段列表。
 void AddExteriorRingSegments(const OGRLinearRing* ring, std::vector<BoundarySegment2D>& segments)
 {
     if (!ring || ring->getNumPoints() < 2) return;
@@ -2295,6 +2355,7 @@ void AddExteriorRingSegments(const OGRLinearRing* ring, std::vector<BoundarySegm
     }
 }
 
+// 作用：收集几何的全部外环边界段(支持多部件)。
 void CollectExteriorBoundarySegments(const OGRGeometry* geometry, std::vector<BoundarySegment2D>& segments)
 {
     if (!geometry) return;
@@ -2310,6 +2371,7 @@ void CollectExteriorBoundarySegments(const OGRGeometry* geometry, std::vector<Bo
     }
 }
 
+// 作用：点到直线(用边界段表示)的距离。
 double PointLineDistance2D(double x, double y, const BoundarySegment2D& segment)
 {
     const double dx = segment.bx - segment.ax;
@@ -2318,6 +2380,7 @@ double PointLineDistance2D(double x, double y, const BoundarySegment2D& segment)
         std::max(segment.length, 1e-9);
 }
 
+// 作用：计算两边界段在平行条件下的投影重叠长度。
 double SegmentProjectionOverlap2D(
     const BoundarySegment2D& a,
     const BoundarySegment2D& b,
@@ -2347,6 +2410,7 @@ double SegmentProjectionOverlap2D(
     return std::max(0.0, hi - lo);
 }
 
+// 作用：鲁棒估计两轮廓的共享边界长度(精确值+容差投影)。
 double RobustSharedBoundaryLength(
     const OGRGeometry* a,
     const OGRGeometry* b,
@@ -2368,19 +2432,20 @@ double RobustSharedBoundaryLength(
     return std::max(exactSharedLength, robustLength);
 }
 
+// 作用：清理合并后的几何(去自交、平滑细缝、保持拓扑)。
 std::unique_ptr<OGRGeometry> CleanMergedGeometry(const OGRGeometry* geometry)
 {
     if (!geometry) return nullptr;
     std::unique_ptr<OGRGeometry> cleaned(geometry->clone());
     if (!cleaned) return nullptr;
 
-    // First remove self-intersection artifacts produced by Union/Buffer(0).
+    // 先去除 Union/Buffer(0) 产生的自交伪影。
     if (!cleaned->IsValid()) {
         std::unique_ptr<OGRGeometry> fixed(cleaned->Buffer(0.0));
         if (fixed) cleaned = std::move(fixed);
     }
 
-    // Then smooth tiny raster seams while preserving topology.
+    // 再在保持拓扑的前提下平滑细小栅格缝。
     std::unique_ptr<OGRGeometry> simplified(
         cleaned->SimplifyPreserveTopology(kInitialMergeSimplifyTolerance));
     if (simplified && !simplified->IsEmpty()) {
@@ -2394,6 +2459,7 @@ std::unique_ptr<OGRGeometry> CleanMergedGeometry(const OGRGeometry* geometry)
     return cleaned;
 }
 
+// 作用：按形状判断两个过分割轮廓是否该合并(缺口互补等)。
 bool ShouldMergeByFootprintShape(
     const OutlineFeatureRecord& a,
     const OutlineFeatureRecord& b,
@@ -2428,12 +2494,14 @@ bool ShouldMergeByFootprintShape(
     return true;
 }
 
+// 作用：紧凑度 = 4πA/P²(圆为 1)。
 double Compactness(double area, double perimeter)
 {
     return area > 0.0 && perimeter > 0.0
         ? 4.0 * M_PI * area / (perimeter * perimeter) : 0.0;
 }
 
+// 作用：判断两几何是否存在有意义的重叠(超面积/比例阈值)。
 bool HasMeaningfulGeometryOverlap(
     const OGRGeometry* a,
     const OGRGeometry* b,
@@ -2453,6 +2521,7 @@ bool HasMeaningfulGeometryOverlap(
     return overlapArea / smaller >= kOutputOverlapMinRatio;
 }
 
+// 作用：计算几何质心(面优先，失败退回包围盒中心)。
 bool GeometryCentroid2D(const OGRGeometry* geometry, double& x, double& y)
 {
     x = y = 0.0;
@@ -2472,6 +2541,7 @@ bool GeometryCentroid2D(const OGRGeometry* geometry, double& x, double& y)
     return true;
 }
 
+// 作用：把几何整体平移 (dx, dy)。
 std::unique_ptr<OGRGeometry> TranslateGeometry2D(
     const OGRGeometry* geometry,
     double dx,
@@ -2510,6 +2580,7 @@ std::unique_ptr<OGRGeometry> TranslateGeometry2D(
     return moved;
 }
 
+// 作用：尝试沿质心连线方向平移"动方"使其脱离"定方"(带新冲突检查)。
 bool TryResolvePairByTranslation(
     const OGRGeometry* fixed,
     const OGRGeometry* moving,
@@ -2633,6 +2704,7 @@ struct IntrusionHalfspaceResidual {
     double weight_;
 };
 
+// 作用：两条 Hesse 法线式直线的交点。
 bool LineIntersection2D(
     const GroupEdgeLine& a,
     const GroupEdgeLine& b,
@@ -2646,6 +2718,7 @@ bool LineIntersection2D(
     return std::isfinite(x) && std::isfinite(y);
 }
 
+// 作用：把输出多边形转为组平差模型(边参数化 θ/d)。
 bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
     GroupBuildingModel& model)
 {
@@ -2694,6 +2767,7 @@ bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
     return model.edges.size() == model.ring.size();
 }
 
+// 作用：由优化后的边参数重建环(面积比护栏)。
 bool ReconstructGroupRing(GroupBuildingModel& model)
 {
     if (model.edges.size() < 3) return false;
@@ -2724,6 +2798,7 @@ bool ReconstructGroupRing(GroupBuildingModel& model)
     return true;
 }
 
+// 作用：沿环采样顶点/中点用于重叠检测。
 std::vector<pcl::PointXYZ> SampleRingForOverlap(const std::vector<pcl::PointXYZ>& ring)
 {
     std::vector<pcl::PointXYZ> samples;
@@ -2756,6 +2831,7 @@ std::vector<pcl::PointXYZ> SampleRingForOverlap(const std::vector<pcl::PointXYZ>
     return samples;
 }
 
+// 作用：查点在环上最近的边下标。
 int NearestEdgeIndex(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& ring)
 {
     int best = -1;
@@ -2770,6 +2846,7 @@ int NearestEdgeIndex(const pcl::PointXYZ& p, const std::vector<pcl::PointXYZ>& r
     return best;
 }
 
+// 作用：Ceres 组平差：相邻建筑互斥的软约束迭代(角度固定、只调边偏移)。
 bool OptimizeCeresConflictGroup(
     std::vector<GroupBuildingModel>& group,
     OutputOverlapRepairStats& stats)
@@ -2848,6 +2925,7 @@ bool OptimizeCeresConflictGroup(
     return anyImproved;
 }
 
+// 作用：把(多)线几何拆成接缝段列表。
 void CollectSeamSegments(const OGRGeometry* geometry,
                          const Eigen::Vector3d& metadataOffset,
                          std::vector<SeamSegment>& segments)
@@ -2876,6 +2954,7 @@ void CollectSeamSegments(const OGRGeometry* geometry,
     }
 }
 
+// 作用：查询点附近是否存在墙面点。
 bool HasWallPointNear(
     const pcl::PointXYZ& query,
     const MyCloudPtr& sampled,
@@ -2899,6 +2978,7 @@ bool HasWallPointNear(
     return false;
 }
 
+// 作用：取点附近屋顶高度中位数。
 bool MedianRoofHeightNear(
     const pcl::PointXYZ& query,
     const MyCloudPtr& sampled,
@@ -2926,6 +3006,7 @@ bool MedianRoofHeightNear(
     return true;
 }
 
+// 作用：沿共享边采样统计墙面比例与两侧屋顶高差(合并/切分的证据判据)。
 SeamEvidence EvaluateSeamEvidence(
     const OGRGeometry* sharedBoundary,
     const MyCloudPtr& sampled,
@@ -3016,6 +3097,7 @@ private:
 };
 
 #if 0
+// 作用：输出重叠修复：组平差 + 平移回退 + 硬裁剪(当前默认禁用)。
 bool ResolveOutputOverlaps(OGRLayer* layer,
     const Eigen::Vector3d& metadataOffset,
     OutputOverlapRepairStats& stats)
@@ -3129,7 +3211,7 @@ bool ResolveOutputOverlaps(OGRLayer* layer,
         }
     }
 
-    // Resolve residual conflicts without changing the larger footprint. Translation
+    // 在不改动较大轮廓的前提下解决残余冲突。平移
     // is accepted only when it does not create a new conflict with any third building.
     for (std::size_t pass = 0; pass < features.size(); ++pass) {
         bool changed = false;
@@ -3333,6 +3415,7 @@ bool ResolveOutputOverlaps(OGRLayer* layer,
 }
 #endif
 
+// 作用：初始轮廓过分割合并阶段：按接缝证据/形状/大建筑兜底就地合并 Shapefile。
 bool MergeOversegmentedInitialOutlines(
     const std::string& shpPath,
     const MyCloudPtr& sampled,
@@ -3387,7 +3470,7 @@ bool MergeOversegmentedInitialOutlines(
             const double exactSharedLength = GeometryLength(shared.get());
             const double sharedLength = RobustSharedBoundaryLength(
                 a.geometry.get(), b.geometry.get(), exactSharedLength);
-            if (sharedLength < kMinSharedBoundaryLength) continue;   // 閭绘帴涓嬮檺(鐐?瑙掓帴瑙︿笉绠?
+            if (sharedLength < kMinSharedBoundaryLength) continue;   // 邻接下限(点/角接触不算)
             ++stats.adjacentCandidates;
             if (sharedLength > exactSharedLength + 0.5) {
                 std::cerr << "[Merge diag] ROBUST exactShared=" << exactSharedLength
@@ -3416,7 +3499,8 @@ bool evidenceComputed = false;
                 continue;
             }
 
-            // 闂? 瀹界紳锛氬叡浜竟 >= kMergeSeamLength 鎵嶇畻"璇ュ悎"銆?            // 棰?绐勮繛鎺?濡傚垎姘村箔鍒囧紑鐨勭矘杩炴ゼ)鍏变韩杈圭煭 鈫?涓嶅悓鏍?鈫?涓嶅悎銆?
+            // 宽缝：共享边 >= kMergeSeamLength 才算"该合"。
+            // 窄缝(如分水岭切开的粘连)共享边短 → 属不同栋 → 不合并。
 if (sharedLength < kMergeSeamLength) {
                 if (largePair) std::cerr << "[Merge diag] NARROW sharedLen=" << sharedLength
                                          << " areaA=" << a.area << " areaB=" << b.area << std::endl;
@@ -3430,8 +3514,9 @@ if (sharedLength < kMergeSeamLength) {
                 ++stats.mergedByParent;
                 continue;
             }
-            // 澶у缓绛戠洿閫氾細涓や晶閮芥槸澶у潡涓斿叡浜暱杈?鈫?瑙嗕负鍚屼竴缁煎悎浣擄紝璺宠繃璇佹嵁闂哥洿鎺ュ悎骞躲€?            // 瑙?kLargeBuildingMergeArea 澶勬敞閲婏細闀胯竟鏈韩鏄?鍚屼竴鏍?鐨勬渶寮哄嚑浣曡瘉鎹紝鑰岃瘉鎹椄
-            // 鍦ㄥぇ寤虹瓚灞嬮潰浼氬洜濂冲効澧?浼哥缉缂濈瓑璇Е鍙?wallRatio 楗卞拰)鑰岄敊璇湴闃绘鍚堝苟銆?
+            // 大建筑兜底：两侧都是大块且共享长边 → 视为同一综合体，跳过证据间直接合并。
+            // 注(kLargeBuildingMergeArea 处)：长边本身是同一栋的最强几何证据，而证据间在
+            // 大建筑屋面会因女儿墙/伸缩缝等触发 wallRatio 饱和而错误阻止合并。
 if (std::min(a.area, b.area) > kLargeBuildingMergeArea) {
                 if (largePair) std::cerr << "[Merge diag] BIGMERGE sharedLen=" << sharedLength
                                          << " areaA=" << a.area << " areaB=" << b.area << std::endl;
@@ -3469,13 +3554,13 @@ if (std::min(a.area, b.area) > kLargeBuildingMergeArea) {
         }
         std::unique_ptr<OGRGeometry> mergeCleaned = CleanMergedGeometry(merged.get());
         if (mergeCleaned) merged = std::move(mergeCleaned);
-        // 鐐规帴瑙?灏忕紳闅欎細璁╁苟闆嗗彉鎴?MultiPolygon锛涚敤 Buffer(0) 铻嶅悎鎴愬崟澶氳竟褰?
+        // 点接触/小缝隙会让并集变成 MultiPolygon；用 Buffer(0) 融合成单多边形
 if (merged && wkbFlatten(merged->getGeometryType()) != wkbPolygon) {
             std::unique_ptr<OGRGeometry> cleaned(merged->Buffer(0.0));
             if (cleaned && wkbFlatten(cleaned->getGeometryType()) == wkbPolygon) {
                 merged = std::move(cleaned);
             } else {
-                continue;  // 瀹炲湪鍚堜笉鎴愬崟澶氳竟褰紝鏀惧純杩欑粍
+                continue;  // 实在合不成单多边形，放弃这组
             }
         }
         if (!merged || wkbFlatten(merged->getGeometryType()) != wkbPolygon) continue;
@@ -3497,7 +3582,7 @@ if (merged && wkbFlatten(merged->getGeometryType()) != wkbPolygon) {
     return true;
 }
 
-// 鎶婂杈瑰舰(鍗?澶?鐨勬墍鏈?interior ring 鍘绘帀锛屽彧淇濈暀澶栫幆(瀹炲績鍖?銆俢hanged 缃负鏄惁鐪熺殑鏀瑰姩杩囥€?
+// 把多边形(可能带洞)的所有 interior ring 去掉，只保留外环(实心化)。changed 置为是否真的改动过。
 std::unique_ptr<OGRGeometry> SolidGeometry(const OGRGeometry* g, bool& changed)
 {
     changed = false;
@@ -3537,8 +3622,10 @@ std::unique_ptr<OGRGeometry> SolidGeometry(const OGRGeometry* g, bool& changed)
     return std::unique_ptr<OGRGeometry>(g->clone());
 }
 
-// 鍚堝苟鏀舵暃鍚庯細鍏堟妸鎵€鏈夊杈瑰舰鍘?interior ring(瀹炲績鍖?锛屽啀鍒犻櫎琚洿澶ц疆寤撳畬鍏ㄥ寘鍚殑灏忚疆寤撱€?// 澶у缓绛戝悎骞跺悗锛屽唴閮ㄦ畫鐣欑殑鍒嗗壊/鏍呮牸鍖栧皬纰庣墖甯镐互"澶ц疆寤撳甫娲?+ 娲為噷濂楀皬杞粨"鐨勫舰寮忓瓨鍦紱
-// 甯︽礊鐨?A 瀵规礊閲岀殑 B 璋?Contains 杩斿洖 false 浼氭紡妫€锛屾晠鍏堝叏灞€鍘诲瓟锛屽啀鎸夊疄蹇冨嚑浣曞仛鍖呭惈娓呯悊銆?// maxArea锛氬彧鍒犻潰绉?=maxArea 鐨勮鍖呭惈鑰呫€?
+// 合并收敛后：先把所有多边形去 interior ring(实心化)，再删除被较大轮廓完全包含的小轮廓。
+// 大建筑合并后，内部残留的分色/栅格化小碎片常以"大轮廓带洞+洞里套小轮廓"的形式存在；
+// 带洞的 A 对洞里的 B 调 Contains 返回 false 会漏检，故先全局去洞，再按实际几何做包含清理。
+// maxArea：只删面积 <= maxArea 的被包含者。
 long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxArea)
 {
     GDALDataset* dataset = static_cast<GDALDataset*>(
@@ -3553,7 +3640,7 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
         std::unique_ptr<OGRGeometry> geom;
         OGREnvelope env = {};
         double area = 0.0;
-        bool solidified = false;              // 鍘熷甫瀛斻€佸凡瀹炲績鍖栵紝闇€鍐欏洖
+        bool solidified = false;              // 原带孔、已实心化，需写回
         bool remove = false;
     };
     std::vector<ContainedRec> recs;
@@ -3564,7 +3651,7 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
             ContainedRec rec;
             rec.fid = feature->GetFID();
             bool changed = false;
-            rec.geom = SolidGeometry(geometry, changed);   // 鍏堝疄蹇冨寲锛岃娲為噷鐨勫皬杞粨鍙 Contains
+            rec.geom = SolidGeometry(geometry, changed);   // 先实心化，让洞里的小轮廓可被 Contains
             rec.solidified = changed;
             rec.geom->getEnvelope(&rec.env);
             rec.area = GeometryArea(rec.geom.get());
@@ -3577,13 +3664,13 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
               [](const ContainedRec& a, const ContainedRec& b) { return a.area > b.area; });
     for (std::size_t i = 1; i < recs.size(); ++i) {
         ContainedRec& b = recs[i];
-        if (b.area > maxArea) continue;          // 鍙垹"灏?杞粨
+        if (b.area > maxArea) continue;          // 只删"小"轮廓
         for (std::size_t j = 0; j < i; ++j) {
             const ContainedRec& a = recs[j];
             if (a.area <= b.area) continue;
             if (a.env.MinX > b.env.MinX || a.env.MinY > b.env.MinY ||
                 a.env.MaxX < b.env.MaxX || a.env.MaxY < b.env.MaxY) {
-                continue;                         // envelope 棰勭瓫锛欰 鍖呬笉浣?B 鐨勫鎺ョ煩褰㈠垯璺宠繃
+                continue;                         // envelope 预筛：A 包不住 B 的外接矩形则跳过
             }
             if (a.geom->Contains(b.geom.get())) {
                 b.remove = true;
@@ -3615,6 +3702,7 @@ long long RemoveContainedSmallFootprints(const std::string& shpPath, double maxA
     return removed;
 }
 
+// 作用：把支撑点按要素 fid 着色后追加进调试收集器。
 void AppendDebugSupportPoints(
     const std::vector<pcl::PointXYZ>& support,
     GIntBig sourceFid,
@@ -3643,7 +3731,8 @@ void AppendDebugSupportPoints(
 }
 
 // ===== RegularizeGeometry =====
-// 浣滅敤锛氬涓€涓?OGR 鍑犱綍(鍗曞杈瑰舰 / 澶氬杈瑰舰)鍋氳鍒欏寲锛岃繑鍥炴柊鐨勫嚑浣曘€?//       鍏跺畠绫诲瀷鐩存帴鍏嬮殕杩斿洖銆?
+// 作用：对一个 OGR 几何(单多边形/多多边形)做规则化，返回新的几何。
+//       其它类型直接克隆返回。
 std::unique_ptr<OGRGeometry> RegularizeGeometry(
     OGRGeometry* geometry,
     const MyCloudPtr& sampled,
@@ -3741,7 +3830,7 @@ std::unique_ptr<OGRGeometry> RegularizeGeometry(
 }
 
 // ===== CopyFields =====
-// 浣滅敤锛氭妸杈撳叆鍥惧眰鐨勬墍鏈夊睘鎬у瓧娈电粨鏋勫鍒跺埌杈撳嚭鍥惧眰(鍙鍒跺瓧娈靛畾涔夛紝涓嶅鍒跺€?銆?
+// 作用：把输入图层的所有属性字段结构复制到输出图层(只复制字段定义，不复制值)。
 void CopyFields(OGRLayer* inputLayer, OGRLayer* outputLayer)
 {
     OGRFeatureDefn* defn = inputLayer->GetLayerDefn();
@@ -3752,7 +3841,7 @@ void CopyFields(OGRLayer* inputLayer, OGRLayer* outputLayer)
 }
 
 // ===== CopyFieldValues =====
-// 浣滅敤锛氭妸涓€涓绱犵殑鎵€鏈夊睘鎬у€煎鍒跺埌鍙︿竴涓绱?鎸夊瓧娈典笅鏍囧搴?銆?
+// 作用：把一个要素的所有属性值复制到另一个要素(按字段下标对应)。
 void CopyFieldValues(OGRFeature* src, OGRFeature* dst)
 {
     for (int i = 0; i < src->GetFieldCount(); ++i) {
@@ -3760,9 +3849,9 @@ void CopyFieldValues(OGRFeature* src, OGRFeature* dst)
     }
 }
 
-// Adds or refreshes an "area" attribute (square metres) on every feature of
-// the shapefile. Used to stamp the initial outline after the mask stages:
-// merge/split recreate features, so areas written earlier would go stale.
+// 给 Shapefile 的每个要素新增或刷新 "area" 属性(平方米)。
+// 掩膜各阶段会重建要素，中途写的面积会过期，
+// 故在全部阶段结束后统一盖章。
 bool StampAreaField(const std::string& shpPath)
 {
     GDALDataset* dataset = static_cast<GDALDataset*>(
@@ -3799,13 +3888,14 @@ bool StampAreaField(const std::string& shpPath)
     return updated > 0;
 }
 
+// 作用：把每栋的最优假设写出为 debug_best_hypothesis.shp。
 bool SaveDebugBestHypotheses(
     const std::filesystem::path& outputPath,
     const RegularizationDebugCollector& debug,
     OGRSpatialReference* spatialRef,
     const Eigen::Vector3d& metadataOffset)
 {
-    // 鍒犻櫎鏃ф枃浠讹紝閬垮厤鏈娌℃湁鏈夋晥璁板綍鏃舵畫鐣欎笂涓€娆¤皟璇曠粨鏋溿€?
+    // 删除旧文件，避免本次没有有效记录时残留上一次调试结果。
 if (!RemoveShapefileFamily(outputPath)) return false;
     if (debug.hypotheses.empty()) return true;
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
@@ -3836,8 +3926,8 @@ if (!RemoveShapefileFamily(outputPath)) return false;
         if (!polygon) continue;
         OGRFeature* feature = OGRFeature::CreateFeature(defn);
         feature->SetField("src_fid", static_cast<GIntBig>(record.sourceFid));
-        // Uniform stable building id (joins with initial_building_outline and
-        // the regularized output; equals src_fid for raster-mode inputs).
+        // 统一的稳定建筑 id(可与 initial_building_outline 和
+        // 规则化输出关联；栅格模式下与 src_fid 相同)。
         feature->SetField("id", static_cast<GIntBig>(record.sourceFid));
         feature->SetField("ring_id", record.ringIndex);
         feature->SetField("npoints", static_cast<int>(record.points.size()));
@@ -3850,6 +3940,7 @@ if (!RemoveShapefileFamily(outputPath)) return false;
     return true;
 }
 
+// 作用：把调试支撑点云保存为 LAS。
 bool SaveDebugSupportLas(
     const std::filesystem::path& outputPath,
     const RegularizationDebugCollector& debug,
@@ -3871,19 +3962,20 @@ bool SaveDebugSupportLas(
 }
 
 // ============================================================================
-// Mask-only mode: full regularization without any OSGB dependency.
-// TIF -> vectorized initial outlines -> uniform arc-length contour residual
-// points -> the SAME outlineRegular::regular_Contour pipeline (VDP, direction
-// decision with the contour chord histogram as evidence, Ceres) -> output.
+// Mask-only 模式：完全不依赖 OSGB 的规则化。
+// TIF -> 矢量化初始轮廓 -> 等弧长轮廓残差
+// 点 -> 复用同一个 outlineRegular::regular_Contour 管线(VDP、
+// 以轮廓弦方向直方图为证据的方向判定、Ceres) -> 输出。
 // ============================================================================
 
 
-// Uniform residual-point spacing along the initial outline (metres). Uniform
-// arc-length spacing removes the staircase vertex-density bias of raster
-// outlines; chord directions between points 1-2.5 m apart also act as a
-// de-staircased edge-direction histogram.
+// 沿初始轮廓的均匀残差点间距(米)。等弧长
+// 均匀布点消除栅格轮廓的楼梯顶点密度偏置；
+// 点间距 1-2.5m 的弦方向同时充当
+// 去楼梯化的边方向直方图。
 const double kMaskResidualSpacing = 0.5;
 
+// 作用：判断 Mask-only 结果环是否自交(线段两两相交测试)。
 bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring)
 {
     const std::size_t n = ring.size();
@@ -3905,8 +3997,8 @@ bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring)
 
 enum class MaskOnlyFallback { Final = 0, Hypothesis, Initial };
 
-// Mask-only regularization entry: contour points are BOTH the residual cloud
-// and the direction evidence for the unchanged regular_Contour pipeline.
+// Mask-only 规则化入口：轮廓点既是残差点云，
+// 也是方向证据，供原封不动的 regular_Contour 管线使用。
 std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     const std::vector<pcl::PointXYZ>& ring,
     long long sourceFid,
@@ -3947,8 +4039,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     outlineRegular regularizer(ring, contourCloud, weights);
     regularizer.setSourceFeatureId(sourceFid);
     regularizer.setSupportDirectionHint(contourDir, contourRatio, contourPairs);
-    // No ortho evidence arbitrates curve detection on raster staircases;
-    // mask-only must not restore pseudo curves.
+    // 无正射证据仲裁栅格楼梯上的曲线检测；
+    // Mask-only 不得恢复伪曲线。
     regularizer.setCurveRestorationEnabled(false);
     regularizer.regular_Contour();
 
@@ -3990,6 +4082,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     return result;
 }
 
+// 作用：Mask-only 模式主入口：TIF→初始轮廓→等弧长残差点→复用规则化→输出。
 int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVectorIn)
 {
     std::cout << "[Mode] Mask-only" << std::endl;
@@ -3997,7 +4090,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     std::cout << "[MaskOnly] output_shp=" << outputVectorIn << std::endl;
     GDALAllRegister();
 
-    // GeoTransform + spatial reference (mandatory: outputs keep the TIF SRS).
+    // 仿射变换 + 空间参考(必需：输出保留 TIF 的坐标系)。
     GDALDataset* tif = static_cast<GDALDataset*>(
         GDALOpenEx(inputRaster.c_str(), GDAL_OF_RASTER, nullptr, nullptr, nullptr));
     if (!tif) {
@@ -4024,7 +4117,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
               << "," << gt[3] << "," << gt[4] << "," << gt[5] << std::endl;
     GDALClose(tif);
 
-    // Output preparation: debug files go next to the output Shapefile.
+    // 输出准备：调试文件放在输出 Shapefile 旁边。
     std::filesystem::path outPath(outputVectorIn);
     std::error_code dirEc;
     std::filesystem::create_directories(outPath.parent_path(), dirEc);
@@ -4052,8 +4145,8 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                   << std::endl;
         return 1;
     }
-    // The over-segmentation merge stage relies on OSGB seam evidence; without
-    // it, blind merging risks fusing real neighbours, so mask-only skips it.
+    // 过分割合并阶段依赖 OSGB 接缝证据；没有
+    // 证据的盲合并有融合真实邻居的风险，故 Mask-only 跳过。
     std::cout << "[MaskOnly] merge stage skipped: requires OSGB seam evidence" << std::endl;
     NarrowNeckSplitStats neckStats;
     if (!SplitInitialOutlinesAtNarrowNecks(initialPath.string(), neckStats)) {
@@ -4078,8 +4171,8 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
         GDALClose(inDataset);
         return 1;
     }
-    // Clone the SRS before closing the dataset: the debug hypothesis writer
-    // runs after inDataset is gone and must still carry the TIF reference.
+    // 关闭数据集前克隆 SRS：调试假设写出器
+    // 在 inDataset 销毁后运行，仍需携带 TIF 参考系。
     OGRSpatialReference* srsClone = inLayer->GetSpatialRef()
         ? inLayer->GetSpatialRef()->Clone()
         : nullptr;
@@ -4278,7 +4371,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
 } // namespace
 
 // ===== main =====
-// 浣滅敤锛氱▼搴忓叆鍙ｃ€傝 OSGB -> 浠?TIF 鎻愬彇鍒濆杞粨 -> 鎸夋ā鍨嬭繃婊?-> 瑙勫垯鍖?-> 鍐欏嚭 SHP銆?
+// 作用：程序入口。读 OSGB -> 从 TIF 提取初始轮廓 -> 按模型过滤 -> 规则化 -> 写出 SHP。
 int main(int argc, char* argv[])
 {
     SetConsoleOutputCP(65001u);
@@ -4343,12 +4436,13 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // ---- 2) 鍒濆鍖?GDAL锛岀‘淇濊緭鍑虹洰褰曞瓨鍦紝鎵撳嵃璺緞 ----
+    // ---- 2) 初始化 GDAL，确保输出目录存在，打印路径 ----
     GDALAllRegister();
     std::cout << "Input OSGB dir: " << osgbDir << std::endl;
 
-    // ---- 2.5) 閫?metadata XML锛岃В鏋愬湴鐞嗗弬鑰?SRSOrigin) ----
-    //   OSGB 鏄浉瀵瑰潗鏍囷紝鐐逛簯涔熸寜鐩稿鍧愭爣閲囨牱锛涜繖閲屽厛鎷垮埌 offset锛屼緵绋嶅悗淇濆瓨 PLY 鏃?    //   鍙犲姞鎴愪笘鐣屽潗鏍囷紝浠ュ強鍚庣画鎶婁笘鐣屽潗鏍囩殑澶氳竟褰㈡崲绠楀洖鐩稿鍧愭爣銆?
+    // ---- 2.5) 读 metadata XML，解析地理参考(SRSOrigin) ----
+    //   OSGB 是相对坐标，点云也按相对坐标采样；这里先拿到 offset，供稍后保存 LAS 时
+    //   叠加成世界坐标，以及后续把世界坐标的多边形换算回相对坐标。
 std::cout << "Select metadata XML file..." << std::endl;
     Eigen::Vector3d metadataOffset = Eigen::Vector3d::Zero();
     if (PickOpenXmlFile(metadataXml)) {
@@ -4359,7 +4453,7 @@ std::cout << "Select metadata XML file..." << std::endl;
         std::cout << "No metadata XML selected. Using metadata offset 0,0,0." << std::endl;
     }
 
-    // ---- 3) 璇?OSGB锛岄噰鏍锋垚鐐逛簯(鍚硶鍚戦噺) ----
+    // ---- 3) 读 OSGB，采样成点云(含法向量) ----
     auto s0 = std::chrono::steady_clock::now();
     MyCloudPtr sampled = std::make_shared<MyCloud>();
     if (!OSGMeshSampler::convertOSGBToMyCloud(osgbDir, sampled, kSampleDensity, kMaxPagedLODDepth) ||
@@ -4375,7 +4469,7 @@ std::cout << "Select metadata XML file..." << std::endl;
         return 1;
     }
 
-    // ---- 3.5) 寤轰竴娆?2D KdTree(Z 缃?0)锛屼緵鍚庣画姣忎釜澶氳竟褰㈠仛閭诲煙鏌ヨ ----
+    // ---- 3.5) 建一次 2D KdTree(Z 置 0)，供后续每个多边形做邻域查询 ----
     auto kt0 = std::chrono::steady_clock::now();
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud2d(new pcl::PointCloud<pcl::PointXYZ>);
     cloud2d->resize(sampled->cloud->size());
@@ -4392,21 +4486,25 @@ std::cout << "Select metadata XML file..." << std::endl;
               << std::chrono::duration<double, std::milli>(kt1 - kt0).count()
               << " ms (" << cloud2d->size() << " points)" << std::endl;
 
-    // ---- 3.6) 鍙€夛細淇濆瓨閲囨牱鐐逛簯涓?LAS(鐐规牸寮?3=GPS+RGB锛屼簩杩涘埗, 鍚湴鐞嗗弬鑰?offset) ----
-    //          榛樿鏀惧湪 build_deps_release\src\sampled_cloud.las锛?    //          涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + SRSOrigin(offset 鍐欏叆 LAS 鏂囦欢澶?銆?    //          鍐呭瓨閲岀殑 sampled 浠嶄繚鎸佺浉瀵瑰潗鏍囷紝鍚庣画澶勭悊涓嶅彉銆?
+    // ---- 3.6) 可选：保存采样点云为 LAS(点格式 3=GPS+RGB，二进制，含地理参考 offset) ----
+    //          默认放在 build_deps_release\src\sampled_cloud.las；
+    //          世界坐标 = 相对坐标 + SRSOrigin(offset 写入 LAS 文件头)。
+    //          内存里的 sampled 仍保持相对坐标，后续处理不变。
 std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
-              << " 涓偣銆傛槸鍚︿繚瀛樹负 LAS? (y/n): ";
+              << " 个点。是否保存为 LAS? (y/n): ";
     char saveCloud = 'n';
     std::cin >> saveCloud;
     if (saveCloud == 'y' || saveCloud == 'Y') {
         char exePath[1024] = {0};
         GetModuleFileNameA(nullptr, exePath, 1024);
-        // exe 鍦?build_deps_release\Release\锛屼笂涓€绾у啀杩?src = build_deps_release\src
+        // exe 在 build_deps_release\Release\，上一级再进 src = build_deps_release\src
         std::filesystem::path lasDir = std::filesystem::path(exePath).parent_path() / ".." / "src";
         std::filesystem::create_directories(lasDir);
         std::string lasPath = (lasDir / "sampled_cloud.las").string();
 
-        // LAS 鏂囦欢澶?offset = 鍦扮悊鍙傝€?SRSOrigin)锛汼aveSampledCloudAsLas 鍐呴儴鎸?        // 涓栫晫鍧愭爣 = 鐩稿鍧愭爣 + offset 鍐欏叆锛屼笉鏀瑰姩 sampled->cloud 鐨勭浉瀵瑰潗鏍囥€?        sampled->offset = metadataOffset;
+        // LAS 文件头 offset = 地理参考(SRSOrigin)；SaveSampledCloudAsLas 内部按
+        // 世界坐标 = 相对坐标 + offset 写入，不改动 sampled->cloud 的相对坐标。
+        sampled->offset = metadataOffset;
         sampled->hasoffset = true;
 
         std::cout << "姝ｅ湪淇濆瓨鐐逛簯鍒? " << lasPath << " ..." << std::endl;
@@ -4416,9 +4514,9 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         if (ok) {
             std::error_code ec;
             auto sz = std::filesystem::file_size(lasPath, ec);
-            std::cout << "[LAS] 宸蹭繚瀛? " << sampled->cloud->size() << " points, 鑰楁椂 "
+            std::cout << "[LAS] 已保存 " << sampled->cloud->size() << " points, 耗时 "
                       << std::chrono::duration<double>(p1 - p0).count() << " s"
-                      << (ec ? "" : (", 鏂囦欢 " + std::to_string(sz) + " bytes")) << std::endl;
+                      << (ec ? "" : (", 文件 " + std::to_string(sz) + " bytes")) << std::endl;
         } else {
             std::cerr << "[LAS] save failed." << std::endl;
         }
@@ -4504,7 +4602,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
                   << std::endl;
     }
 
-    // ---- 鍚堝苟鏀舵暃鍚庯細鍚告敹琚ぇ杞粨瀹屽叏鍖呭惈鐨勫唴閮ㄥ皬杞粨(鍒嗗壊/鏍呮牸鍖栨畫鐣? ----
+    // ---- 合并收敛后：吸收被大轮廓完全包含的内部小轮廓(分色/栅格化残留) ----
     const long long containedFootprintsRemoved =
         RemoveContainedSmallFootprints(inputVector, kContainedFootprintMaxArea);
     if (containedFootprintsRemoved > 0) {
@@ -4616,7 +4714,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         return 1;
     }
 
-    // ---- 5) 鍒涘缓杈撳嚭 Shapefile(ESRI Shapefile 椹卞姩锛屼笁缁撮潰 wkbPolygon25D) ----
+    // ---- 5) 创建输出 Shapefile(ESRI Shapefile 驱动，三维面 wkbPolygon25D) ----
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
     if (!driver) {
         std::cerr << "Cannot find ESRI Shapefile driver." << std::endl;
@@ -4640,7 +4738,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
         return 1;
     }
 
-    CopyFields(inLayer, outLayer);   // 澶嶅埗瀛楁缁撴瀯
+    CopyFields(inLayer, outLayer);   // 复制字段结构
     // Ensure the output carries the stable building id (assigned once at mask
     // vectorization, propagated through merge/split stages); fall back to the
     // input FID when the field is absent (existing-vector input mode).
@@ -4671,7 +4769,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
               << std::chrono::duration<double>(ownershipEnd - ownershipStart).count()
               << " s" << std::endl;
 
-    // ---- 6) 閬嶅巻姣忎釜寤虹瓚鐗╄绱狅細瑙勫垯鍖栧嚑浣?+ 澶嶅埗灞炴€?+ 鍐欏嚭 ----
+    // ---- 6) 遍历每个建筑物要素：规则化几何 + 复制属性 + 写出 ----
     int total = 0;
     int ok = 0;
     RegularizationDebugCollector debugCollector;
@@ -4769,7 +4867,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
     //               << ", max shift=" << overlapStats.maxShiftDistance << std::endl;
     // }
 
-    // ---- 璁℃椂姹囨€伙細瀹氫綅"鏀拺鐐规彁鍙?杩樻槸"瑙勫垯鍖栦紭鍖?鏄摱棰?----
+    // ---- 计时汇总：定位"支撑点提取"还是"规则化优化"是瓶颈 ----
     double loopSec = std::chrono::duration<double>(loopEnd - loopStart).count();
     std::cout << "[Timing] feature loop: " << loopSec << " s (" << total << " features)" << std::endl;
     std::cout << "[Timing]   support extraction: " << g_supportTime << " s" << std::endl;
@@ -4791,7 +4889,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
     GDALClose(outDataset);
     GDALClose(inDataset);
 
-    // ---- 7) 鎵撳嵃缁撴灉缁熻 ----
+    // ---- 7) 打印结果统计 ----
     std::cout << "Regularization finished. success=" << ok << " / total=" << total << std::endl;
     std::cout << "Output: " << outputVector << std::endl;
     return ok > 0 ? 0 : 2;

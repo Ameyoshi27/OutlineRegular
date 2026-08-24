@@ -90,31 +90,31 @@ constexpr double kSupportDirectionPairRadius = 2.5;
 constexpr double kSupportDirectionMinPairDistance = 0.35;
 constexpr double kSupportDirectionStrongPeakRatio = 0.14; // Uniform +/-5 degree background is 11/90.
 constexpr double kSupportDirectionCorrectionDeg = 9.0;
-// Wall corrections beyond this magnitude are suspect: with sparse wall
-// evidence the histogram peak can be a short anomalous wall fragment
-// (observed 15-45 deg "corrections" from only 400-8000 pairs rotating
-// buildings away from outline/hypothesis/wall majority). Genuine
-// corrections (validated case: 32.1 -> 16.5 deg) stay below this cap.
+// 超过此幅度的墙面纠偏视为可疑：墙面证据稀疏时，
+// 直方图峰可能来自一小段异常墙碎片
+// (实测：仅 400-8000 配对造成 15-45° 的"纠偏"，把建筑
+// 转离轮廓/假设/墙面主体)。真正的纠偏
+// (已验证案例：32.1°→16.5°)不会超过此上限。
 constexpr double kWallDirectionCorrectionMaxDeg = 25.0;
-// Original-ring PCA gate: a raster-staircase outline's overall trend is a
-// stable direction prior for elongated footprints (validated to ~0.5 deg on
-// real cases). A direction selection that deviates beyond these gates needs
-// strong wall evidence, otherwise it snaps back to the ring trend. Blocks the
-// "VDP hull diagonal" failure mode (18 deg chosen for a ~12 deg building).
+// 原始轮廓 PCA 门控：栅格楼梯轮廓的整体趋势
+// 是拉长轮廓的稳定方向先验(真实数据上验证到 ~0.5°)。
+// 方向选择偏离先验超过门槛时必须有
+// 强墙面证据，否则回退到轮廓趋势。用于拦截
+// "VDP 凸包对角线"失效模式(12°建筑被选成18°)。
 constexpr double kPcaDirectionReliableAxisRatio = 1.6; // elongation (std ratio) for the PCA fallback gate
 constexpr double kPcaDirectionGateStrongDeg = 5.0;
-// Small buildings run the normal pipeline (the oriented-rectangle fast path
-// was removed) but their best hypothesis must regularize to ONE main
-// direction: multi-direction regularization produces diagonal edges that
-// look wrong on small footprints. Same value as the former rectangle
-// fast-path threshold in main.cpp.
+// 小建筑走正常管线(main.cpp 的方向矩形快通道
+// 已移除)，但其最优假设必须按单一主方向
+// 规则化：多方向规则化产生斜边，
+// 在小轮廓上明显不对。数值沿用原
+// main.cpp 矩形快通道阈值。
 constexpr double kSmallBuildingSingleDirectionArea = 60.0;
-// Evidence-backed notch protection: real rectangular notches (courtyard bays,
-// setbacks) survive the energy hypothesis but get dissolved by the orthogonal
-// clean-up chain (topology repair at repair_distance, axis-collinear vertex
-// erasure in forceOrthogonalPolygonToAngle). A notch is protected only when
-// it is deep enough to be a building feature (not mask noise) AND the mesh
-// support cloud confirms points along its walls.
+// 证据支撑的缺口保护：真实矩形缺口(退台/院湾)
+// 在能量假设中保留，却被正交清理链抹掉
+// (repair_distance 尺度的拓扑修复、forceOrthogonal-
+// PolygonToAngle 的同轴删点)。只有当缺口足够深
+// (是建筑特征而非掩膜噪声)且网格
+// 支撑点云确认缺口壁上有支撑时才保护。
 constexpr double kNotchMinDepthFactor = 0.6;    // x tuning.repair_distance
 constexpr double kNotchMinDepthFloor = 1.0;     // meters
 constexpr double kNotchMaxWidth = 15.0;         // meters; larger concavities are wings, not notches
@@ -219,6 +219,7 @@ Polygon_2 toCgalPolygon2D(const std::vector<pcl::PointXYZ>& pts)
     return polygon;
 }
 
+// 作用：含内环多边形的总面积。
 double polygonWithHolesArea2D(const Polygon_with_holes_2& polygon)
 {
     double area = std::abs(CGAL::to_double(polygon.outer_boundary().area()));
@@ -228,6 +229,7 @@ double polygonWithHolesArea2D(const Polygon_with_holes_2& polygon)
     return std::max(0.0, area);
 }
 
+// 作用：两多边形的 IoU(交并比)。
 double polygonIoU2D(const std::vector<pcl::PointXYZ>& a,
     const std::vector<pcl::PointXYZ>& b)
 {
@@ -448,6 +450,7 @@ struct HausdorffMbrCandidate {
     double score = std::numeric_limits<double>::max();
 };
 
+// 作用：单调链法求二维凸包。
 std::vector<pcl::PointXYZ> convexHull2DMonotonic(std::vector<pcl::PointXYZ> points)
 {
     std::vector<pcl::PointXYZ> hull;
@@ -490,6 +493,7 @@ std::vector<pcl::PointXYZ> convexHull2DMonotonic(std::vector<pcl::PointXYZ> poin
     return hull;
 }
 
+// 作用：点到方向外接矩形边界的距离。
 double distancePointToMbrBoundary(
     const pcl::PointXYZ& p,
     double angle,
@@ -510,6 +514,7 @@ double distancePointToMbrBoundary(
     return std::min({ u - min_u, max_u - u, v - min_v, max_v - v });
 }
 
+// 作用：计算某方向的 Hausdorff-MBR 候选评分。
 bool computeHausdorffMbrCandidate(
     const std::vector<pcl::PointXYZ>& polygon,
     double angle,
@@ -579,6 +584,7 @@ bool computeHausdorffMbrCandidate(
     return std::isfinite(candidate.score);
 }
 
+// 作用：用 Hausdorff-MBR 评分从候选角中选出主方向(最多 max_angles 个)。
 std::vector<double> hausdorffMbrLineAngles2D(
     const std::vector<pcl::PointXYZ>& polygon,
     double resolution,
@@ -894,9 +900,9 @@ OutlineTuning makeOutlineTuning(double resolution, double area)
     tuning.association_distance = clampDouble(std::max(2.5 * resolution, 0.012 * scale), 0.2, 2.0);
     tuning.prune_distance = clampDouble(std::max(3.0 * resolution, 0.008 * scale), 0.2, 2.0);
     tuning.fine_prune_distance = clampDouble(std::max(1.5 * resolution, 0.004 * scale), 0.1, 1.0);
-    // Topology artifacts are governed more by the footprint scale than by the
-    // sampled point spacing.  The previous 0.028 * scale term left almost all
-    // medium-sized buildings pinned to the 1 m lower bound.
+    // 拓扑伪影更多由轮廓尺度而非采样点距决定。
+    // 之前的 0.028*scale 使多数中等建筑
+    // 都被钉在 1m 下限上。
     tuning.repair_distance = clampDouble(std::max(8.0 * resolution, 0.10 * scale), 0.8, 4.0);
     tuning.huber_delta = clampDouble(std::max(1.5 * resolution, 0.05), 0.05, 0.5);
     tuning.mid_anchor_weight = clampDouble(0.5 / std::max(tuning.huber_delta, 0.05), 2.0, 8.0);
@@ -922,8 +928,8 @@ std::vector<pcl::PointXYZ> robustEdgeInliers(
     const double edge_angle = std::atan2(edge_end.y - edge_start.y, edge_end.x - edge_start.x);
     const double max_angle_error = 20.0 * M_PI / 180.0;
 
-    // Iteratively fit a 2D TLS line and reject points outside a robust MAD band.
-    // The direction gate prevents a nearby facade from replacing the mask edge.
+    // 迭代拟合 2D TLS 直线，剔除鲁棒 MAD 带外的点。
+    // 方向门防止邻近立面替换掩膜边。
     for (int iteration = 0; iteration < 2; ++iteration) {
         double cx = 0.0, cy = 0.0;
         for (const auto& p : active) {
@@ -972,7 +978,7 @@ std::vector<pcl::PointXYZ> robustEdgeInliers(
         active.swap(filtered);
     }
 
-    // Keep comparable residual counts per edge and sample across its full span.
+    // 让每条边的残差数量可比，并沿边全长采样。
     constexpr size_t kMaxResidualsPerEdge = 120;
     if (active.size() > kMaxResidualsPerEdge) {
         const double dx = edge_end.x - edge_start.x;
@@ -1544,7 +1550,7 @@ bool hasCredibleMultiDirectionChains(
         return false;
     }
 
-    // Linearize the ring from the first constrained edge and merge same-direction runs.
+    // 从第一条受约束边开始线性化环，合并同向连续段。
     for (size_t offset = 0; offset < n; ) {
         const size_t idx = (start + offset) % n;
         const auto& edge = edges[idx];
@@ -1896,7 +1902,7 @@ std::vector<NotchFeature> DetectEvidenceBackedNotches(
     const std::size_t n = polygon.size();
     if (n < 5 || !support || support->empty()) return notches;
 
-    // Orientation-majority reflex detection.
+    // 按多数转向符号判定凹顶点。
     double turnSum = 0.0;
     std::vector<double> turns(n, 0.0);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1914,10 +1920,10 @@ std::vector<NotchFeature> DetectEvidenceBackedNotches(
     }
     if (reflex.size() < 2) return notches;
 
-    // Candidate spans between consecutive nearby reflex vertices, then merge
-    // chains that share vertices: the VDP hypothesis often approximates one
-    // rectangular notch as a 2-3 vertex reflex chain, and each sub-notch
-    // alone is too small to protect.
+    // 相邻近距凹顶点构成候选段，然后合并
+    // 共享顶点的链：VDP 假设常把一个
+    // 矩形缺口近似为 2-3 个凹角的链，而每个子缺口
+    // 单独看都太小，保护不住。
     struct NotchSpan {
         std::size_t entry;
         std::size_t exit;
@@ -1963,7 +1969,7 @@ std::vector<NotchFeature> DetectEvidenceBackedNotches(
         if (depth < minDepth) continue;
         if (width < 0.5 || width > maxWidth) continue;
 
-        // Evidence: support points near the notch's walls and bottom.
+        // 证据：缺口壁和底边附近的支撑点。
         int supportCount = 0;
         for (const auto& p : support->points) {
             double best = std::numeric_limits<double>::max();
@@ -1994,8 +2000,8 @@ std::vector<NotchFeature> DetectEvidenceBackedNotches(
     return notches;
 }
 
-// True when the candidate still carries an edge corresponding to the notch
-// bottom (midpoint + direction + length match). A dissolved notch fails this.
+// 候选多边形仍保留与缺口底边对应的边
+// (中点+方向+长度匹配)时为真。被抹掉的缺口不满足。
 bool NotchPreservedInCandidate(
     const std::vector<pcl::PointXYZ>& candidate,
     const NotchFeature& notch)
@@ -2095,12 +2101,12 @@ bool DetectSpikeStructure(
 
     const double ux = chordX / chordLen;
     const double uy = chordY / chordLen;
-    // Spike height: perpendicular distance of V from the chord line.
+    // 尖刺高度：V 到弦线的垂距。
     const double crossPN = chordX * (V.y - P.y) - chordY * (V.x - P.x);
     const double height = std::abs(crossPN) / chordLen;
     if (height < kSpikeMinDepth || height > kSpikeMaxDepth) return false;
 
-    // Orientation: polygon majority turn sign; V on the exterior side => notch.
+    // 朝向：多边形多数转向符号；V 在外侧 => 凹口。
     double turnSum = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
         const auto& a = polygon[i];
@@ -2113,11 +2119,11 @@ bool DetectSpikeStructure(
     const double sideSign = crossPN >= 0.0 ? 1.0 : -1.0;
     const bool isNotch = sideSign * majority < 0.0;
 
-    // Local frame: v points toward V.
+    // 局部坐标系：v 轴指向 V。
     const double vx = -uy * sideSign;
     const double vy = ux * sideSign;
 
-    // Window of original points around the chord.
+    // 弦线附近的原始点窗口。
     std::vector<std::size_t> window;
     for (std::size_t i = 0; i < original.size(); ++i) {
         const double dx = original[i].x - P.x;
@@ -2144,7 +2150,7 @@ bool DetectSpikeStructure(
     }
     if (vMax < 0.75 * height) return false;   // spike not backed by raw data
 
-    // Bottom band: deepest points define the opening [uLo, uHi].
+    // 底边带：最深的点群确定开口 [uLo, uHi]。
     std::vector<double> bottomU;
     for (std::size_t i : window) {
         double u = 0.0, v = 0.0;
@@ -2159,7 +2165,7 @@ bool DetectSpikeStructure(
     if (width < kRepairMinWidth || width > kRepairMaxWidth) return false;
     if (uLo < -0.8 || uHi > chordLen + 0.8) return false;
 
-    // Walls: points hugging the u-bounds and spanning down in v.
+    // 墙壁：贴着 u 边界、沿 v 有跨度的点。
     int rawLeft = 0, rawRight = 0, rawBottom = 0;
     double leftVMin = 1e9, leftVMax = -1e9;
     double rightVMin = 1e9, rightVMax = -1e9;
@@ -2183,7 +2189,7 @@ bool DetectSpikeStructure(
         return false;
     }
 
-    // Corners back in world coordinates.
+    // 角点换回世界坐标。
     auto toXY = [&](double u, double v, pcl::PointXYZ& p) {
         p.x = static_cast<float>(P.x + u * ux + v * vx);
         p.y = static_cast<float>(P.y + u * uy + v * vy);
@@ -2202,8 +2208,8 @@ bool DetectSpikeStructure(
     toXY(uHi, vMax, s.c3);
     toXY(uHi, 0.0, s.c4);
 
-    // Mesh support near the three new segments (weak branch below when the
-    // area is occluded in the model).
+    // 三条新边附近的网格支撑(该处点云被
+    // 遮挡时走下方的弱分支)。
     if (support && !support->empty()) {
         const pcl::PointXYZ seg[3][2] = {{s.c1, s.c2}, {s.c2, s.c3}, {s.c3, s.c4}};
         for (const auto& p : support->points) {
@@ -2228,7 +2234,7 @@ bool DetectSpikeStructure(
     return true;
 }
 
-// Global repair statistics, printed once per run.
+// 全局修复统计，每次运行打印一次。
 long long g_repairFeaturesExamined = 0;
 long long g_repairFeaturesWithCandidates = 0;
 long long g_repairFeaturesRepaired = 0;
@@ -2237,9 +2243,9 @@ long long g_repairAccepted = 0;
 long long g_repairVerticesAdded = 0;
 long long g_repairMaxVerticesAdded = 0;
 
-// Greedy repair: each round picks the best-scoring structure whose
-// data/support gain beats the added-vertex cost, re-detects, and stops at
-// kRepairMaxPerPolygon insertions.
+// 贪心修复：每轮选出净收益最高、
+// 数据/支撑收益超过新增顶点代价的结构，
+// 重新检测，最多插入 kRepairMaxPerPolygon 处。
 void RepairHypothesisStructures(
     std::vector<pcl::PointXYZ>& polygon,
     const std::vector<pcl::PointXYZ>& original,
@@ -2267,7 +2273,7 @@ void RepairHypothesisStructures(
             anyCandidate = true;
             ++g_repairCandidatesDetected;
 
-            // Build repaired polygon: P ... V ... N  ->  P c1 c2 c3 c4 N.
+            // 构建修复后的多边形：P ... V ... N -> P c1 c2 c3 c4 N。
             std::vector<pcl::PointXYZ> candidate;
             candidate.reserve(n + 3);
             for (std::size_t k = 0; k < n; ++k) {
@@ -2294,8 +2300,8 @@ void RepairHypothesisStructures(
             }
             if (minEdge < kRepairMinNewEdge) continue;
 
-            // Gains: original points near the spike and nearby support points
-            // must get closer to the boundary by more than the vertex cost.
+            // 收益：尖刺附近的原始点和支撑点
+            // 到边界的距离下降须超过顶点代价。
             double dataGain = 0.0;
             double supportGain = 0.0;
             std::vector<std::size_t> rawIdx;
@@ -2421,9 +2427,9 @@ bool forceOrthogonalPolygonToAngle(
     // incoming and outgoing edges would snap to the same axis before solving
     // line intersections; otherwise the two lines are parallel and no corner
     // exists. Odd vertex counts are resolved by the same cyclic pass.
-    // Protected (evidence-backed notch) vertices are never erased here; if a
-    // protected vertex cannot fit the alternating pattern the reconstruction
-    // below fails and the caller falls back to another candidate source.
+    // 受保护的(证据支撑缺口)顶点绝不在此时删除；
+    // 若保护顶点无法满足交替轴模式，下方重建
+    // 失败，调用方换下一个候选源。
     bool changed = true;
     while (changed && working.size() >= 4) {
         changed = false;
@@ -3289,8 +3295,8 @@ SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
 }
 }
 
-// Run-level summary of structure-aware hypothesis repairs (impl lives in the
-// anonymous namespace above).
+// 结构感知假设修复的运行级汇总(实现在上面的
+// 匿名命名空间里)。
 void outlineRegular::PrintHypothesisRepairSummary()
 {
     PrintHypothesisRepairStats();
@@ -3939,12 +3945,12 @@ void outlineRegular::regular_Contour()
         pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud(new pcl::PointCloud<pcl::PointXYZ>);
         for (auto& op : best_hypothesis) { input_cloud->points.push_back(op); }
 
-        // Structure-aware hypothesis repair (R1): VDP collapses real
+        // 结构感知假设修复(R1)：VDP 把真实矩形缺口/
         // rectangular notches/protrusions into single spike vertices, which
         // the downstream orthogonal chain cannot recover. Runs AFTER the
-        // pre-cleanup (so the topology repair cannot dissolve freshly
-        // rebuilt structures) and BEFORE fallback_hypothesis is captured
-        // (so acceptance references and notch protection see them).
+        // fallback_hypothesis 捕获之前执行
+        // (拓扑修复不会吃掉新建结构，
+        // 验收参考与缺口保护都能看到它们)。
         {
             const std::size_t beforeRepair = best_hypothesis.size();
             RepairHypothesisStructures(
@@ -4011,10 +4017,10 @@ void outlineRegular::regular_Contour()
             }
         }
 
-        // Small footprints (by BEST HYPOTHESIS area, replacing the former
-        // rectangle fast path in main.cpp): force single-direction
-        // regularization so the multi-direction branch cannot produce
-        // diagonal edges on them.
+        // 小轮廓(按最优假设面积判定，取代原先
+        // main.cpp 的矩形快通道)：强制单一主方向
+        // 规则化，避免多方向分支产生
+        // 斜边。
         const double smallBuildingHypothesisArea =
             polygonArea2D(fallback_hypothesis);
         const bool forceSingleDirection =
@@ -4027,12 +4033,12 @@ void outlineRegular::regular_Contour()
             credible_multi_direction = false;
         }
 
-        // Prefer a single orthogonal direction first.  Many mask-derived
-        // footprints contain local stair-step or short diagonal artifacts that
-        // can make secondary direction detection too eager.  If one-direction
-        // regularization still explains the best hypothesis well, keep it and
-        // avoid the less stable multi-direction branch.  Buildings with
-        // credible multi-direction evidence (checked above) skip this block.
+        // 优先尝试单一正交方向。掩膜轮廓常含
+        // 楼梯或短斜边伪影，容易让次方向
+        // 检测过于激进。若单方向规则化
+        // 仍能很好解释最优假设，则保留，
+        // 避开稳定性较差的多方向分支。
+        // 有可信多方向证据的建筑(上面已查)跳过本块。
         std::vector<double> single_first_line_angles;
         if (!credible_multi_direction)
         {
@@ -4066,9 +4072,9 @@ void outlineRegular::regular_Contour()
                 bool corrected = strongWallDirection &&
                     difference > kWallDirectionCorrectionThreshold;
                 if (corrected && difference > kWallDirectionCorrectionMax) {
-                    // Sparse-evidence guard: a wall peak that far from the
-                    // selection is usually a short anomalous wall fragment,
-                    // not the building's dominant direction.
+                    // 稀疏证据防护：与选择角相差那么远的墙峰
+                    // 通常是一小段异常墙碎片，
+                    // 而不是建筑的主方向。
                     std::cerr << "[DirectionDecision] reject correction: diff_deg="
                               << difference * 180.0 / M_PI
                               << " exceeds cap " << kWallDirectionCorrectionMaxDeg
@@ -4095,11 +4101,11 @@ void outlineRegular::regular_Contour()
                     double ringPcaAngle = 0.0;
                     if (!corrected &&
                         estimatePcaDirection2D(ringCloud, ringPcaAngle, pcaAxisRatio)) {
-                        // Only well-elongated rings get a PCA fallback: a
-                        // near-isotropic blob's PCA axis is unstable (+-20 deg
-                        // noise) and once overrode a wall-consistent MBR angle
-                        // by 27 deg on a ratio-1.37 footprint, wrecking the
-                        // small building's regularization.
+                        // 只有足够拉长的轮廓才允许 PCA 回退：
+                        // 近各向同性轮廓的 PCA 轴不稳定(±20°噪声)，
+                        // 曾把与墙面一致的 MBR 角
+                        // 扳偏 27°(拉长比仅 1.37)，毁掉了
+                        // 小建筑的规则化。
                         const double gateDeg =
                             pcaAxisRatio >= kPcaDirectionReliableAxisRatio
                                 ? kPcaDirectionGateStrongDeg
@@ -4146,10 +4152,10 @@ void outlineRegular::regular_Contour()
                 const double notchMinDepth = std::max(
                     kNotchMinDepthFloor,
                     kNotchMinDepthFactor * model_tuning.repair_distance);
-                // Reference notches come from the RAW hypothesis, not from the
-                // candidate sources: the first source (post-repair topology
-                // candidate) may have already dissolved the notches, in which
-                // case source-local detection would find nothing to protect.
+                // 参考缺口来自原始假设而非候选源：
+                // 第一个源(修复后的拓扑候选)可能
+                // 已经把缺口抹掉，源内检测
+                // 将一无所获、保护失效。
                 const auto referenceNotches = DetectEvidenceBackedNotches(
                     fallback_hypothesis, fitting_cloud, notchMinDepth, kNotchMaxWidth);
                 if (!referenceNotches.empty()) {
@@ -4161,8 +4167,8 @@ void outlineRegular::regular_Contour()
                     std::cerr << " m)" << std::endl;
                 }
                 for (const auto& source : single_sources) {
-                    // Local (source-own) notches drive the vertex protection
-                    // mask inside the orthogonal snap.
+                    // 源自身的缺口驱动正交吸附内部的
+                    // 顶点保护掩码。
                     const auto protectedNotches = DetectEvidenceBackedNotches(
                         source, fitting_cloud, notchMinDepth, kNotchMaxWidth);
                     std::vector<bool> notchMask;
@@ -4186,7 +4192,7 @@ void outlineRegular::regular_Contour()
                             candidate, fallback_hypothesis, model_tuning)) {
                         continue;
                     }
-                    // Every REFERENCE notch must survive in the candidate.
+                    // 每个参考缺口都必须在候选中保留。
                     if (!referenceNotches.empty()) {
                         int preservedCount = 0;
                         for (const auto& notch : referenceNotches) {
@@ -4375,7 +4381,7 @@ void outlineRegular::regular_Contour()
                     break;
                 }
                 if (!strict_recovered) {
-                    // Do not overwrite the current result with the raw
+                    // 不用原始假设覆盖当前结果——
                     // pre-Ceres ring here.  That ring may contain diagonal
                     // edges even though this building is in StrictOrthogonal
                     // mode.  The common acceptance block below will try a
@@ -4387,10 +4393,10 @@ void outlineRegular::regular_Contour()
         }
 
         auto regularizedCandidateOk = [&](const std::vector<pcl::PointXYZ>& candidate) {
-            // Small buildings must end up strictly orthogonal: the loose
+            // 小建筑必须严格正交：下面的宽松
             // acceptable branch below would otherwise pass Ceres results
-            // whose free edges stayed diagonal (real leak: results id=2168/
-            // 2154 came out with mixed angles despite force-single).
+            // Ceres 结果(真实案例：id=2168/
+            // 2154 被强制单方向后仍是混合角度)。
             if (forceSingleDirection &&
                 !isStrictOrthogonalToMainAngle(
                     candidate,
@@ -4437,7 +4443,7 @@ void outlineRegular::regular_Contour()
                 accepted = true;
             }
             if (!accepted) {
-                // Strict mode must not end by emitting a diagonal raw
+                // 严格模式绝不能以输出斜边原始
                 // hypothesis.  A quality-rejected orthogonal candidate is
                 // still preferable to violating the mode contract; it is
                 // bounded by the same validity/angle checks as normal output.
@@ -5293,14 +5299,14 @@ double outlineRegular::computeAdaptiveLambda(double resolution, const std::vecto
 double outlineRegular::computeOBBArea(const std::vector<pcl::PointXYZ>& points) {
     if (points.size() < 3) return 0.0;
 
-    // Define local 2D point struct
+    // 定义局部 2D 点结构
     struct Point2D {
         float x, y;
         Point2D(float a = 0.0f, float b = 0.0f) : x(a), y(b) {}
         Point2D operator-(const Point2D& p) const { return { x - p.x, y - p.y }; }
     };
 
-    // Define local helper functions as lambdas
+    // 以 lambda 定义局部辅助函数
     auto dot = [](const Point2D& a, const Point2D& b) -> float {
         return a.x * b.x + a.y * b.y;
     };
@@ -5313,13 +5319,13 @@ double outlineRegular::computeOBBArea(const std::vector<pcl::PointXYZ>& points) 
         return std::sqrt(dot(a, a));
     };
 
-    // Directly use x, y as 2D coordinates (assuming z=0 or ignored)
+    // 直接用 x, y 作 2D 坐标(假设 z=0 或忽略)
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud2d(new pcl::PointCloud<pcl::PointXYZ>);
     for (const auto& pt : points) {
         cloud2d->push_back(pcl::PointXYZ(pt.x, pt.y, 0.0f));
     }
 
-    // Compute 2D convex hull
+    // 计算二维凸包
     pcl::PointCloud<pcl::PointXYZ>::Ptr hull_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::ConvexHull<pcl::PointXYZ> chull;
     chull.setInputCloud(cloud2d);
@@ -5334,7 +5340,7 @@ double outlineRegular::computeOBBArea(const std::vector<pcl::PointXYZ>& points) 
     size_t n = hull2d.size();
     if (n < 3) return 0.0;
 
-    // Ensure counterclockwise order
+    // 保证逆时针序
     float signed_area = 0.0f;
     for (size_t i = 0; i < n; ++i) {
         size_t j = (i + 1) % n;
@@ -7889,7 +7895,7 @@ void outlineRegular::repairTopologyBatch(std::vector<pcl::PointXYZ>& pts, double
         int idx_c;
         int idx_e;  // 额外索引：DOUBLE_SPIKE时为idx_d，PARALLEL_STEP时=-1
         pcl::PointXYZ new_vertex;  // 替换后的新顶点
-        pcl::PointXYZ new_vertex2; // PARALLEL_STEP时c_new
+        pcl::PointXYZ new_vertex2; // PARALLEL_STEPʱc_new
         double score;
     };
 

@@ -1,4 +1,4 @@
-#include "MaskVectorizer.h"
+﻿#include "MaskVectorizer.h"
 
 #include <gdal_alg.h>
 #include <gdal_priv.h>
@@ -94,8 +94,8 @@ long long RemoveContainedPolygons(OGRLayer* layer)
               });
     for (std::size_t innerIndex = 1; innerIndex < polygons.size(); ++innerIndex) {
         PolygonRecord& inner = polygons[innerIndex];
-        // Search from the smallest larger polygon to the largest so nested
-        // structures are assigned to their immediate containing shell.
+        // 从大到小遍历，使嵌套结构归属到最近的包含壳。
+        // (先遇到的外层即最近容器)。
         for (std::size_t outerIndex = innerIndex; outerIndex-- > 0;) {
             const PolygonRecord& outer = polygons[outerIndex];
             if (!outer.exteriorShell) continue;
@@ -106,9 +106,9 @@ long long RemoveContainedPolygons(OGRLayer* layer)
                 outer.envelope.MaxY < inner.envelope.MaxY) {
                 continue;
             }
-            // Polygonized label islands appear as both a child polygon and a
-            // hole in the parent. Test against the exterior shell so that the
-            // parent's corresponding hole does not hide this containment.
+            // 多边形化的标签孤岛既是父的洞又是子多边形；
+            // 对外壳判定，父多边形对应的洞
+            // 不会掩盖包含关系。
             if (outer.exteriorShell->Contains(inner.geometry.get())) {
                 inner.containerIndex = outerIndex;
                 break;
@@ -116,13 +116,13 @@ long long RemoveContainedPolygons(OGRLayer* layer)
         }
     }
 
-    // Decide removal direction. A mask mosaicked from several AI batches may
-    // draw a coarse outer instance around finer instances of another batch:
-    // the outer ring is then just a slightly padded duplicate of the inner
-    // union (measured on real data: inner coverage 90-100% of the outer).
-    // Such wrappers must be dropped and the finer inner outlines kept. Real
-    // containment (a courtyard building etc.) has low inner coverage and keeps
-    // the previous behaviour (drop inner).
+    // 决定删除方向。多批次叠加的掩膜可能
+    // 用粗外层实例包住另一批次的精细实例：
+    // 外环只是内层并集微扩一圈的重复伪影
+    // (实测：内层覆盖外层 90-100%)。
+    // 外壳应丢弃、保留精细内层。
+    // 真实包含(院落建筑等)内层覆盖率低，
+    // 维持原行为(删内层)。
     std::vector<double> innerAreaSum(polygons.size(), 0.0);
     std::vector<int> innerCount(polygons.size(), 0);
     for (std::size_t i = 0; i < polygons.size(); ++i) {
@@ -208,33 +208,33 @@ long long RemoveContainedPolygons(OGRLayer* layer)
     return removed;
 }
 
-// This is deliberately expressed in metres. The pixel radius is derived from
-// the GeoTIFF geotransform so the same setting works for different rasters.
+// 刻意用米表示。像素半径由 GeoTIFF 仿射变换换算，
+// 使同一设置适配不同分辨率影像。
 constexpr double kSeedErosionDistanceMeters = 1.2;
 constexpr double kMinSeedAreaSquareMeters = 5.0;
-// Keep instance colors in normal RGB masks. The fallback is only for images
-// whose values are effectively continuous (for example, a rendered overlay).
+// 普通 RGB 掩膜保留实例颜色。
+// (如渲染叠加图)才走二值兜底。
 constexpr std::size_t kMaxReliableColorLabels = 65536;
 constexpr double kNarrowWaistMaxWidthRatio = 0.38;
 constexpr double kNarrowWaistMinCoreAreaRatio = 0.10;
 constexpr double kNarrowWaistMinSplitGapPixels = 2.0;
-// Batch-overlay wrapper thresholds (pixel stage). A mosaicked mask from
-// several AI batches may draw one coarse outer instance around finer
-// instances of another batch; the outer ring is a slightly padded duplicate
-// of the inner union. Measured on production masks: wrapper inner coverage
+// 批次叠加外壳阈值(像素级)。
+// 多批次叠加可能用粗外层包住另一批
+// 的精细实例；外环只是内层并集的
+// 微扩重复(生产掩膜实测：外壳的
 // is 90-100% while real containment (courtyard buildings) stays below 10%.
 constexpr double kWrapperMultiInnerCoverage = 0.60;   // >= 2 inner components
 constexpr double kWrapperSingleInnerCoverage = 0.75;  // single inner component
 constexpr double kWrapperContainerVoteFrac = 0.95;    // ring votes must be one-sided
 constexpr double kWrapperMinComponentArea = 4.0;      // m2, ignore specks on both sides
-// Hairline seam/bridge components: the mosaic overlay of several AI batches
-// leaves 1-2 px wide anti-alias seams between instances (measured colors
-// d50400 / f70e00 families). When such a hairline runs BETWEEN two instances
-// it welds them into one foreground component after watershed absorption;
-// when it BRIDGES two instances it fuses them outright. Both destroy real
-// instance separation (cases id=1949 seam, id=3400 bridge). Hairlines are
-// turned into background so the instances stay disconnected. Real buildings
-// are never hairline-shaped, so the shape gate is safe.
+// 发丝接缝/桥接分量：多批次叠加在实例间
+// 留下 1-2px 抗锯齿缝(实测颜色
+// d50400/f70e00 族)。发丝在两实例之间时
+// 会被分水岭吸收后焊成连通域；
+// 横跨桥接时直接连通。两者都破坏
+// 真实实例分隔(案例 id=1949/id=3400)。
+// 发丝置为背景使实例断开。
+// 真实建筑不可能是发丝状，形状门槛零误伤。
 constexpr int kHairlineMaxThicknessPx = 3;   // bbox thin side
 constexpr int kHairlineMinLengthPx = 15;     // bbox long side
 constexpr double kHairlineFillRatio = 0.55;  // pixels / (thin x long bbox): line-like
@@ -320,10 +320,10 @@ long long RemoveHairlineSeamComponents(cv::Mat& colorImage, double pixelAreaMete
     return removed;
 }
 
-// Removes wrapper rings at the pixel level, BEFORE the watershed labeling:
-// most inner instances are smaller than the seed-area threshold and would
-// otherwise be absorbed into the wrapper's label, so a later polygon-level
-// fix can never see them.
+// 在分水岭标注前于像素级剥除外壳：
+// 多数内层实例小于种子面积阈值，
+// 会被外壳标签吸收，多边形级
+// 修复根本看不到它们。
 long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
 {
     const int w = colorImage.cols;
@@ -376,7 +376,7 @@ long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
         }
     }
 
-    // Boundary votes between different components (both directions).
+    // 不同连通域之间的边界投票(双向)。
     std::vector<std::unordered_map<int, std::size_t>> votes(comps.size());
     for (int y = 0; y < h; ++y) {
         const int* row = colorImage.ptr<int>(y);
@@ -395,11 +395,11 @@ long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
         }
     }
     for (std::size_t i = 0; i < comps.size(); ++i) {
-        // Container = the smallest component that actually surrounds us:
-        // it must touch us (shared boundary edges) AND its bbox must contain
-        // ours (direction check — votes alone are symmetric). Packed inner
-        // instances share boundaries with each other, so no single-vote
-        // fraction threshold works; contact + bbox containment does.
+        // 容器 = 真正包围当前分量的最小连通域：
+        // 必须接触(共享边)且包围盒包含我们
+        // (方向校验——投票是对称的)。紧贴的
+        // 内层实例共享边界，单一投票比例
+        // 门槛无效；接触+包含才有效。
         int best = -1;
         std::size_t bestPixels = 0;
         for (const auto& v : votes[i]) {
@@ -421,8 +421,8 @@ long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
         }
     }
 
-    // Wrapper decision per container (specks below the minimum area are
-    // ignored on both sides: they are label noise, not batch duplicates).
+    // 按容器判定外壳(双侧最小面积门槛
+    // 过滤碎屑：那是标签噪声不是批次重复)。
     const std::size_t minPixels = static_cast<std::size_t>(
         std::max(1.0, kWrapperMinComponentArea / std::max(pixelAreaMeters, 1e-9)));
     std::vector<std::size_t> innerPixels(comps.size(), 0);
@@ -444,12 +444,12 @@ long long RemoveBatchWrapperRings(cv::Mat& colorImage, double pixelAreaMeters)
                                   (innerCount[i] == 1 && coverage >= kWrapperSingleInnerCoverage);
         if (!coveragePass) continue;
 
-        // Ring-thickness profile: a duplicate-batch artifact ring is a thin
-        // band (1-3 px) around the inner union everywhere, while a batch-edge
-        // REMAINDER (one real building, finer batch clipped by the tile, the
-        // coarse batch's leftover part visible as the "ring") has a thick lobe
-        // far from the inner boundary — that case must fall through to the
-        // merge stage instead of being erased here.
+        // 环厚度剖面：批次重复伪影外环是
+        // 处处 1-3px 薄边；而画幅裁断残留
+        // (单栋真楼，细批次被瓦片裁断，
+        // 粗批次剩余成为环)一侧有厚实体——
+        // 此类必须交给合并阶段
+        // 而不是在此删除。
         const bool thinRing = [&]() {
             std::vector<int> innerSet;
             for (std::size_t k = 0; k < comps.size(); ++k) {
@@ -632,7 +632,7 @@ void SetDatasetSpatialInfo(GDALDataset* dataset,
     if (projection && projection[0] != '\0') dataset->SetProjection(projection);
 }
 
-// For a large single connected component, detect a narrow waist by checking
+// 对大连通域，通过检测窄腰判断是否拆分
 // whether the distance-transform core contains multiple separated peaks.
 bool SplitNarrowWaistComponent(const cv::Mat& componentMask,
                                cv::Mat& outputLabels,
@@ -758,7 +758,7 @@ bool SplitNarrowWaistComponent(const cv::Mat& componentMask,
     return changed;
 }
 
-// Build a label image while retaining the original foreground. Erosion is
+// 构建标签图并保留原始前景。腐蚀用于
 // used only to find stable cores; it is never used as the final footprint.
 cv::Mat SeparateColorComponents(const cv::Mat& colorImage,
                                 int erosionRadiusPixels,
@@ -1046,7 +1046,7 @@ bool VectorizeBuildingMask(const std::string& tifPath,
         }
     }
     if (tooManyColors) {
-        // The image likely contains anti-aliased or continuous colors rather
+        // 影像可能含抗锯齿或连续颜色
         // than semantic instance labels. Normalize the prefix scanned before
         // the threshold was reached as well.
         colorImage.setTo(1, colorImage != 0);
@@ -1139,7 +1139,7 @@ bool VectorizeBuildingMask(const std::string& tifPath,
         std::cerr << "[Mask] Cannot create parent attribute." << std::endl;
         return false;
     }
-    // Stable per-polygon identifier assigned once at vectorization time. It
+    // 矢量化时一次性分配的稳定多边形标识。
     // survives the merge/split stages (CopyFieldValues propagates it to parts
     // and merged features) while FIDs churn, so initial outlines, debug
     // hypotheses and the regularized output can be joined on it.

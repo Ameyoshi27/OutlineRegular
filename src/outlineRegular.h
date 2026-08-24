@@ -1,4 +1,4 @@
-/*
+﻿/*
  * @Descripttion: LOD轮廓规则化
  * @version:
  * @Author: JiangTao
@@ -125,10 +125,10 @@ public:
 	void regular_Contour();
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
-	// Mask-only mode disables curve restoration: without ortho evidence the
-	// curve detector fits raster staircases and would restore pseudo curves.
+// Mask-only 模式关闭曲线恢复：无正射证据仲裁时，
+// 曲线检测器会把栅格楼梯拟合成伪曲线。
 	void setCurveRestorationEnabled(bool enabled) { curve_restoration_enabled_ = enabled; }
-	// Prints the run-level summary of structure-aware hypothesis repairs.
+// 打印结构感知假设修复的运行级汇总。
 	static void PrintHypothesisRepairSummary();
 	static bool estimateSupportDirection2D(
 		const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
