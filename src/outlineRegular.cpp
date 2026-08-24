@@ -3773,7 +3773,9 @@ void outlineRegular::regular_Contour()
         resolution = makeOutlineTuning(resolution, computeOBBArea(original_points)).resolution;
     }
     const std::vector<PreservedArcSegment> preserved_arcs =
-        detectPreservedArcs(original_points, resolution);
+        curve_restoration_enabled_
+            ? detectPreservedArcs(original_points, resolution)
+            : std::vector<PreservedArcSegment>{};
 
     //判断当前轮廓是否近似圆或椭圆
     if (fitting_cloud->size() >= 6) {

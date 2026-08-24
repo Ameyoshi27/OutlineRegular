@@ -125,6 +125,9 @@ public:
 	void regular_Contour();
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
+	// Mask-only mode disables curve restoration: without ortho evidence the
+	// curve detector fits raster staircases and would restore pseudo curves.
+	void setCurveRestorationEnabled(bool enabled) { curve_restoration_enabled_ = enabled; }
 	// Prints the run-level summary of structure-aware hypothesis repairs.
 	static void PrintHypothesisRepairSummary();
 	static bool estimateSupportDirection2D(
@@ -224,6 +227,7 @@ private:
 	double support_direction_peak_ratio_ = 0.0;
 	std::size_t support_direction_pair_count_ = 0;
 	long long source_feature_id_ = -1;   // for [HypothesisRepair] logging only
+	bool curve_restoration_enabled_ = true;
 
 	double computeAdaptiveLambda(double resolution, const std::vector<pcl::PointXYZ>& points);
 

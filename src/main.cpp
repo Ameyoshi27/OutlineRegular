@@ -3870,6 +3870,411 @@ bool SaveDebugSupportLas(
     return SaveSampledCloudAsLas(cloud, outputPath.string());
 }
 
+// ============================================================================
+// Mask-only mode: full regularization without any OSGB dependency.
+// TIF -> vectorized initial outlines -> uniform arc-length contour residual
+// points -> the SAME outlineRegular::regular_Contour pipeline (VDP, direction
+// decision with the contour chord histogram as evidence, Ceres) -> output.
+// ============================================================================
+
+
+// Uniform residual-point spacing along the initial outline (metres). Uniform
+// arc-length spacing removes the staircase vertex-density bias of raster
+// outlines; chord directions between points 1-2.5 m apart also act as a
+// de-staircased edge-direction histogram.
+const double kMaskResidualSpacing = 0.5;
+
+bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring)
+{
+    const std::size_t n = ring.size();
+    if (n < 4) return true;
+    std::vector<Point2D64> pts;
+    pts.reserve(n);
+    for (const auto& p : ring) pts.push_back({p.x, p.y, p.z});
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 2; j < n; ++j) {
+            if (i == 0 && j == n - 1) continue;
+            if (SegmentsIntersect2D64(pts[i], pts[(i + 1) % n],
+                                      pts[j], pts[(j + 1) % n])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+enum class MaskOnlyFallback { Final = 0, Hypothesis, Initial };
+
+// Mask-only regularization entry: contour points are BOTH the residual cloud
+// and the direction evidence for the unchanged regular_Contour pipeline.
+std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
+    const std::vector<pcl::PointXYZ>& ring,
+    long long sourceFid,
+    std::vector<pcl::PointXYZ>* bestHypothesisOut,
+    MaskOnlyFallback* fallbackLevel)
+{
+    if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
+    if (ring.size() < 3) {
+        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
+        return ring;
+    }
+
+    auto residual = DensifyBoundary(ring, kMaskResidualSpacing);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr contourCloud(new pcl::PointCloud<pcl::PointXYZ>);
+    contourCloud->points.assign(residual->begin(), residual->end());
+    if (contourCloud->size() < 8) {
+        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
+        return ring;
+    }
+
+    double contourDir = 0.0;
+    double contourRatio = 0.0;
+    std::size_t contourPairs = 0;
+    outlineRegular::estimateSupportDirection2D(
+        contourCloud, contourDir, contourRatio, contourPairs);
+
+    std::cerr << "[MaskOnlySupport] fid=" << sourceFid
+              << " original_vertices=" << ring.size()
+              << " resampled_points=" << contourCloud->size()
+              << " spacing=" << kMaskResidualSpacing
+              << " weights=contour_uniform" << std::endl;
+    std::cerr << "[MaskOnlyDirection] fid=" << sourceFid
+              << " contour_hist_deg=" << contourDir * 180.0 / M_PI
+              << " peak_ratio=" << contourRatio
+              << " pairs=" << contourPairs << std::endl;
+
+    std::vector<double> weights(contourCloud->size(), 1.0);
+    outlineRegular regularizer(ring, contourCloud, weights);
+    regularizer.setSourceFeatureId(sourceFid);
+    regularizer.setSupportDirectionHint(contourDir, contourRatio, contourPairs);
+    // No ortho evidence arbitrates curve detection on raster staircases;
+    // mask-only must not restore pseudo curves.
+    regularizer.setCurveRestorationEnabled(false);
+    regularizer.regular_Contour();
+
+    std::vector<pcl::PointXYZ> bestHypothesis;
+    if (bestHypothesisOut) {
+        *bestHypothesisOut = regularizer.getBestEnergyHypothesis();
+        if (bestHypothesisOut->size() < 3) *bestHypothesisOut = ring;
+        RemoveClosingDuplicate(*bestHypothesisOut);
+        bestHypothesis = *bestHypothesisOut;
+    } else {
+        bestHypothesis = regularizer.getBestEnergyHypothesis();
+        if (bestHypothesis.size() < 3) bestHypothesis = ring;
+        RemoveClosingDuplicate(bestHypothesis);
+    }
+
+    std::vector<pcl::PointXYZ> result;
+    if (regularizer.final_points && regularizer.final_points->size() >= 3) {
+        result.assign(regularizer.final_points->points.begin(),
+                      regularizer.final_points->points.end());
+        RemoveClosingDuplicate(result);
+    }
+    if (result.size() < 3) {
+        result = bestHypothesis;
+        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
+    }
+    if (result.size() < 3) {
+        result = ring;
+        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
+    }
+    std::cerr << "[MaskOnlyHypothesis] fid=" << sourceFid
+              << " initial_vertices=" << ring.size()
+              << " best_vertices=" << bestHypothesis.size()
+              << " final_vertices=" << result.size()
+              << " initial_area=" << PolygonArea2D(ring)
+              << " best_area=" << PolygonArea2D(bestHypothesis)
+              << " fallback=" << static_cast<int>(fallbackLevel ? *fallbackLevel
+                                                                : MaskOnlyFallback::Final)
+              << std::endl;
+    return result;
+}
+
+int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVectorIn)
+{
+    std::cout << "[Mode] Mask-only" << std::endl;
+    std::cout << "[MaskOnly] input_tif=" << inputRaster << std::endl;
+    std::cout << "[MaskOnly] output_shp=" << outputVectorIn << std::endl;
+    GDALAllRegister();
+
+    // GeoTransform + spatial reference (mandatory: outputs keep the TIF SRS).
+    GDALDataset* tif = static_cast<GDALDataset*>(
+        GDALOpenEx(inputRaster.c_str(), GDAL_OF_RASTER, nullptr, nullptr, nullptr));
+    if (!tif) {
+        std::cerr << "[MaskOnly] cannot open input raster: " << inputRaster << std::endl;
+        return 1;
+    }
+    double gt[6] = {0};
+    if (tif->GetGeoTransform(gt) != CE_None) {
+        std::cerr << "[MaskOnly] input raster has no GeoTransform." << std::endl;
+        GDALClose(tif);
+        return 1;
+    }
+    const char* projection = tif->GetProjectionRef();
+    if (!projection || projection[0] == '\0') {
+        std::cerr << "[MaskOnly] input raster has no spatial reference." << std::endl;
+        GDALClose(tif);
+        return 1;
+    }
+    const double originX = std::round(gt[0] + gt[1] * tif->GetRasterXSize() * 0.5);
+    const double originY = std::round(gt[3] + gt[5] * tif->GetRasterYSize() * 0.5);
+    const Eigen::Vector3d originOffset(originX, originY, 0.0);
+    std::cout << "[MaskOnly] origin_x=" << originX << " origin_y=" << originY << std::endl;
+    std::cout << "[MaskOnly] geotransform=" << gt[0] << "," << gt[1] << "," << gt[2]
+              << "," << gt[3] << "," << gt[4] << "," << gt[5] << std::endl;
+    GDALClose(tif);
+
+    // Output preparation: debug files go next to the output Shapefile.
+    std::filesystem::path outPath(outputVectorIn);
+    std::error_code dirEc;
+    std::filesystem::create_directories(outPath.parent_path(), dirEc);
+    if (dirEc && !outPath.parent_path().empty()) {
+        std::cerr << "[MaskOnly] cannot create output directory: "
+                  << outPath.parent_path().string() << " (" << dirEc.message() << ")" << std::endl;
+        return 1;
+    }
+    const std::string outputVector =
+        PrepareWritableShapefilePath(outPath, "output Shapefile").string();
+    const std::filesystem::path debugDir =
+        std::filesystem::path(outputVector).parent_path();
+
+    std::filesystem::path initialPath = debugDir / "initial_building_outline.shp";
+    if (std::filesystem::exists(initialPath) && !RemoveShapefileFamily(initialPath, false)) {
+        initialPath = MakeUniqueShapefilePath(initialPath);
+        std::cout << "[SHP] initial outline path locked, writing to: "
+                  << initialPath.string() << std::endl;
+    }
+
+    // ---- Initial outlines: full mask geometry chain ----
+    MaskVectorizationStats maskStats;
+    if (!VectorizeBuildingMask(inputRaster, initialPath.string(), maskStats)) {
+        std::cerr << "[MaskOnly] mask vectorization failed (no valid building pixels?)."
+                  << std::endl;
+        return 1;
+    }
+    // The over-segmentation merge stage relies on OSGB seam evidence; without
+    // it, blind merging risks fusing real neighbours, so mask-only skips it.
+    std::cout << "[MaskOnly] merge stage skipped: requires OSGB seam evidence" << std::endl;
+    NarrowNeckSplitStats neckStats;
+    if (!SplitInitialOutlinesAtNarrowNecks(initialPath.string(), neckStats)) {
+        std::cerr << "[MaskOnly] neck split failed." << std::endl;
+    }
+    const long long containedRemoved =
+        RemoveContainedSmallFootprints(initialPath.string(), kContainedFootprintMaxArea);
+    StampAreaField(initialPath.string());
+    std::cout << "[MaskOnly] initial outlines saved: " << initialPath.string() << std::endl;
+
+    // ---- Feature loop (no OSGB: no coverage filter, no ownership) ----
+    GDALDataset* inDataset = static_cast<GDALDataset*>(
+        GDALOpenEx(initialPath.string().c_str(), GDAL_OF_VECTOR,
+                   nullptr, nullptr, nullptr));
+    if (!inDataset) {
+        std::cerr << "[MaskOnly] cannot reopen initial outlines." << std::endl;
+        return 1;
+    }
+    OGRLayer* inLayer = inDataset->GetLayer(0);
+    if (!inLayer) {
+        std::cerr << "[MaskOnly] initial outline layer missing." << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+    // Clone the SRS before closing the dataset: the debug hypothesis writer
+    // runs after inDataset is gone and must still carry the TIF reference.
+    OGRSpatialReference* srsClone = inLayer->GetSpatialRef()
+        ? inLayer->GetSpatialRef()->Clone()
+        : nullptr;
+    const int initialCount = inLayer->GetFeatureCount(TRUE);
+    std::cout << "[MaskOnly] initial feature count=" << initialCount << std::endl;
+
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) {
+        std::cerr << "[MaskOnly] ESRI Shapefile driver unavailable." << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+    GDALDataset* outDataset = driver->Create(
+        outputVector.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!outDataset) {
+        std::cerr << "[MaskOnly] cannot create output vector: " << outputVector << std::endl;
+        GDALClose(inDataset);
+        return 1;
+    }
+    OGRLayer* outLayer = outDataset->CreateLayer(
+        "regularized_building", inLayer->GetSpatialRef(), wkbPolygon25D, nullptr);
+    if (!outLayer) {
+        std::cerr << "[MaskOnly] cannot create output layer." << std::endl;
+        GDALClose(outDataset);
+        GDALClose(inDataset);
+        return 1;
+    }
+    CopyFields(inLayer, outLayer);
+    const int inIdFieldIdx = inLayer->GetLayerDefn()->GetFieldIndex("id");
+    int outIdFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("id");
+    if (outIdFieldIdx < 0) {
+        OGRFieldDefn idField("id", OFTInteger64);
+        if (outLayer->CreateField(&idField) == OGRERR_NONE) {
+            outIdFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("id");
+        }
+    }
+    int outAreaFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("area");
+    if (outAreaFieldIdx < 0) {
+        OGRFieldDefn areaField("area", OFTReal);
+        if (outLayer->CreateField(&areaField) == OGRERR_NONE) {
+            outAreaFieldIdx = outLayer->GetLayerDefn()->GetFieldIndex("area");
+        }
+    }
+    OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
+
+    RegularizationDebugCollector debugCollector;
+    long long total = 0;
+    long long okCount = 0;
+    long long emptyGeom = 0;
+    long long smallSkipped = 0;
+    long long holesDropped = 0;
+    long long selfIntersect = 0;
+    long long fallbackHypothesis = 0;
+    long long fallbackInitial = 0;
+    double sumInitVerts = 0.0;
+    double sumBestVerts = 0.0;
+    double sumFinalVerts = 0.0;
+    double sumAreaRatio = 0.0;
+    long long areaSamples = 0;
+    auto loopStart = std::chrono::steady_clock::now();
+
+    inLayer->ResetReading();
+    while (OGRFeature* inFeature = inLayer->GetNextFeature()) {
+        ++total;
+        OGRGeometry* geometry = inFeature->GetGeometryRef();
+        if (!geometry || geometry->IsEmpty()) {
+            std::cerr << "[MaskOnly] skip empty geometry fid=" << inFeature->GetFID() << std::endl;
+            ++emptyGeom;
+            OGRFeature::DestroyFeature(inFeature);
+            continue;
+        }
+        GIntBig buildingId = inFeature->GetFID();
+        if (inIdFieldIdx >= 0 && inFeature->IsFieldSetAndNotNull(inIdFieldIdx)) {
+            buildingId = inFeature->GetFieldAsInteger64(inIdFieldIdx);
+        }
+
+        // Collect exterior rings of every polygon part.
+        std::vector<OGRPolygon*> parts;
+        const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+        if (type == wkbPolygon) {
+            parts.push_back(geometry->toPolygon());
+        } else if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+            auto* collection = geometry->toGeometryCollection();
+            for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+                const OGRwkbGeometryType partType =
+                    wkbFlatten(collection->getGeometryRef(i)->getGeometryType());
+                if (partType == wkbPolygon) {
+                    parts.push_back(collection->getGeometryRef(i)->toPolygon());
+                }
+            }
+        }
+
+        std::vector<std::unique_ptr<OGRPolygon>> outParts;
+        int ringIdx = 0;
+        for (OGRPolygon* part : parts) {
+            if (part->getNumInteriorRings() > 0) {
+                ++holesDropped;
+            }
+            auto ring = ExtractExteriorRing(part, originOffset);
+            ++ringIdx;
+            if (BoundingBoxArea2D(ring) < kMinPolygonBBoxArea) {
+                ++smallSkipped;
+                continue;
+            }
+            std::vector<pcl::PointXYZ> bestHypothesis;
+            MaskOnlyFallback fallback = MaskOnlyFallback::Final;
+            auto result = RegularizeRingFromMaskOnly(
+                ring, static_cast<long long>(buildingId), &bestHypothesis, &fallback);
+            if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
+            if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
+
+            if (bestHypothesis.size() >= 3) {
+                debugCollector.hypotheses.push_back(
+                    {buildingId, ringIdx - 1, bestHypothesis});
+            }
+            sumInitVerts += static_cast<double>(ring.size());
+            sumBestVerts += static_cast<double>(bestHypothesis.size());
+            sumFinalVerts += static_cast<double>(result.size());
+            const double initArea = PolygonArea2D(ring);
+            if (initArea > 1e-6) {
+                sumAreaRatio += PolygonArea2D(result) / initArea;
+                ++areaSamples;
+            }
+            if (!MaskOnlyRingIsSimple(result)) ++selfIntersect;
+
+            std::unique_ptr<OGRPolygon> outPolygon(MakePolygon(result, originOffset));
+            if (outPolygon) outParts.push_back(std::move(outPolygon));
+        }
+
+        if (outParts.empty()) {
+            std::cerr << "[MaskOnly] no valid rings for fid=" << buildingId << std::endl;
+            OGRFeature::DestroyFeature(inFeature);
+            continue;
+        }
+        OGRFeature* outFeature = OGRFeature::CreateFeature(outDefn);
+        CopyFieldValues(inFeature, outFeature);
+        if (outIdFieldIdx >= 0) outFeature->SetField(outIdFieldIdx, buildingId);
+        if (outParts.size() == 1) {
+            outFeature->SetGeometry(outParts.front().get());
+        } else {
+            OGRMultiPolygon multi;
+            for (const auto& part : outParts) multi.addGeometry(part.get());
+            outFeature->SetGeometry(&multi);
+        }
+        if (outAreaFieldIdx >= 0) {
+            outFeature->SetField(outAreaFieldIdx,
+                GeometryArea(outFeature->GetGeometryRef()));
+        }
+        if (outLayer->CreateFeature(outFeature) == OGRERR_NONE) {
+            ++okCount;
+        } else {
+            std::cerr << "[MaskOnly] CreateFeature failed fid=" << buildingId << std::endl;
+        }
+        OGRFeature::DestroyFeature(outFeature);
+        OGRFeature::DestroyFeature(inFeature);
+        if (total % 200 == 0) {
+            std::cout << "  ...mask-only processing feature " << total << std::endl;
+        }
+    }
+    auto loopEnd = std::chrono::steady_clock::now();
+    outDataset->FlushCache();
+    GDALClose(outDataset);
+    GDALClose(inDataset);
+
+    const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";
+    SaveDebugBestHypotheses(debugBestPath, debugCollector, srsClone, originOffset);
+    if (srsClone) srsClone->Release();
+    std::cout << "[MaskOnly] best hypotheses saved: " << debugBestPath.string()
+              << " (" << debugCollector.hypotheses.size() << " rings)" << std::endl;
+    std::cout << "[MaskOnly] support LAS skipped: no OSGB source" << std::endl;
+
+    const double loopSec =
+        std::chrono::duration<double>(loopEnd - loopStart).count();
+    std::cout << "[MaskOnly] summary initial_features=" << initialCount
+              << " processed=" << total
+              << " output_features=" << okCount
+              << " empty_geom=" << emptyGeom
+              << " small_area_skipped=" << smallSkipped
+              << " holes_dropped=" << holesDropped
+              << " self_intersections=" << selfIntersect
+              << " fallback_hypothesis=" << fallbackHypothesis
+              << " fallback_initial=" << fallbackInitial << std::endl;
+    if (areaSamples > 0) {
+        std::cout << "[MaskOnly] avg_vertices initial="
+                  << (total > 0 ? sumInitVerts / total : 0.0)
+                  << " best=" << (total > 0 ? sumBestVerts / total : 0.0)
+                  << " final=" << (total > 0 ? sumFinalVerts / total : 0.0)
+                  << " area_ratio_mean=" << sumAreaRatio / areaSamples << std::endl;
+    }
+    std::cout << "[MaskOnly] feature loop: " << loopSec << " s" << std::endl;
+    std::cout << "[MaskOnly] Output: " << outputVector << std::endl;
+    return okCount > 0 ? 0 : 2;
+}
+
+
 } // namespace
 
 // ===== main =====
@@ -3900,6 +4305,29 @@ int main(int argc, char* argv[])
                   << ", Y=" << stats.minY << ".." << stats.maxY << std::endl;
         std::cout << "[Mask] Output: " << argv[3] << std::endl;
         return 0;
+    }
+
+    if (argc == 4 && std::string(argv[1]) == "--mask-only") {
+        return RunMaskOnlyMode(argv[2], argv[3]);
+    }
+
+    std::cout << "Select data mode: (1) OSGB + XML (default)  (2) Mask-only: ";
+    std::string dataModeChoice;
+    std::cin >> dataModeChoice;
+    if (dataModeChoice == "2" || dataModeChoice == "m" || dataModeChoice == "M") {
+        std::string maskOnlyTif;
+        std::string maskOnlyOut;
+        std::cout << "Select AI mask GeoTIFF..." << std::endl;
+        if (!PickOpenTifFile(maskOnlyTif)) {
+            std::cerr << "No mask GeoTIFF selected. Exiting." << std::endl;
+            return 1;
+        }
+        std::cout << "Select output Shapefile (.shp) to save..." << std::endl;
+        if (!PickSaveFile(maskOnlyOut)) {
+            std::cerr << "No output Shapefile selected. Exiting." << std::endl;
+            return 1;
+        }
+        return RunMaskOnlyMode(maskOnlyTif, maskOnlyOut);
     }
 
     // ---- 1) Select OSGB input ----
