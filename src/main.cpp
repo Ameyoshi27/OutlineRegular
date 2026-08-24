@@ -3888,6 +3888,288 @@ void CopyFieldValues(OGRFeature* src, OGRFeature* dst)
     }
 }
 
+// ===== Mask-only 初始轮廓保拓扑平滑 =====
+// 用 OGR 的 SimplifyPreserveTopology 消除栅格楼梯，配合面积/有效性/
+// 邻接回退检查，保证建筑数量、孔洞和相邻关系不被破坏。
+// 窄颈拆分必须在平滑之前执行(平滑会删除窄颈候选顶点)。
+
+struct InitialOutlineSmoothStats {
+    long long inspected = 0;
+    long long changed = 0;
+    long long beforeVertices = 0;
+    long long afterVertices = 0;
+    long long revertedInvalid = 0;
+    long long revertedType = 0;
+    long long revertedArea = 0;
+    long long revertedDeviation = 0;
+    long long revertedAdjacency = 0;
+    long long revertedNoReduction = 0;
+    long long holesPreserved = 0;
+};
+
+const double kInitialOutlineSmoothMinTolerance = 0.20;      // m
+const double kInitialOutlineSmoothMaxTolerance = 0.45;      // m
+const double kInitialOutlineSmoothAreaChangeRatio = 0.05;   // 5%
+const double kInitialOutlineSmoothMaxDeviation = 0.60;      // m, 双向边界最大偏移
+const double kInitialOutlineSmoothAdjacencyTolerance = 0.60; // m, 共享边邻接距离
+const double kInitialOutlineSmoothOverlapArea = 0.05;       // m², 新增重叠面积下限
+
+// 采样环边界并计算到另一环边界的最大距离(近似 Hausdorff)
+double MaxBoundaryDeviation(
+    const OGRGeometry* geomA,
+    const OGRGeometry* geomB,
+    double sampleStep)
+{
+    if (!geomA || !geomB) return 0.0;
+    std::unique_ptr<OGRGeometry> boundaryB(geomB->Boundary());
+    if (!boundaryB) return 0.0;
+    std::unique_ptr<OGRGeometry> boundaryA(geomA->Boundary());
+    if (!boundaryA) return 0.0;
+
+    // 沿 A 的边界采样点，测到 B 边界的距离
+    OGRPoint sample;
+    double maxDist = 0.0;
+    const OGRGeometryCollection* colA =
+        dynamic_cast<const OGRGeometryCollection*>(boundaryA.get());
+    const int nGeomA = colA ? colA->getNumGeometries() : 0;
+    for (int g = 0; g < (nGeomA > 0 ? nGeomA : 1); ++g) {
+        const OGRGeometry* line =
+            (colA && nGeomA > 0) ? colA->getGeometryRef(g) : boundaryA.get();
+        if (!line || wkbFlatten(line->getGeometryType()) != wkbLineString) continue;
+        const auto* ls = line->toLineString();
+        const int nPts = ls->getNumPoints();
+        for (int i = 0; i < nPts; ++i) {
+            ls->getPoint(i, &sample);
+            const double d = boundaryB->Distance(&sample);
+            if (d > maxDist) maxDist = d;
+        }
+    }
+    return maxDist;
+}
+
+int CountTotalVertices(const OGRGeometry* geom)
+{
+    if (!geom) return 0;
+    const OGRwkbGeometryType type = wkbFlatten(geom->getGeometryType());
+    if (type == wkbPolygon) {
+        const auto* poly = geom->toPolygon();
+        int count = poly->getExteriorRing() ? poly->getExteriorRing()->getNumPoints() : 0;
+        for (int i = 0; i < poly->getNumInteriorRings(); ++i) {
+            count += poly->getInteriorRing(i)->getNumPoints();
+        }
+        return count;
+    }
+    if (type == wkbMultiPolygon) {
+        const auto* mp = geom->toMultiPolygon();
+        int count = 0;
+        for (int i = 0; i < mp->getNumGeometries(); ++i) {
+            count += CountTotalVertices(mp->getGeometryRef(i));
+        }
+        return count;
+    }
+    return 0;
+}
+
+int CountInteriorRings(const OGRGeometry* geom)
+{
+    if (!geom) return 0;
+    const OGRwkbGeometryType type = wkbFlatten(geom->getGeometryType());
+    if (type == wkbPolygon) {
+        return geom->toPolygon()->getNumInteriorRings();
+    }
+    if (type == wkbMultiPolygon) {
+        const auto* mp = geom->toMultiPolygon();
+        int count = 0;
+        for (int i = 0; i < mp->getNumGeometries(); ++i) {
+            count += CountInteriorRings(mp->getGeometryRef(i));
+        }
+        return count;
+    }
+    return 0;
+}
+
+// 对整个初始轮廓 Shapefile 执行保拓扑平滑(就地修改)。
+// 返回 true 表示至少处理了一个要素。
+bool SmoothInitialOutlinesTopologyPreserving(
+    const std::string& shpPath,
+    double pixelSizeX,
+    double pixelSizeY,
+    InitialOutlineSmoothStats& stats)
+{
+    stats = {};
+    GDALDataset* dataset = static_cast<GDALDataset*>(
+        GDALOpenEx(shpPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                   nullptr, nullptr, nullptr));
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->GetLayer(0);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+
+    const double tolerance = std::clamp(
+        1.0 * std::max(pixelSizeX, pixelSizeY),
+        kInitialOutlineSmoothMinTolerance,
+        kInitialOutlineSmoothMaxTolerance);
+
+    struct SmoothRec {
+        GIntBig fid = OGRNullFID;
+        std::unique_ptr<OGRGeometry> original;
+        std::unique_ptr<OGRGeometry> smoothed;
+        OGREnvelope env = {};
+        bool changed = false;
+        bool reverted = false;
+    };
+    std::vector<SmoothRec> recs;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        SmoothRec rec;
+        rec.fid = feature->GetFID();
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            rec.original.reset(geometry->clone());
+            rec.original->getEnvelope(&rec.env);
+        }
+        if (rec.original) recs.push_back(std::move(rec));
+        OGRFeature::DestroyFeature(feature);
+    }
+    if (recs.empty()) {
+        GDALClose(dataset);
+        return false;
+    }
+
+    // 第一遍：逐要素 SimplifyPreserveTopology + 安全检查
+    for (auto& rec : recs) {
+        ++stats.inspected;
+        stats.beforeVertices += CountTotalVertices(rec.original.get());
+        if (!rec.original) continue;
+
+        const OGRwkbGeometryType origType = wkbFlatten(rec.original->getGeometryType());
+        const int origHoles = CountInteriorRings(rec.original.get());
+        const double origArea = GeometryArea(rec.original.get());
+        const int origVerts = CountTotalVertices(rec.original.get());
+
+        std::unique_ptr<OGRGeometry> simplified(rec.original->SimplifyPreserveTopology(tolerance));
+        if (!simplified || simplified->IsEmpty()) {
+            ++stats.revertedInvalid;
+            continue;
+        }
+
+        const OGRwkbGeometryType simpType = wkbFlatten(simplified->getGeometryType());
+        if (simpType != origType) {
+            ++stats.revertedType;
+            continue;
+        }
+
+        const int simpHoles = CountInteriorRings(simplified.get());
+        if (simpHoles < origHoles) {
+            ++stats.revertedInvalid;
+            continue;
+        }
+
+        const double simpArea = GeometryArea(simplified.get());
+        if (std::abs(simpArea - origArea) >
+            kInitialOutlineSmoothAreaChangeRatio * std::max(origArea, 1.0)) {
+            ++stats.revertedArea;
+            continue;
+        }
+
+        const double deviation = MaxBoundaryDeviation(
+            rec.original.get(), simplified.get(), tolerance);
+        if (deviation > kInitialOutlineSmoothMaxDeviation) {
+            ++stats.revertedDeviation;
+            continue;
+        }
+
+        const int simpVerts = CountTotalVertices(simplified.get());
+        if (simpVerts >= origVerts) {
+            ++stats.revertedNoReduction;
+            continue;
+        }
+
+        if (!simplified->IsValid()) {
+            // 不用 Buffer(0) 修复，直接回退
+            ++stats.revertedInvalid;
+            continue;
+        }
+
+        rec.smoothed = std::move(simplified);
+        rec.changed = true;
+        ++stats.changed;
+        if (simpHoles > 0) ++stats.holesPreserved;
+    }
+
+    // 第二遍：跨建筑邻接检查——平滑后不产生新重叠或异常缝隙
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+        auto& a = recs[i];
+        if (!a.changed) continue;
+        for (std::size_t j = 0; j < recs.size(); ++j) {
+            if (i == j) continue;
+            auto& b = recs[j];
+            if (!b.original) continue;
+            // 平滑后几何的 envelope
+            OGREnvelope envSmoothedA;
+            if (a.smoothed) a.smoothed->getEnvelope(&envSmoothedA);
+            else envSmoothedA = a.env;
+            // 原始几何的 envelope(用于判断原始是否相邻)
+            if (envSmoothedA.MaxX < b.env.MinX - kInitialOutlineSmoothAdjacencyTolerance ||
+                b.env.MaxX < envSmoothedA.MinX - kInitialOutlineSmoothAdjacencyTolerance ||
+                envSmoothedA.MaxY < b.env.MinY - kInitialOutlineSmoothAdjacencyTolerance ||
+                b.env.MaxY < envSmoothedA.MinY - kInitialOutlineSmoothAdjacencyTolerance) {
+                continue;
+            }
+
+            // 计算原始对是否有重叠
+            const bool hadOverlap = a.original->Intersects(b.original.get());
+            // 平滑后是否有重叠
+            const bool nowOverlap = a.smoothed->Intersects(b.original.get());
+            if (!hadOverlap && nowOverlap) {
+                // 新增重叠：检查面积
+                std::unique_ptr<OGRGeometry> overlap(a.smoothed->Intersection(b.original.get()));
+                const double overlapArea = GeometryArea(overlap.get());
+                if (overlapArea > kInitialOutlineSmoothOverlapArea) {
+                    a.changed = false;
+                    a.smoothed.reset();
+                    ++stats.revertedAdjacency;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 写回：只更新 changed 且未回退的要素
+    for (const auto& rec : recs) {
+        if (!rec.changed || !rec.smoothed || rec.reverted) continue;
+        OGRFeature* feature = layer->GetFeature(rec.fid);
+        if (!feature) continue;
+        feature->SetGeometry(rec.smoothed.get());
+        layer->SetFeature(feature);
+        OGRFeature::DestroyFeature(feature);
+        stats.afterVertices += CountTotalVertices(rec.smoothed.get());
+    }
+    // 未平滑的要素也计入 after 统计
+    for (const auto& rec : recs) {
+        if (rec.changed && rec.smoothed && !rec.reverted) continue;
+        stats.afterVertices += CountTotalVertices(rec.original.get());
+    }
+
+    layer->SyncToDisk();
+    GDALClose(dataset);
+
+    std::cout << "[Mask smooth] inspected=" << stats.inspected
+              << " changed=" << stats.changed
+              << " before_vertices=" << stats.beforeVertices
+              << " after_vertices=" << stats.afterVertices
+              << " reverted_invalid=" << stats.revertedInvalid
+              << " reverted_type=" << stats.revertedType
+              << " reverted_area=" << stats.revertedArea
+              << " reverted_deviation=" << stats.revertedDeviation
+              << " reverted_adjacency=" << stats.revertedAdjacency
+              << " reverted_no_reduction=" << stats.revertedNoReduction
+              << " holes_preserved=" << stats.holesPreserved << std::endl;
+    return true;
+}
+
 // 给 Shapefile 的每个要素新增或刷新 "area" 属性(平方米)。
 // 掩膜各阶段会重建要素，中途写的面积会过期，
 // 故在全部阶段结束后统一盖章。
@@ -4193,6 +4475,31 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     }
     const long long containedRemoved =
         RemoveContainedSmallFootprints(initialPath.string(), kContainedFootprintMaxArea);
+
+    // 保拓扑平滑：在窄颈拆分和包含清理之后、StampAreaField 之前执行。
+    // 先保存原始副本用于对比诊断。
+    {
+        const std::filesystem::path rawPath = debugDir / "initial_building_outline_raw.shp";
+        if (std::filesystem::exists(initialPath)) {
+            // 复制整个 Shapefile 族
+            for (const char* ext : {".shp", ".shx", ".dbf", ".prj", ".cpg"}) {
+                std::error_code copyEc;
+                std::filesystem::path src = initialPath;
+                src.replace_extension(ext);
+                std::filesystem::path dst = rawPath;
+                dst.replace_extension(ext);
+                if (std::filesystem::exists(src)) {
+                    std::filesystem::copy_file(src, dst,
+                        std::filesystem::copy_options::overwrite_existing, copyEc);
+                }
+            }
+            std::cout << "[MaskOnly] raw initial saved: " << rawPath.string() << std::endl;
+        }
+        InitialOutlineSmoothStats smoothStats;
+        SmoothInitialOutlinesTopologyPreserving(
+            initialPath.string(), maskStats.pixelSizeX, maskStats.pixelSizeY, smoothStats);
+    }
+
     StampAreaField(initialPath.string());
     std::cout << "[MaskOnly] initial outlines saved: " << initialPath.string() << std::endl;
 
