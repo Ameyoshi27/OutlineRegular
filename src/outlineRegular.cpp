@@ -123,6 +123,15 @@ constexpr int kNotchMinSupportPoints = 8;
 constexpr double kNotchPreserveMidpointTol = 1.2;  // meters, bottom-edge midpoint match
 constexpr double kNotchPreserveAngleDeg = 20.0;
 constexpr double kNotchPreserveLengthRatio = 0.5;
+// ---- Direction chain extraction & multi-peak detection ----
+// Split-and-merge continuous edge chain extraction on the closed ring,
+// followed by weighted KDE multi-peak detection in [0°, 90°).
+constexpr double kDirectionMinChainLength = 0.8;        // m, chains shorter than this don't vote
+constexpr double kDirectionMaxAngularResidualDeg = 6.0; // deg, max point-line angular residual for chain fit
+constexpr double kDirectionPeakSeparationDeg = 12.0;    // deg, minimum separation between direction peaks
+constexpr double kDirectionKdeBandwidthDeg = 4.0;       // deg, KDE smoothing bandwidth
+constexpr double kDirectionMinSecondaryRatio = 0.18;    // secondary peak must have >=18% of total weight
+constexpr int kDirectionMinIndependentChains = 2;       // secondary peak needs >=2 spatially independent chains
 // ---- Structure-aware hypothesis repair (single-spike -> rectangle) ----
 // VDP encodes a real rectangular notch/protrusion as ONE extreme vertex (a
 // spike); the energy's vertex-count model term actively prefers that
@@ -3193,6 +3202,343 @@ bool isSingleDirectionCandidateAcceptable(
     return ok;
 }
 
+// ===== Direction chain extraction & multi-peak detection =====
+// Split-and-merge continuous edge chain extraction on a closed ring,
+// followed by weighted KDE multi-peak direction detection in [0°, 90°).
+// Chains replace individual edges as direction evidence: a staircase edge
+// is one noisy chain, not a "diagonal direction".  Curves decompose into
+// short high-RMSE chains that get downweighted, not misread as multi-dir.
+
+struct DirectionChain {
+    std::size_t startIndex = 0;      // index into the ring's vertex list
+    std::size_t endIndex = 0;
+    double length = 0.0;             // meters along the chain
+    double angleRad = 0.0;           // principal direction, folded to [0, π/2)
+    double rmse = 0.0;               // fit RMSE (m)
+    double maxDeviation = 0.0;       // max point-to-line distance (m)
+    double centerX = 0.0;            // chain midpoint (for spatial independence)
+    double centerY = 0.0;
+    double weight = 0.0;             // voting weight for direction estimation
+};
+
+struct DirectionPeak {
+    double angleRad = 0.0;           // folded to [0, π/2)
+    double ratio = 0.0;              // weightedLength / totalWeight
+    double weightedLength = 0.0;
+    int chainCount = 0;
+    double meanRmse = 0.0;
+    bool strong = false;
+};
+
+struct DirectionEvidence2D {
+    bool valid = false;
+    DirectionPeak primary;
+    DirectionPeak secondary;
+    int totalChains = 0;
+    double totalWeightedLength = 0.0;
+    double fitTolerance = 0.0;        // the tolerance used for chain fitting
+    std::vector<DirectionChain> chains;
+    std::vector<DirectionPeak> peaks; // all peaks (primary + secondary + minor)
+    // evidence source: 0=mask chains, 1=OSGB support, 2=fused
+    int source = 0;
+};
+
+// Fit a line to ring[start..end] (inclusive, no wraparound in this helper).
+// Returns false if degenerate. Reports RMSE and max deviation.
+bool FitChainLine(
+    const std::vector<pcl::PointXYZ>& ring,
+    std::size_t start, std::size_t end,
+    double& dirX, double& dirY,
+    double& rmse, double& maxDev)
+{
+    if (end <= start) return false;
+    const std::size_t n = end - start + 1;
+    double mx = 0.0, my = 0.0;
+    for (std::size_t i = start; i <= end; ++i) {
+        mx += ring[i].x; my += ring[i].y;
+    }
+    mx /= n; my /= n;
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (std::size_t i = start; i <= end; ++i) {
+        const double dx = ring[i].x - mx;
+        const double dy = ring[i].y - my;
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+    // principal direction via eigenvector of covariance
+    double theta = 0.5 * std::atan2(2.0 * sxy, sxx - syy);
+    dirX = std::cos(theta);
+    dirY = std::sin(theta);
+    rmse = 0.0; maxDev = 0.0;
+    for (std::size_t i = start; i <= end; ++i) {
+        const double dx = ring[i].x - mx;
+        const double dy = ring[i].y - my;
+        const double perp = -dx * dirY + dy * dirX;
+        rmse += perp * perp;
+        maxDev = std::max(maxDev, std::abs(perp));
+    }
+    rmse = std::sqrt(rmse / n);
+    return std::isfinite(rmse) && std::isfinite(maxDev);
+}
+
+// Recursive split: if the chain from start to end has max deviation > tolerance,
+// split at the max-deviation vertex and recurse both halves.
+void SplitChainRecursive(
+    const std::vector<pcl::PointXYZ>& ring,
+    std::size_t start, std::size_t end,
+    double tolerance,
+    std::vector<std::pair<std::size_t, std::size_t>>& segments)
+{
+    if (end <= start + 1) {
+        segments.push_back({start, end});
+        return;
+    }
+    double dirX, dirY, rmse, maxDev;
+    if (!FitChainLine(ring, start, end, dirX, dirY, rmse, maxDev)) {
+        segments.push_back({start, end});
+        return;
+    }
+    if (maxDev <= tolerance) {
+        segments.push_back({start, end});
+        return;
+    }
+    // find max deviation vertex
+    std::size_t maxIdx = start;
+    double bestDev = 0.0;
+    double mx = 0.0, my = 0.0;
+    const std::size_t n = end - start + 1;
+    for (std::size_t i = start; i <= end; ++i) { mx += ring[i].x; my += ring[i].y; }
+    mx /= n; my /= n;
+    for (std::size_t i = start; i <= end; ++i) {
+        const double dx = ring[i].x - mx;
+        const double dy = ring[i].y - my;
+        const double perp = -dx * dirY + dy * dirX;
+        if (std::abs(perp) > bestDev) {
+            bestDev = std::abs(perp);
+            maxIdx = i;
+        }
+    }
+    if (maxIdx == start || maxIdx == end) {
+        segments.push_back({start, end});
+        return;
+    }
+    SplitChainRecursive(ring, start, maxIdx, tolerance, segments);
+    SplitChainRecursive(ring, maxIdx, end, tolerance, segments);
+}
+
+// Merge adjacent segments whose directions are close and merged fit still
+// satisfies the tolerance.
+void MergeAdjacentSegments(
+    const std::vector<pcl::PointXYZ>& ring,
+    std::vector<std::pair<std::size_t, std::size_t>>& segments,
+    double tolerance,
+    double maxAngleDeg)
+{
+    if (segments.size() < 2) return;
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            std::size_t next = (i + 1) % segments.size();
+            if (next == 0 && segments.size() == 1) break;
+            // check angular proximity
+            double dx1, dy1, rmse1, dev1, dx2, dy2, rmse2, dev2;
+            if (!FitChainLine(ring, segments[i].first, segments[i].second, dx1, dy1, rmse1, dev1)) continue;
+            if (!FitChainLine(ring, segments[next].first, segments[next].second, dx2, dy2, rmse2, dev2)) continue;
+            double dot = std::abs(dx1 * dx2 + dy1 * dy2);
+            if (dot < std::cos(maxAngleDeg * M_PI / 180.0)) continue;
+            // try merged fit
+            std::size_t s = segments[i].first;
+            std::size_t e = segments[next].second;
+            double mDx, mDy, mRmse, mDev;
+            // handle wraparound: if next wraps to index 0, merged goes from s to ring.size()-1 + next.second
+            // for simplicity, only merge non-wrapping pairs in this pass
+            if (next == 0) continue;  // skip wraparound in this simple version
+            if (!FitChainLine(ring, s, e, mDx, mDy, mRmse, mDev)) continue;
+            if (mDev > tolerance) continue;
+            segments[i].second = e;
+            segments.erase(segments.begin() + next);
+            merged = true;
+            break;
+        }
+    }
+}
+
+// Extract continuous edge chains from a closed ring via split-and-merge.
+std::vector<DirectionChain> ExtractDirectionChains(
+    const std::vector<pcl::PointXYZ>& ring,
+    double fitTolerance)
+{
+    std::vector<DirectionChain> chains;
+    if (ring.size() < 4) return chains;
+
+    // duplicate the ring start at the end so the closing edge is a normal segment
+    std::vector<pcl::PointXYZ> extended(ring);
+    extended.push_back(ring[0]);
+
+    // start from the vertex farthest from the centroid to avoid splitting mid-edge
+    double cx = 0.0, cy = 0.0;
+    for (const auto& p : ring) { cx += p.x; cy += p.y; }
+    cx /= ring.size(); cy /= ring.size();
+    std::size_t startIdx = 0;
+    double maxDist = 0.0;
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const double d = std::hypot(ring[i].x - cx, ring[i].y - cy);
+        if (d > maxDist) { maxDist = d; startIdx = i; }
+    }
+
+    // rotate the extended ring so it starts at startIdx
+    std::vector<pcl::PointXYZ> rotated(extended.size());
+    for (std::size_t i = 0; i < extended.size(); ++i) {
+        rotated[i] = extended[(startIdx + i) % extended.size()];
+    }
+
+    std::vector<std::pair<std::size_t, std::size_t>> segments;
+    SplitChainRecursive(rotated, 0, rotated.size() - 1, fitTolerance, segments);
+    MergeAdjacentSegments(rotated, segments, fitTolerance,
+        kDirectionMaxAngularResidualDeg);
+
+    for (const auto& seg : segments) {
+        if (seg.second <= seg.first) continue;
+        double dirX, dirY, rmse, maxDev;
+        if (!FitChainLine(rotated, seg.first, seg.second, dirX, dirY, rmse, maxDev)) continue;
+        double length = 0.0;
+        for (std::size_t i = seg.first; i < seg.second; ++i) {
+            length += std::hypot(rotated[i + 1].x - rotated[i].x,
+                                 rotated[i + 1].y - rotated[i].y);
+        }
+        if (length < kDirectionMinChainLength) continue;
+
+        DirectionChain chain;
+        chain.startIndex = seg.first;
+        chain.endIndex = seg.second;
+        chain.length = length;
+        chain.angleRad = foldedLineAngle90(std::atan2(dirY, dirX));
+        chain.rmse = rmse;
+        chain.maxDeviation = maxDev;
+        chain.centerX = 0.5 * (rotated[seg.first].x + rotated[seg.second].x);
+        chain.centerY = 0.5 * (rotated[seg.first].y + rotated[seg.second].y);
+        // voting weight: length × fit quality
+        const double fitScore = std::exp(
+            -(rmse / std::max(fitTolerance, 0.01)) * (rmse / std::max(fitTolerance, 0.01)));
+        chain.weight = length * fitScore;
+        chains.push_back(chain);
+    }
+    return chains;
+}
+
+// Weighted KDE multi-peak detection on chain angles in [0°, 90°).
+std::vector<DirectionPeak> DetectDirectionPeaks(
+    const std::vector<DirectionChain>& chains,
+    double fitTolerance)
+{
+    std::vector<DirectionPeak> peaks;
+    if (chains.empty()) return peaks;
+
+    double totalWeight = 0.0;
+    for (const auto& c : chains) totalWeight += c.weight;
+    if (totalWeight < 1e-9) return peaks;
+
+    // sample the KDE at 0.5° intervals
+    constexpr int kBins = 180;  // 90° / 0.5°
+    std::vector<double> kde(kBins, 0.0);
+    const double bandwidthRad = kDirectionKdeBandwidthDeg * M_PI / 180.0;
+    for (int b = 0; b < kBins; ++b) {
+        const double angle = (b + 0.5) * 0.5 * M_PI / 180.0;
+        double density = 0.0;
+        for (const auto& c : chains) {
+            double diff = std::abs(angle - c.angleRad);
+            // circular distance in [0, π/2)
+            if (diff > M_PI / 4.0) diff = M_PI / 2.0 - diff;
+            density += c.weight * std::exp(-0.5 * (diff / bandwidthRad) * (diff / bandwidthRad));
+        }
+        kde[b] = density;
+    }
+
+    // find local maxima
+    std::vector<int> maxima;
+    for (int b = 1; b < kBins - 1; ++b) {
+        if (kde[b] > kde[b - 1] && kde[b] >= kde[b + 1] && kde[b] > totalWeight * 0.02) {
+            maxima.push_back(b);
+        }
+    }
+    if (maxima.empty()) return peaks;
+
+    // sort by density descending
+    std::sort(maxima.begin(), maxima.end(),
+        [&](int a, int b) { return kde[a] > kde[b]; });
+
+    // enforce separation
+    const double minSepBins = kDirectionPeakSeparationDeg / 0.5;
+    std::vector<int> selected;
+    for (int m : maxima) {
+        bool separated = true;
+        for (int s : selected) {
+            double diff = std::abs(m - s);
+            if (diff > kBins / 2.0) diff = kBins - diff;
+            if (diff < minSepBins) { separated = false; break; }
+        }
+        if (separated) selected.push_back(m);
+        if (selected.size() >= 4) break;
+    }
+
+    // build peaks with chain membership
+    for (int bin : selected) {
+        const double peakAngle = (bin + 0.5) * 0.5 * M_PI / 180.0;
+        DirectionPeak peak;
+        peak.angleRad = peakAngle;
+        double halfWidth = kDirectionPeakSeparationDeg * 0.5 * M_PI / 180.0;
+        double rmseSum = 0.0;
+        for (const auto& c : chains) {
+            double diff = std::abs(c.angleRad - peakAngle);
+            if (diff > M_PI / 4.0) diff = M_PI / 2.0 - diff;
+            if (diff <= halfWidth) {
+                peak.weightedLength += c.weight;
+                peak.chainCount++;
+                rmseSum += c.rmse;
+            }
+        }
+        if (peak.chainCount > 0) peak.meanRmse = rmseSum / peak.chainCount;
+        peak.ratio = peak.weightedLength / totalWeight;
+        peak.strong = peak.ratio >= 0.30 && peak.chainCount >= 2;
+        peaks.push_back(peak);
+    }
+    return peaks;
+}
+
+// Full direction evidence estimation from a polygon ring.
+DirectionEvidence2D EstimateDirectionEvidence(
+    const std::vector<pcl::PointXYZ>& ring,
+    double pixelSize,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& support)
+{
+    DirectionEvidence2D evidence;
+    const double fitTolerance = std::clamp(
+        0.5 * std::max(pixelSize, 0.3), 0.15, 0.60);
+    evidence.fitTolerance = fitTolerance;
+
+    evidence.chains = ExtractDirectionChains(ring, fitTolerance);
+    evidence.totalChains = static_cast<int>(evidence.chains.size());
+    evidence.totalWeightedLength = 0.0;
+    for (const auto& c : evidence.chains) evidence.totalWeightedLength += c.weight;
+    if (evidence.chains.empty()) return evidence;
+
+    evidence.peaks = DetectDirectionPeaks(evidence.chains, fitTolerance);
+    if (evidence.peaks.empty()) return evidence;
+
+    evidence.primary = evidence.peaks[0];
+    if (evidence.peaks.size() >= 2) {
+        evidence.secondary = evidence.peaks[1];
+        // multi-direction requires: secondary ratio >= threshold AND >= 2 independent chains
+        // single long chain as secondary is not enough
+        if (evidence.secondary.ratio >= kDirectionMinSecondaryRatio &&
+            evidence.secondary.chainCount >= kDirectionMinIndependentChains) {
+            evidence.valid = true;
+        }
+    }
+    evidence.source = support && !support->empty() ? 2 : 0;
+    return evidence;
+}
+
 // A second geometric direction is only credible when the support cloud has an
 // independent direction peak as well.  Polygon edges alone are unreliable on
 // raster staircases and short repaired notches.
@@ -3973,6 +4319,26 @@ void outlineRegular::regular_Contour()
         // 分支，避免"单方向宽松放行"掩盖斜翼被强行正交化的系统性形变
         // (实测案例：IoU=0.69 / mean=4.1m / q90=11.7m 被 relaxed 通道放行)。
         // 检测不到多方向证据的建筑仍走原 SingleFirst 路径，行为不变。
+
+        // ---- 边链方向证据(split-and-merge + KDE 多峰) ----
+        const DirectionEvidence2D chainEvidence =
+            EstimateDirectionEvidence(original_points, resolution, fitting_cloud);
+        std::cerr << "[DirectionEvidence] fid=" << source_feature_id_
+            << " chains=" << chainEvidence.totalChains
+            << " total_weight=" << chainEvidence.totalWeightedLength
+            << " fit_tol=" << chainEvidence.fitTolerance
+            << " source=" << chainEvidence.source << std::endl;
+        for (std::size_t pk = 0; pk < chainEvidence.peaks.size(); ++pk) {
+            const auto& peak = chainEvidence.peaks[pk];
+            std::cerr << "[DirectionPeak] fid=" << source_feature_id_
+                << " peak=" << pk
+                << " angle=" << peak.angleRad * 180.0 / M_PI
+                << " ratio=" << peak.ratio
+                << " chains=" << peak.chainCount
+                << " rmse=" << peak.meanRmse
+                << " strong=" << (peak.strong ? 1 : 0) << std::endl;
+        }
+
         std::vector<DirectionSystem> direction_systems =
             detectDirectionSystems(best_hypothesis, fitting_cloud, model_tuning);
         const SupportDirectionPeaks2D supportPeaks =
@@ -3995,9 +4361,19 @@ void outlineRegular::regular_Contour()
         bool geometric_multi_direction =
             direction_systems.size() >= 2 &&
             hasCredibleMultiDirectionChains(best_hypothesis, direction_systems, model_tuning);
-        bool credible_multi_direction = geometric_multi_direction &&
+        // 边链证据门控：次方向峰必须有权重占比和独立链数支撑
+        const bool chainMultiDirection = chainEvidence.valid;
+        std::cerr << "[MultiChainGate] fid=" << source_feature_id_
+            << " chain_multi=" << (chainMultiDirection ? 1 : 0)
+            << " chain_secondary_ratio=" << chainEvidence.secondary.ratio
+            << " chain_secondary_chains=" << chainEvidence.secondary.chainCount
+            << " geometric_multi=" << (geometric_multi_direction ? 1 : 0)
+            << " wall_secondary=" << (independentWallSecondary ? 1 : 0) << std::endl;
+
+        bool credible_multi_direction =
+            (geometric_multi_direction || chainMultiDirection) &&
             independentWallSecondary;
-        if (geometric_multi_direction && !independentWallSecondary) {
+        if ((geometric_multi_direction || chainMultiDirection) && !independentWallSecondary) {
             std::cerr << "[BuildingMode] strict multi-direction rejected: "
                          "no independent wall secondary peak" << std::endl;
         }
@@ -4007,11 +4383,12 @@ void outlineRegular::regular_Contour()
             const bool relaxedGeometricEvidence = relaxed_systems.size() >= 2 &&
                 hasCredibleMultiDirectionChains(
                     best_hypothesis, relaxed_systems, model_tuning);
-            if (relaxedGeometricEvidence && independentWallSecondary) {
+            const bool relaxedChainEvidence = chainMultiDirection;
+            if ((relaxedGeometricEvidence || relaxedChainEvidence) && independentWallSecondary) {
                 direction_systems = std::move(relaxed_systems);
                 credible_multi_direction = true;
                 std::cerr << "[BuildingMode] relaxed multi-direction evidence accepted" << std::endl;
-            } else if (relaxedGeometricEvidence && !independentWallSecondary) {
+            } else if ((relaxedGeometricEvidence || relaxedChainEvidence) && !independentWallSecondary) {
                 std::cerr << "[BuildingMode] relaxed multi-direction rejected: "
                              "geometry-only secondary direction" << std::endl;
             }
