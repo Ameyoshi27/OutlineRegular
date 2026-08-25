@@ -2770,6 +2770,9 @@ bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
     return model.edges.size() == model.ring.size();
 }
 
+// 前向声明: ReconstructGroupRing 的简单性护栏用到(定义在下方)
+bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring);
+
 // 作用：由优化后的边参数重建环(面积比护栏)。
 bool ReconstructGroupRing(GroupBuildingModel& model)
 {
@@ -2784,6 +2787,12 @@ bool ReconstructGroupRing(GroupBuildingModel& model)
         if (!LineIntersection2D(model.edges[previous], model.edges[i], x, y)) {
             return false;
         }
+        // 交点距离护栏: 近平行边优化后可能产生远距离交点(飞点),
+        // 交点必须落在初始环对应顶点附近
+        if (i < model.initialRing.size() &&
+            std::hypot(x - model.initialRing[i].x, y - model.initialRing[i].y) > 0.8) {
+            return false;
+        }
         pcl::PointXYZ p;
         p.x = static_cast<float>(x);
         p.y = static_cast<float>(y);
@@ -2792,10 +2801,23 @@ bool ReconstructGroupRing(GroupBuildingModel& model)
     }
     RemoveClosingDuplicate(rebuilt);
     if (rebuilt.size() < 3) return false;
+    // 简单多边形(组平差不允许引入自交)
+    if (!MaskOnlyRingIsSimple(rebuilt)) return false;
     const double area = PolygonArea2D(rebuilt);
     const double initialArea = std::max(PolygonArea2D(model.initialRing), 1e-6);
     if (area < 1e-6 || area / initialArea < 0.5 || area / initialArea > 1.8) {
         return false;
+    }
+    // 质心位移护栏: 组平差不允许整体搬动建筑
+    {
+        double cx = 0.0, cy = 0.0, ix = 0.0, iy = 0.0;
+        for (const auto& p : rebuilt) { cx += p.x; cy += p.y; }
+        for (const auto& p : model.initialRing) { ix += p.x; iy += p.y; }
+        cx /= static_cast<double>(rebuilt.size());
+        cy /= static_cast<double>(rebuilt.size());
+        ix /= static_cast<double>(model.initialRing.size());
+        iy /= static_cast<double>(model.initialRing.size());
+        if (std::hypot(cx - ix, cy - iy) > 0.5) return false;
     }
     model.ring.swap(rebuilt);
     return true;
@@ -2915,11 +2937,18 @@ bool OptimizeCeresConflictGroup(
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        bool rebuiltAll = true;
+        // 逐建筑重建: 单体失败(护栏拦截/求交失败)只回退该建筑到
+        // 初始环与初始边参数, 不回退整个组; 全部失败才终止
+        int rebuiltCount = 0;
         for (auto& building : group) {
-            rebuiltAll = ReconstructGroupRing(building) && rebuiltAll;
+            if (ReconstructGroupRing(building)) {
+                ++rebuiltCount;
+            } else {
+                building.ring = building.initialRing;
+                for (auto& edge : building.edges) edge.d = edge.initialD;
+            }
         }
-        if (!rebuiltAll) return anyImproved;
+        if (rebuiltCount == 0) return anyImproved;
         anyImproved = true;
     }
     if (anyImproved) {
@@ -3417,6 +3446,396 @@ bool ResolveOutputOverlaps(OGRLayer* layer,
     return writeOk && stats.unresolvedPairs == 0;
 }
 #endif
+
+// ===== Mask-only 输出重叠解决器 =====
+// 在全部单体规则化完成后统一处理建筑间相交(不在单体过程中掩盖错误)。
+// 冲突处理顺序: 更好的单体候选(初始轮廓) → 带护栏的 Ceres 组平差 →
+// 有位移上限的平移回退 → Difference 裁剪低优先级建筑。
+// 小建筑矩形获得优先级加成: 邻居让位, 矩形本体只被裁掉超出部分,
+// 不会因首次相交整体回退。
+struct MaskOnlyOverlapStats {
+    long long candidates = 0;
+    long long conflictPairs = 0;
+    long long groups = 0;
+    long long repaired = 0;
+    long long clipped = 0;
+    long long unresolved = 0;
+    long long bufferRepaired = 0;   // Buffer(0) 修复的几何
+    long long candidateSwaps = 0;   // 阶段一: 换回初始轮廓解决的对
+    long long groupAdjusted = 0;    // 阶段二: 组平差改写的建筑
+    long long translatedCount = 0;  // 阶段三: 平移解决的对
+    std::vector<long long> clippedFids;
+};
+
+bool ResolveMaskOnlyOutputOverlaps(
+    OGRLayer* layer,
+    const Eigen::Vector3d& originOffset,
+    const std::unordered_map<long long, double>& priorityByFid,
+    const std::unordered_map<long long, std::vector<pcl::PointXYZ>>& alternateByFid,
+    MaskOnlyOverlapStats& stats)
+{
+    stats = {};
+    if (!layer) return false;
+    // ---- 1. 读取 + 几何有效性检查(必要时 Buffer(0) 修复) ----
+    std::vector<OutlineFeatureRecord> features;
+    layer->ResetReading();
+    while (OGRFeature* feature = layer->GetNextFeature()) {
+        OGRGeometry* geometry = feature->GetGeometryRef();
+        if (geometry && !geometry->IsEmpty()) {
+            OutlineFeatureRecord record;
+            record.fid = feature->GetFID();
+            record.geometry.reset(geometry->clone());
+            if (record.geometry && !record.geometry->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(record.geometry->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    record.geometry = std::move(fixed);
+                    ++stats.bufferRepaired;
+                }
+            }
+            if (!record.geometry || record.geometry->IsEmpty() ||
+                !record.geometry->IsValid()) {
+                OGRFeature::DestroyFeature(feature);
+                continue;
+            }
+            record.geometry->getEnvelope(&record.envelope);
+            record.area = GeometryArea(record.geometry.get());
+            record.perimeter = GeometryPerimeter(record.geometry.get());
+            if (record.area > 0.0 && record.perimeter > 0.0) {
+                features.push_back(std::move(record));
+            }
+        }
+        OGRFeature::DestroyFeature(feature);
+    }
+    stats.candidates = static_cast<long long>(features.size());
+    if (features.size() < 2) {
+        std::cout << "[MaskOnlyOverlap] candidates=" << stats.candidates
+                  << " conflict_pairs=0 groups=0 repaired=0 unresolved=0" << std::endl;
+        return true;
+    }
+
+    auto priorityOf = [&](const OutlineFeatureRecord& f) {
+        const auto it = priorityByFid.find(static_cast<long long>(f.fid));
+        return it == priorityByFid.end() ? 0.5 : it->second;
+    };
+    // 严格重叠面积(绝对面积, 不带比例豁免; 验收阈值 0.05m²)
+    auto strictOverlapArea = [](const OGRGeometry* a, const OGRGeometry* b) {
+        if (!a || !b || !a->Intersects(b)) return 0.0;
+        std::unique_ptr<OGRGeometry> inter(a->Intersection(b));
+        return inter ? GeometryArea(inter.get()) : 0.0;
+    };
+    constexpr double kStrictOverlapArea = 0.05;
+    auto bboxDisjoint = [](const OutlineFeatureRecord& a, const OutlineFeatureRecord& b) {
+        return a.envelope.MaxX < b.envelope.MinX || b.envelope.MaxX < a.envelope.MinX ||
+               a.envelope.MaxY < b.envelope.MinY || b.envelope.MaxY < a.envelope.MinY;
+    };
+    auto refreshEnvelope = [](OutlineFeatureRecord& f) {
+        if (f.geometry) {
+            f.geometry->getEnvelope(&f.envelope);
+            f.area = GeometryArea(f.geometry.get());
+            f.perimeter = GeometryPerimeter(f.geometry.get());
+        } else {
+            f.area = f.perimeter = 0.0;
+        }
+    };
+    auto collectConflicts = [&](std::vector<std::pair<std::size_t, std::size_t>>& pairs) {
+        pairs.clear();
+        for (std::size_t i = 0; i < features.size(); ++i) {
+            if (!features[i].geometry) continue;
+            for (std::size_t j = i + 1; j < features.size(); ++j) {
+                if (!features[j].geometry) continue;
+                if (bboxDisjoint(features[i], features[j])) continue;
+                if (strictOverlapArea(features[i].geometry.get(),
+                                      features[j].geometry.get()) > kStrictOverlapArea) {
+                    pairs.emplace_back(i, j);
+                }
+            }
+        }
+    };
+
+    // ---- 2. bbox 预筛 + 冲突图 ----
+    std::vector<std::pair<std::size_t, std::size_t>> conflicts;
+    collectConflicts(conflicts);
+    stats.conflictPairs = static_cast<long long>(conflicts.size());
+    DisjointSet dset(features.size());
+    for (const auto& pr : conflicts) dset.unite(pr.first, pr.second);
+    {
+        std::unordered_map<std::size_t, int> groupSizes;
+        for (std::size_t i = 0; i < features.size(); ++i) ++groupSizes[dset.find(i)];
+        for (const auto& gs : groupSizes) {
+            if (gs.second >= 2) ++stats.groups;
+        }
+    }
+    std::cout << "[MaskOnlyOverlap] candidates=" << stats.candidates << std::endl;
+    std::cout << "[MaskOnlyOverlap] conflict_pairs=" << stats.conflictPairs << std::endl;
+    std::cout << "[MaskOnlyOverlap] groups=" << stats.groups << std::endl;
+    if (conflicts.empty()) return true;
+
+    // ---- 3. 阶段一: 更好的单体候选 ----
+    // 低优先级成员换回规则化前的原始轮廓(局部坐标 + 偏移),
+    // 仅当消除当前冲突且不与任何第三方产生新冲突时采纳。
+    {
+        std::vector<std::pair<std::size_t, std::size_t>> current;
+        collectConflicts(current);
+        for (const auto& pr : current) {
+            auto& fa = features[pr.first];
+            auto& fb = features[pr.second];
+            if (!fa.geometry || !fb.geometry) continue;
+            const bool aYields = priorityOf(fa) < priorityOf(fb);
+            OutlineFeatureRecord& loser = aYields ? fa : fb;
+            const OutlineFeatureRecord& winner = aYields ? fb : fa;
+            const auto altIt = alternateByFid.find(static_cast<long long>(loser.fid));
+            if (altIt == alternateByFid.end() || altIt->second.size() < 3) continue;
+            std::unique_ptr<OGRPolygon> altPoly(
+                MakePolygon(altIt->second, originOffset));
+            if (!altPoly || altPoly->IsEmpty() || !altPoly->IsValid()) continue;
+            if (strictOverlapArea(altPoly.get(), winner.geometry.get()) > kStrictOverlapArea) {
+                continue;
+            }
+            bool newConflict = false;
+            OGREnvelope altEnv;
+            altPoly->getEnvelope(&altEnv);
+            for (std::size_t k = 0; k < features.size() && !newConflict; ++k) {
+                if (k == pr.first || k == pr.second || !features[k].geometry) continue;
+                const auto& env = features[k].envelope;
+                if (altEnv.MaxX < env.MinX || env.MaxX < altEnv.MinX ||
+                    altEnv.MaxY < env.MinY || env.MaxY < altEnv.MinY) continue;
+                if (strictOverlapArea(altPoly.get(), features[k].geometry.get()) >
+                    kStrictOverlapArea) {
+                    newConflict = true;
+                }
+            }
+            if (newConflict) continue;
+            loser.geometry = std::move(altPoly);
+            refreshEnvelope(loser);
+            ++stats.candidateSwaps;
+        }
+    }
+
+    // ---- 4. 阶段二: 带护栏的 Ceres 组平差 ----
+    {
+        std::vector<std::pair<std::size_t, std::size_t>> current;
+        collectConflicts(current);
+        DisjointSet ceresDset(features.size());
+        for (const auto& pr : current) ceresDset.unite(pr.first, pr.second);
+        std::unordered_map<std::size_t, std::vector<std::size_t>> members;
+        for (std::size_t i = 0; i < features.size(); ++i) {
+            members[ceresDset.find(i)].push_back(i);
+        }
+        for (const auto& item : members) {
+            const auto& indices = item.second;
+            if (indices.size() < 2) continue;
+            std::vector<GroupBuildingModel> group;
+            group.reserve(indices.size());
+            bool groupOk = true;
+            for (std::size_t index : indices) {
+                const OGRPolygon* sourcePolygon =
+                    features[index].geometry &&
+                    wkbFlatten(features[index].geometry->getGeometryType()) == wkbPolygon
+                        ? features[index].geometry->toPolygon() : nullptr;
+                const OGRLinearRing* sourceRing =
+                    sourcePolygon ? sourcePolygon->getExteriorRing() : nullptr;
+                if (!sourceRing || sourceRing->getNumPoints() - 1 > 40) {
+                    groupOk = false;
+                    break;
+                }
+                GroupBuildingModel model;
+                if (!BuildGroupModelFromGeometry(features[index], model)) {
+                    groupOk = false;
+                    break;
+                }
+                group.push_back(std::move(model));
+            }
+            if (!groupOk || group.size() < 2) continue;
+            OutputOverlapRepairStats ceresStats;
+            if (!OptimizeCeresConflictGroup(group, ceresStats)) continue;
+            for (std::size_t local = 0; local < group.size(); ++local) {
+                const std::size_t featureIndex = indices[local];
+                std::unique_ptr<OGRPolygon> polygon(
+                    MakePolygon(group[local].ring, Eigen::Vector3d::Zero()));
+                if (!polygon || polygon->IsEmpty() || !polygon->IsValid()) continue;
+                features[featureIndex].geometry.reset(polygon.release());
+                refreshEnvelope(features[featureIndex]);
+                ++stats.groupAdjusted;
+            }
+        }
+    }
+
+    // ---- 5/6. 阶段三+四: 平移回退 → Difference 裁剪(按优先级) ----
+    for (int pass = 0; pass < 4; ++pass) {
+        std::vector<std::pair<std::size_t, std::size_t>> current;
+        collectConflicts(current);
+        if (current.empty()) break;
+        bool changed = false;
+        for (const auto& pr : current) {
+            auto& fa = features[pr.first];
+            auto& fb = features[pr.second];
+            if (!fa.geometry || !fb.geometry) continue;
+            const bool aYields = priorityOf(fa) < priorityOf(fb);
+            OutlineFeatureRecord& loser = aYields ? fa : fb;
+            OutlineFeatureRecord& winner = aYields ? fb : fa;
+
+            // 阶段三: 有位移上限的平移(不得引入新冲突)
+            const double overlapArea =
+                strictOverlapArea(loser.geometry.get(), winner.geometry.get());
+            std::unique_ptr<OGRGeometry> candidate;
+            double shiftDistance = 0.0;
+            bool translated = TryResolvePairByTranslation(
+                winner.geometry.get(), loser.geometry.get(),
+                overlapArea, candidate, shiftDistance);
+            if (translated) {
+                OGREnvelope candEnv;
+                candidate->getEnvelope(&candEnv);
+                for (std::size_t k = 0; k < features.size() && translated; ++k) {
+                    if (k == pr.first || k == pr.second || !features[k].geometry) continue;
+                    const auto& env = features[k].envelope;
+                    if (candEnv.MaxX < env.MinX || env.MaxX < candEnv.MinX ||
+                        candEnv.MaxY < env.MinY || env.MaxY < candEnv.MinY) continue;
+                    if (strictOverlapArea(candidate.get(), features[k].geometry.get()) >
+                        kStrictOverlapArea) {
+                        translated = false;
+                    }
+                }
+                // 平移器内部用较宽的重叠阈值验收, 残余重叠可能仍在
+                // 严格阈值之上——用严格阈值复核本对是否真正解决
+                if (translated &&
+                    strictOverlapArea(candidate.get(), winner.geometry.get()) >
+                        kStrictOverlapArea) {
+                    translated = false;
+                }
+            }
+            if (translated) {
+                loser.geometry = std::move(candidate);
+                refreshEnvelope(loser);
+                ++stats.translatedCount;
+                changed = true;
+                continue;
+            }
+
+            // 阶段四: Difference 裁剪(低优先级让位; 前后有效性检查)
+            if (!loser.geometry->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(loser.geometry->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    loser.geometry = std::move(fixed);
+                }
+            }
+            if (!winner.geometry->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(winner.geometry->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    winner.geometry = std::move(fixed);
+                }
+            }
+            std::unique_ptr<OGRGeometry> clipped(
+                loser.geometry->Difference(winner.geometry.get()));
+            if (!clipped || clipped->IsEmpty()) {
+                loser.geometry.reset();
+            } else if (!clipped->IsValid()) {
+                std::unique_ptr<OGRGeometry> fixed(clipped->Buffer(0.0));
+                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                    clipped = std::move(fixed);
+                } else {
+                    clipped.reset();
+                }
+            }
+            if (clipped) {
+                loser.geometry = std::move(clipped);
+            } else {
+                loser.geometry.reset();
+            }
+            refreshEnvelope(loser);
+            ++stats.clipped;
+            stats.clippedFids.push_back(static_cast<long long>(loser.fid));
+            // 裁剪后面积过小的残留删除
+            if (loser.geometry) {
+                const double bboxArea =
+                    (loser.envelope.MaxX - loser.envelope.MinX) *
+                    (loser.envelope.MaxY - loser.envelope.MinY);
+                if (loser.area < kMinOutputPolygonArea ||
+                    bboxArea < kMinOutputPolygonBBoxArea) {
+                    loser.geometry.reset();
+                    refreshEnvelope(loser);
+                }
+            }
+            changed = true;
+        }
+        if (!changed) break;
+    }
+    stats.repaired = std::max<long long>(0, stats.conflictPairs -
+        [&] {
+            std::vector<std::pair<std::size_t, std::size_t>> current;
+            collectConflicts(current);
+            return static_cast<long long>(current.size());
+        }());
+
+    // ---- 7. 写回 ----
+    if (!layer->TestCapability(OLCRandomWrite)) {
+        std::cerr << "[MaskOnlyOverlap] layer does not support random writes" << std::endl;
+        return false;
+    }
+    for (const auto& feature : features) {
+        OGRFeature* target = layer->GetFeature(feature.fid);
+        if (!target) continue;
+        const OGRErr setGeometryErr = feature.geometry
+            ? target->SetGeometry(feature.geometry.get())
+            : target->SetGeometry(nullptr);
+        if (setGeometryErr == OGRERR_NONE) {
+            layer->SetFeature(target);
+        }
+        OGRFeature::DestroyFeature(target);
+    }
+
+    // ---- 8. 最终严格检查: 先有效性修复, 再绝对面积相交检测 ----
+    {
+        std::vector<OutlineFeatureRecord> finalFeats;
+        layer->ResetReading();
+        while (OGRFeature* feature = layer->GetNextFeature()) {
+            OGRGeometry* geometry = feature->GetGeometryRef();
+            if (geometry && !geometry->IsEmpty()) {
+                OutlineFeatureRecord record;
+                record.fid = feature->GetFID();
+                record.geometry.reset(geometry->clone());
+                if (record.geometry && !record.geometry->IsValid()) {
+                    std::unique_ptr<OGRGeometry> fixed(record.geometry->Buffer(0.0));
+                    if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                        record.geometry = std::move(fixed);
+                        OGRFeature* target = layer->GetFeature(feature->GetFID());
+                        if (target) {
+                            target->SetGeometry(record.geometry.get());
+                            layer->SetFeature(target);
+                            OGRFeature::DestroyFeature(target);
+                        }
+                    }
+                }
+                if (record.geometry && !record.geometry->IsEmpty()) {
+                    record.geometry->getEnvelope(&record.envelope);
+                    finalFeats.push_back(std::move(record));
+                }
+            }
+            OGRFeature::DestroyFeature(feature);
+        }
+        for (std::size_t i = 0; i < finalFeats.size(); ++i) {
+            for (std::size_t j = i + 1; j < finalFeats.size(); ++j) {
+                if (bboxDisjoint(finalFeats[i], finalFeats[j])) continue;
+                const double area = strictOverlapArea(
+                    finalFeats[i].geometry.get(), finalFeats[j].geometry.get());
+                if (area > kStrictOverlapArea) {
+                    ++stats.unresolved;
+                    std::cerr << "[MaskOnlyOverlap] unresolved fid="
+                              << finalFeats[i].fid << " x " << finalFeats[j].fid
+                              << " area=" << area << std::endl;
+                }
+            }
+        }
+    }
+
+    std::cout << "[MaskOnlyOverlap] repaired=" << stats.repaired << std::endl;
+    std::cout << "[MaskOnlyOverlap] unresolved=" << stats.unresolved << std::endl;
+    std::string clippedList;
+    for (std::size_t i = 0; i < stats.clippedFids.size(); ++i) {
+        clippedList += (i ? "," : "") + std::to_string(stats.clippedFids[i]);
+    }
+    std::cout << "[MaskOnlyOverlap] clipped_fids=" << clippedList << std::endl;
+    return stats.unresolved == 0;
+}
 
 // 作用：初始轮廓过分割合并阶段：按接缝证据/形状/大建筑兜底就地合并 Shapefile。
 // GeometryOnly 模式仅执行同 parent + 共享边下限的确定性合并，不调 OSGB 证据。
@@ -4693,6 +5112,9 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
         double sumAreaRatio = 0.0;
     };
     std::vector<PathStatAccum> pathStats(4);
+    // 重叠解决器输入: 建筑优先级与"更好的单体候选"(初始轮廓, 局部坐标)
+    std::unordered_map<long long, double> overlapPriorityByFid;
+    std::unordered_map<long long, std::vector<pcl::PointXYZ>> overlapAlternateByFid;
     long long total = 0;
     long long okCount = 0;
     long long emptyGeom = 0;
@@ -4774,6 +5196,30 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                 const double outA = std::abs(PolygonArea2D(result));
                 if (initA > 1e-6) st.sumAreaRatio += outA / initA;
             }
+            // 重叠解决器输入采集:
+            // 优先级 = 路径置信度 + 面积规模 + 小建筑矩形语义加成
+            {
+                double prio = 0.5;
+                switch (path) {
+                    case MaskOnlyPath::Topology: prio += 0.35; break;
+                    case MaskOnlyPath::Vdp: prio += 0.15; break;
+                    case MaskOnlyPath::BestHypothesis: break;
+                    case MaskOnlyPath::InitialRing: prio -= 0.25; break;
+                }
+                prio += 0.20 * std::min(1.0, std::abs(PolygonArea2D(result)) / 200.0);
+                // 小建筑矩形(≤6顶点的 VDP 矩形拟合): 提高优先级,
+                // 相交时邻居让位, 矩形只被裁掉超出部分
+                if (path == MaskOnlyPath::Vdp && result.size() <= 6) prio += 0.15;
+                const long long key = static_cast<long long>(buildingId);
+                const auto prev = overlapPriorityByFid.find(key);
+                if (prev == overlapPriorityByFid.end() || prev->second < prio) {
+                    overlapPriorityByFid[key] = prio;
+                }
+                // 单环要素记录初始轮廓作为备选候选
+                if (parts.size() == 1 && path != MaskOnlyPath::InitialRing) {
+                    overlapAlternateByFid[key] = ring;
+                }
+            }
 
             if (bestHypothesis.size() >= 3) {
                 debugCollector.hypotheses.push_back(
@@ -4824,6 +5270,20 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
         }
     }
     auto loopEnd = std::chrono::steady_clock::now();
+
+    // ---- 全局重叠解决: 所有单体规则化完成后统一处理建筑间相交 ----
+    {
+        MaskOnlyOverlapStats overlapStats;
+        ResolveMaskOnlyOutputOverlaps(
+            outLayer, originOffset,
+            overlapPriorityByFid, overlapAlternateByFid, overlapStats);
+        std::cout << "[MaskOnlyOverlap] summary buffer_repaired="
+                  << overlapStats.bufferRepaired
+                  << " candidate_swaps=" << overlapStats.candidateSwaps
+                  << " group_adjusted=" << overlapStats.groupAdjusted
+                  << " translated=" << overlapStats.translatedCount
+                  << " clipped=" << overlapStats.clipped << std::endl;
+    }
     outDataset->FlushCache();
     GDALClose(outDataset);
     GDALClose(inDataset);
