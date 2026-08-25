@@ -3622,14 +3622,14 @@ namespace {
 
 constexpr double kDirDiagStableMinLength = 1.5;    // m, 稳定链长度下限(高于投票下限 0.8)
 constexpr double kDirDiagSeedMinLength = 3.0;      // m, 单链成系统的最小长度(配合连续性/占比约束)
-constexpr double kDirDiagSystemMinSeparationDeg = 12.0; // 候选方向间最小角距(防吞并相邻方向)
-constexpr double kDirDiagAssignDeg = 9.0;          // 稳定链归组阈值(统一分配, 就近候选)
-constexpr double kDirDiagShortAssignDeg = 13.0;    // 短链归组阈值
-constexpr double kDirDiagLongRescueDeg = 18.0;     // 未归组长链(>=3m)抢救归组上限
+constexpr double kDirDiagSystemMinSeparationDeg = 20.0; // 候选方向间最小角距: 低于此值视为同一方向的栅格抖动(楼梯链角误差±5~8°, 同向簇可差10~15°)
+constexpr double kDirDiagAssignDeg = 16.0;         // 稳定链归组阈值(统一分配, 就近候选)
+constexpr double kDirDiagShortAssignDeg = 16.0;    // 短链归组阈值
+constexpr double kDirDiagLongRescueDeg = 20.0;     // 未归组长链(>=3m)抢救归组上限
 constexpr double kDirDiagStructuralTurnDeg = 45.0; // 相邻链转角超过此值=显著凹凸/窄颈
 constexpr int kDirDiagMaxCandidates = 7;           // 候选方向上限(防御异常; 90°/12°分离理论约7)
 constexpr int kDirDiagMaxFinalSystems = 5;         // 最终可信系统上限(超过标记 complex 不静默丢弃)
-constexpr double kDirDiagSystemMinChainFrac = 0.08; // 多链系统最小支持长度占稳定链总长比
+constexpr double kDirDiagSystemMinChainFrac = 0.15; // 多链系统最小支持长度占稳定链总长比(8%时楼梯碎片凑数成系统)
 constexpr double kDirDiagUnassignedWeakRatio = 0.05;  // 未归组长链弱支持占比阈值(≤此值不回退)
 constexpr double kDirDiagUnassignedHighRatio = 0.10;  // 未归组长链占比>此值且无法成新系统→不确定
 constexpr double kDirDiagGrayZoneScoreMin = 0.60;     // 灰区(5%~10%)时单/多方向模型评分下限
@@ -3638,8 +3638,8 @@ constexpr double kDirDiagSpikeMaxArea = 0.30;      // m², 尖刺三角面积上
 constexpr double kDirDiagZigzagChordDev = 0.12;    // m, 近共线锯齿顶点偏离弦的上限
 constexpr double kDirDiagShortDiagMinLen = 0.8;    // m, 短斜边方向检查的长度下限
 constexpr double kDirDiagSupportRadius = 0.6;      // m, 支撑点计数半径
-constexpr double kDirDiagMultiGainMin = 0.10;      // 多方向判定: multi比single评分高多少
-constexpr double kDirDiagMultiFracMin = 0.15;      // 多方向判定: 次系统权重占比下限
+constexpr double kDirDiagMultiGainMin = 0.20;      // 多方向判定: multi比single评分高多少
+constexpr double kDirDiagMultiFracMin = 0.22;      // 多方向判定: 次系统权重占比下限
 
 struct DirectionSystemDiag {
     double angleRad = 0.0;        // 系统代表方向(折叠[0°,90°))
@@ -3649,6 +3649,7 @@ struct DirectionSystemDiag {
     double weight = 0.0;          // 加权支持(长度×拟合质量)
     double meanRmse = 0.0;        // 平均拟合残差
     double meanContinuity = 0.0;  // 平均连续性(弦长/弧长, 1=直线)
+    double concentration = 0.0;   // 圆集中度(四倍角合向量长度R, 1=成员角完全集中)
     double extent = 0.0;          // 空间覆盖: 成员端点 bbox 对角线
     double kdePeak = 0.0;         // 系统角度处的 KDE 密度
     long long supportPoints = 0;  // 成员链关联的支撑点数
@@ -3670,7 +3671,7 @@ double DirDiagPointToSegmentDistance(
 
 constexpr double kDirDiagCertaintyConf = 0.15;   // 主系统置信度下限, 低于则方向不确定
 constexpr double kDirDiagCertaintyScore = 0.30;  // 单方向评分下限
-constexpr double kDirDiagMultiSecondConf = 0.05; // 多方向判定: 次系统置信度下限
+constexpr double kDirDiagMultiSecondConf = 0.18; // 多方向判定: 次系统置信度下限
 constexpr double kDirDiagMultiSecondLength = 15.0; // 多方向判定: 次系统绝对支持长度旁路(m)
 
 struct DirectionChainAssignment {
@@ -3815,6 +3816,17 @@ DirectionSystemBuild BuildDirectionSystems(
             if (!memberAngles.empty()) {
                 sys.angleRad = circularMeanAngle90(memberAngles, memberWeights);
                 sys.meanContinuity = continuitySum / memberAngles.size();
+                // 圆集中度 R = |Σw·e^{i4θ}| / Σw: 真方向系统的成员角
+                // 高度集中(平行墙折叠后 ±3°, R≈1); 楼梯/噪声碎片的
+                // 角度簇分散(R 低)——用 R 区分真方向与凑数簇
+                double cx4 = 0.0, cy4 = 0.0, wSum = 0.0;
+                for (std::size_t k = 0; k < memberAngles.size(); ++k) {
+                    cx4 += memberWeights[k] * std::cos(4.0 * memberAngles[k]);
+                    cy4 += memberWeights[k] * std::sin(4.0 * memberAngles[k]);
+                    wSum += memberWeights[k];
+                }
+                sys.concentration =
+                    wSum > 1e-9 ? std::hypot(cx4, cy4) / wSum : 0.0;
             }
             angles[s] = sys.angleRad;
         }
@@ -3822,8 +3834,13 @@ DirectionSystemBuild BuildDirectionSystems(
     // 删除指定系统并统一重映射 chainInfo.system 索引
     // (donor<keeper 时 erase 会使 keeper 及其后继索引前移)
     auto removeSystem = [&](std::size_t donor, std::size_t keeper) {
-        const int keeperAfter = static_cast<int>(
-            keeper > donor ? keeper - 1 : keeper);
+        // keeper 无效(无幸存系统/donor 自身)时成员置为未分配,
+        // 否则全灭路径会留下悬空 system 索引, 后续 remap 越界崩溃
+        const bool hasKeeper =
+            keeper < systems.size() && keeper != donor;
+        const int keeperAfter = hasKeeper
+            ? static_cast<int>(keeper > donor ? keeper - 1 : keeper)
+            : -1;
         for (auto& info : build.chainInfo) {
             int& s = info.system;
             if (s < 0) continue;
@@ -3833,9 +3850,13 @@ DirectionSystemBuild BuildDirectionSystems(
         systems.erase(systems.begin() + donor);
     };
     // 候选可信度: ≥2 条稳定链且支持长度占比达标;
-    // 或单条可信长链(连续性≥0.85, 长度≥max(15m, 周长10%))
+    // 或单条可信长链(连续性≥0.85, 长度≥max(15m, 周长10%))。
+    // 所有路线都要求圆集中度 R≥0.80(成员角集中才是真方向系统,
+    // 楼梯/噪声碎片簇 R 低, 否则单方向建筑会被拆成 4~6 个
+    // 垃圾系统——实测 65/94 的质量投诉源于此)
     auto systemCredible = [&](const DirectionSystemDiag& sys) {
         if (sys.chainCount <= 0) return false;
+        if (sys.concentration < 0.80) return false;
         if (sys.chainCount >= 2) {
             return sys.totalLength >=
                 kDirDiagSystemMinChainFrac *
@@ -3927,7 +3948,12 @@ DirectionSystemBuild BuildDirectionSystems(
             }
             for (auto& info : build.chainInfo) {
                 if (info.system >= 0) {
-                    info.system = remap[static_cast<std::size_t>(info.system)];
+                    // 越界防御: 悬空索引(不应发生)按未分配处理
+                    if (static_cast<std::size_t>(info.system) >= remap.size()) {
+                        info.system = -1;
+                    } else {
+                        info.system = remap[static_cast<std::size_t>(info.system)];
+                    }
                 }
             }
             systems.swap(kept);
@@ -3935,7 +3961,8 @@ DirectionSystemBuild BuildDirectionSystems(
 
         // ---- 阶段四: 精化后角距<8°的系统合并 ----
         {
-            const double mergeRad = 8.0 * M_PI / 180.0;
+            const double mergeRad = 14.0 * M_PI / 180.0;
+            int mergeGuard = 0;
             bool merged = true;
             while (merged && systems.size() >= 2) {
                 merged = false;
@@ -9987,6 +10014,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                       << " angle_deg=" << sys.angleRad * 180.0 / M_PI
                       << " chains=" << sys.chainCount
                       << " total_length=" << sys.totalLength
+                      << " concentration=" << sys.concentration
                       << " confidence=" << sys.confidence << std::endl;
         }
         int stableCount = 0, assignedCount = 0;
