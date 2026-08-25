@@ -637,6 +637,74 @@ void SetDatasetSpatialInfo(GDALDataset* dataset,
     if (projection && projection[0] != '\0') dataset->SetProjection(projection);
 }
 
+// 颜色漂移聚类容差(逐通道)。
+// 多批次叠加/重采样会让同一实例色漂移 ±1~2(实测 0x2b1501 vs 0x2a1501，
+// 即 RGB(43,21,1) vs (42,21,1))。精确匹配的颜色量化把漂移色当成新实例，
+// 同一栋楼被拆成多个 parent，后续按 parent 判同源的合并就永远合不回来。
+// 真实实例色板内部色差远大于此容差(实测 be1401 vs e91501: R 相差 43)，
+// 聚到一起的都是漂移副本，不会误并不同实例。
+constexpr int kColorDriftMaxChannelDelta = 2;
+
+long long MergeColorDriftLabels(cv::Mat& colorImage,
+                                long long& repaintedPixels)
+{
+    // 1) 统计每种颜色的像素数
+    std::unordered_map<int, long long> counts;
+    counts.reserve(256);
+    for (int y = 0; y < colorImage.rows; ++y) {
+        const int* row = colorImage.ptr<int>(y);
+        for (int x = 0; x < colorImage.cols; ++x) {
+            if (row[x] != 0) ++counts[row[x]];
+        }
+    }
+    if (counts.size() < 2) {
+        repaintedPixels = 0;
+        return 0;
+    }
+    // 2) 按像素数降序：高频色优先作为代表色(真实色应占多数，漂移色是少数)
+    std::vector<std::pair<int, long long>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    // 3) 贪心聚类: 与任一已接受代表色逐通道差 <= 容差 → 并入该代表色
+    std::vector<int> canonical;
+    canonical.reserve(sorted.size());
+    std::unordered_map<int, int> remap;
+    auto channelDelta = [](int a, int b, int shift) {
+        return std::abs(((a >> shift) & 255) - ((b >> shift) & 255));
+    };
+    for (const auto& item : sorted) {
+        const int color = item.first;
+        int target = -1;
+        for (const int canon : canonical) {
+            if (channelDelta(color, canon, 16) <= kColorDriftMaxChannelDelta &&
+                channelDelta(color, canon, 8) <= kColorDriftMaxChannelDelta &&
+                channelDelta(color, canon, 0) <= kColorDriftMaxChannelDelta) {
+                target = canon;
+                break;
+            }
+        }
+        if (target >= 0) remap[color] = target;
+        else canonical.push_back(color);
+    }
+    if (remap.empty()) {
+        repaintedPixels = 0;
+        return 0;
+    }
+    // 4) LUT 重写
+    repaintedPixels = 0;
+    for (int y = 0; y < colorImage.rows; ++y) {
+        int* row = colorImage.ptr<int>(y);
+        for (int x = 0; x < colorImage.cols; ++x) {
+            const auto it = remap.find(row[x]);
+            if (it != remap.end()) {
+                row[x] = it->second;
+                ++repaintedPixels;
+            }
+        }
+    }
+    return static_cast<long long>(remap.size());
+}
+
 // 对大连通域，通过检测窄腰判断是否拆分
 // whether the distance-transform core contains multiple separated peaks.
 bool SplitNarrowWaistComponent(const cv::Mat& componentMask,
@@ -1123,6 +1191,15 @@ bool VectorizeBuildingMask(const std::string& tifPath,
             colorImage, stats.pixelSizeX * stats.pixelSizeY);
         RemoveBatchWrapperRings(
             colorImage, stats.pixelSizeX * stats.pixelSizeY);
+        // 颜色漂移聚类：在实例分离之前把 ±1~2 的漂移副本并回高频代表色，
+        // 否则同一栋楼按颜色被拆成多个实例(parent)，后续同源合并失效
+        long long repaintedPixels = 0;
+        const long long mergedColors = MergeColorDriftLabels(colorImage, repaintedPixels);
+        if (mergedColors > 0) {
+            std::cerr << "[Mask] color drift merged: " << mergedColors
+                      << " colors repainted into canonical, "
+                      << repaintedPixels << " px affected" << std::endl;
+        }
     }
     std::unordered_map<int, int> labelToParent;
     cv::Mat separated = SeparateColorComponents(

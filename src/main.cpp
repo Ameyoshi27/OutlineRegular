@@ -3489,12 +3489,30 @@ bool MergeOversegmentedInitialOutlines(
             }
 
             if (mode == InitialMergeMode::GeometryOnly) {
-                // 保守几何合并：仅同 parent + 共享边下限。
-                // 不调 ShouldMergeByFootprintShape、largePair、OSGB 接缝证据。
+                // 保守几何合并：同 parent(同实例色)直接合并。
+                // 兜底两条纯几何判据(不依赖 OSGB 点云)，覆盖 parent 因
+                // 颜色漂移/连通域断裂而失真的过分割：
+                //   1) 形状互补(并集面积/周长吻合) —— 中小建筑的主判据；
+                //   2) 大建筑长共享边 —— min面积>1500m² 且共享边>=3m。
+                // wrapper 伪影会被形状互补校验(并集须为单多边形)拦住。
                 if (a.parent > 0 && a.parent == b.parent) {
                     groups.unite(i, j);
                     ++stats.mergedPairs;
                     ++stats.mergedByParent;
+                    continue;
+                }
+                if (ShouldMergeByFootprintShape(a, b, sharedLength)) {
+                    groups.unite(i, j);
+                    ++stats.mergedPairs;
+                    ++stats.mergedByShape;
+                    continue;
+                }
+                if (std::min(a.area, b.area) > kLargeBuildingMergeArea &&
+                    sharedLength >= kMergeSeamLength) {
+                    groups.unite(i, j);
+                    ++stats.mergedPairs;
+                    ++stats.mergedByBigPair;
+                    continue;
                 }
                 continue;
             }
