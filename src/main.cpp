@@ -4767,7 +4767,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     long long sourceFid,
     std::vector<pcl::PointXYZ>* bestHypothesisOut,
     MaskOnlyFallback* fallbackLevel,
-    MaskOnlyPath* pathOut = nullptr)
+    MaskOnlyPath* pathOut = nullptr,
+    int partIndex = 0)
 {
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
     if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
@@ -4800,9 +4801,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
               << " peak_ratio=" << contourRatio
               << " pairs=" << contourPairs << std::endl;
 
-    // 方向系统诊断(只读): 加权KDE+稳定链贪心聚类, 只打日志不改行为
-    outlineRegular::RunDirectionSystemDiagnostic(
-        sourceFid, ring, kMaskResidualSpacing, contourCloud);
+    // 方向诊断已并入 TopologyPreservingRegularize(单次调用统一用于
+    // 决策/吸附/上下文/日志), 不再单独执行不同输入的第二遍诊断
 
     std::vector<double> weights(contourCloud->size(), 1.0);
     outlineRegular regularizer(ring, contourCloud, weights);
@@ -4818,7 +4818,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
         auto topoResult = regularizer.TopologyPreservingRegularize(
-            ring, kMaskResidualSpacing, topoFallback, &dirCtx);
+            ring, kMaskResidualSpacing, topoFallback, &dirCtx, partIndex);
         if (!topoResult.empty()) {
             if (bestHypothesisOut) *bestHypothesisOut = topoResult;
             if (pathOut) *pathOut = MaskOnlyPath::Topology;
@@ -4863,7 +4863,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // 返回), 也不能直接进入输出; 逐级退到最优假设、初始轮廓。
     if (result.size() >= 3) {
         const std::string vdpReason =
-            outlineRegular::CheckRingQuality(result, ring, dirCtx);
+            outlineRegular::CheckRingQuality(result, ring, dirCtx, 2.5, sourceFid, partIndex);
         if (!vdpReason.empty()) {
             std::cerr << "[VDPReject] fid=" << sourceFid
                       << " stage=final reason=" << vdpReason << std::endl;
@@ -4882,7 +4882,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     }
     if (bestHypothesis.size() >= 3) {
         const std::string hypReason =
-            outlineRegular::CheckRingQuality(bestHypothesis, ring, dirCtx);
+            outlineRegular::CheckRingQuality(bestHypothesis, ring, dirCtx, 2.5, sourceFid, partIndex);
         if (!hypReason.empty()) {
             std::cerr << "[VDPReject] fid=" << sourceFid
                       << " stage=best_hypothesis reason=" << hypReason << std::endl;
@@ -5178,7 +5178,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             MaskOnlyPath path = MaskOnlyPath::InitialRing;
             auto result = RegularizeRingFromMaskOnly(
                 ring, static_cast<long long>(buildingId), &bestHypothesis,
-                &fallback, &path);
+                &fallback, &path, ringIdx - 1);
             if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
             if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
             // 路径统计: 顶点数/短边数(<0.5m)/面积变化
