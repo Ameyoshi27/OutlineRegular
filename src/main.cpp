@@ -4430,10 +4430,14 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     if (result.size() < 3) {
         result = bestHypothesis;
         if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
+        std::cerr << "[TopologyFallbackToBestHypothesis] fid=" << sourceFid
+                  << " vertices=" << bestHypothesis.size() << std::endl;
     }
     if (result.size() < 3) {
         result = ring;
         if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
+        std::cerr << "[TopologyFallbackToInitial] fid=" << sourceFid
+                  << " vertices=" << ring.size() << std::endl;
     }
     std::cerr << "[MaskOnlyHypothesis] fid=" << sourceFid
               << " initial_vertices=" << ring.size()
