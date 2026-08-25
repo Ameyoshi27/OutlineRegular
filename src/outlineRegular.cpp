@@ -3577,6 +3577,63 @@ DirectionEvidence2D EstimateDirectionEvidence(
     return evidence;
 }
 
+// ===== 方向系统诊断(只读通道) =====
+// 目的: 验证"加权 KDE + 稳定边链贪心聚类"的混合方向检测是否比现有
+// 全局 KDE 更稳。只输出 [DirectionDiag] 日志，不改变
+// DirectionDecision / TopologyPreservingRegularize / Ceres 的任何行为。
+//
+// 设计要点:
+// - 检测对象是 ExtractDirectionChains 的稳定边链(非原始像素短边)，
+//   链自带长度/拟合RMSE/端点坐标，楼梯残差已在链层面被吸收;
+// - 方向系统 = theta / theta+90° 一组: 折叠角空间([0°,90°))天然满足
+//   平行边与垂直边同系统(垂直边折叠后与平行边重合);
+// - 贪心聚类种子从权重前 N 的稳定链中依次考察，不无条件取最长链，
+//   并要求系统成立门槛(成员数>=2 或种子足够长);
+// - 短链不作种子也不丢弃: 能归组则归组，位于显著转折(凹凸/窄颈)的
+//   标记为受保护结构，其余记为自由边/噪声。
+namespace {
+
+constexpr double kDirDiagStableMinLength = 1.5;    // m, 稳定链长度下限(高于投票下限 0.8)
+constexpr double kDirDiagSeedMinLength = 3.0;      // m, 单链即可成系统的种子长度
+constexpr int kDirDiagMaxSeedCandidates = 6;       // 从权重前 N 条稳定链中选种子
+constexpr double kDirDiagSystemMergeDeg = 12.0;    // 新系统与已有系统的最小角距
+constexpr double kDirDiagAssignDeg = 18.0;         // 稳定链归组容差
+constexpr double kDirDiagShortAssignDeg = 20.0;    // 短链归组容差(略宽)
+constexpr double kDirDiagStructuralTurnDeg = 45.0; // 相邻链转角超过此值=显著凹凸/窄颈
+constexpr int kDirDiagMaxSystems = 3;              // 方向系统上限
+constexpr double kDirDiagSupportRadius = 0.6;      // m, 支撑点计数半径
+constexpr double kDirDiagMultiGainMin = 0.10;      // 多方向判定: multi比single评分高多少
+constexpr double kDirDiagMultiFracMin = 0.15;      // 多方向判定: 次系统权重占比下限
+
+struct DirectionSystemDiag {
+    double angleRad = 0.0;        // 系统代表方向(折叠[0°,90°))
+    int chainCount = 0;           // 归入的稳定链数
+    int shortRegrouped = 0;       // 归入的短链数
+    double totalLength = 0.0;     // 稳定链总长度
+    double weight = 0.0;          // 加权支持(长度×拟合质量)
+    double meanRmse = 0.0;        // 平均拟合残差
+    double extent = 0.0;          // 空间覆盖: 成员端点 bbox 对角线
+    double kdePeak = 0.0;         // 系统角度处的 KDE 密度
+    long long supportPoints = 0;  // 成员链关联的支撑点数
+    double confidence = 0.0;      // 方向置信度 [0,1]
+};
+
+double DirDiagPointToSegmentDistance(
+    double px, double py,
+    const pcl::PointXYZ& a, const pcl::PointXYZ& b)
+{
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-12) return std::hypot(px - a.x, py - a.y);
+    double t = ((px - a.x) * dx + (py - a.y) * dy) / lenSq;
+    t = std::clamp(t, 0.0, 1.0);
+    return std::hypot(px - a.x - t * dx, py - a.y - t * dy);
+}
+
+} // namespace
+
+
 // A second geometric direction is only credible when the support cloud has an
 // independent direction peak as well.  Polygon edges alone are unreliable on
 // raster staircases and short repaired notches.
@@ -3677,6 +3734,308 @@ SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
         result.secondaryRatio >= kSupportDirectionStrongPeakRatio;
     return result;
 }
+}
+void outlineRegular::RunDirectionSystemDiagnostic(
+    long long fid,
+    const std::vector<pcl::PointXYZ>& ring,
+    double pixelSize,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& supportCloud)
+{
+    // 1. 稳定边链提取(与拓扑通道同参数, 保证诊断与实跑几何一致)
+    const double fitTolerance = std::clamp(
+        std::max(0.50, 1.2 * pixelSize), 0.15, 0.90);
+    const auto chains = ExtractDirectionChains(ring, fitTolerance);
+    if (chains.size() < 3) return;
+
+    // 2. 逐链指标: 长度/rmse 已有, 补连续性(弦长/弧长)与支撑点数
+    struct ChainDiag {
+        int chainIndex = 0;
+        bool stable = false;
+        double continuity = 0.0;   // 端点直线距 / 弧长, 1=完美直线
+        long long supportPts = 0;
+        int system = -1;           // 归组结果, -1=未归组
+        bool protectedStructure = false;
+    };
+    std::vector<ChainDiag> diag(chains.size());
+    double chordRatioSum = 0.0;
+    for (std::size_t i = 0; i < chains.size(); ++i) {
+        const auto& c = chains[i];
+        diag[i].chainIndex = static_cast<int>(i);
+        const double chord = std::hypot(c.endPoint.x - c.startPoint.x,
+                                        c.endPoint.y - c.startPoint.y);
+        diag[i].continuity = chord / std::max(c.length, 1e-9);
+        chordRatioSum += diag[i].continuity;
+        diag[i].stable = c.length >= kDirDiagStableMinLength &&
+                         c.rmse <= fitTolerance;
+        if (supportCloud && !supportCloud->empty()) {
+            for (const auto& p : supportCloud->points) {
+                if (DirDiagPointToSegmentDistance(
+                        p.x, p.y, c.startPoint, c.endPoint) <=
+                        kDirDiagSupportRadius) {
+                    ++diag[i].supportPts;
+                }
+            }
+        }
+    }
+
+    // 3. 稳定链加权 KDE 峰(候选方向证据)
+    std::vector<DirectionChain> stableChains;
+    for (std::size_t i = 0; i < chains.size(); ++i) {
+        if (diag[i].stable) stableChains.push_back(chains[i]);
+    }
+    const auto peaks = DetectDirectionPeaks(stableChains, fitTolerance);
+
+    // 4. 贪心方向系统聚类: 从权重前 N 的稳定链依次考察种子
+    std::vector<DirectionSystemDiag> systems;
+    {
+        std::vector<std::size_t> candidates;
+        for (std::size_t i = 0; i < chains.size(); ++i) {
+            if (diag[i].stable) candidates.push_back(i);
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return chains[a].weight > chains[b].weight;
+                  });
+        if (candidates.size() >
+            static_cast<std::size_t>(kDirDiagMaxSeedCandidates)) {
+            candidates.resize(
+                static_cast<std::size_t>(kDirDiagMaxSeedCandidates));
+        }
+        const double mergeRad = kDirDiagSystemMergeDeg * M_PI / 180.0;
+        for (std::size_t seedIdx : candidates) {
+            if (static_cast<int>(systems.size()) >= kDirDiagMaxSystems) break;
+            // 种子必须未被归组: 已属既有系统的链(在 12°~18° 容差缝隙内)
+            // 不能再开新系统, 否则产生 0 条稳定链的空系统
+            if (diag[seedIdx].system >= 0) continue;
+            const double seedAngle = chains[seedIdx].angleRad;
+            bool nearExisting = false;
+            for (const auto& s : systems) {
+                if (foldedAngleDistance90(seedAngle, s.angleRad) < mergeRad) {
+                    nearExisting = true;
+                    break;
+                }
+            }
+            if (nearExisting) continue;
+
+            // 试建系统: 系统角先取种子角, 若 12° 内有 KDE 峰则用峰角
+            double sysAngle = seedAngle;
+            for (const auto& pk : peaks) {
+                if (foldedAngleDistance90(seedAngle, pk.angleRad) < mergeRad) {
+                    sysAngle = pk.angleRad;
+                    break;
+                }
+            }
+            // 归组稳定链
+            const double assignRad = kDirDiagAssignDeg * M_PI / 180.0;
+            std::vector<std::size_t> members;
+            for (std::size_t i = 0; i < chains.size(); ++i) {
+                if (!diag[i].stable) continue;
+                if (diag[i].system >= 0) continue;  // 已归组, 不抢
+                if (foldedAngleDistance90(chains[i].angleRad, sysAngle) <=
+                    assignRad) {
+                    members.push_back(i);
+                }
+            }
+            // 种子必须落在成员里(未归组保证了这一点), 空成员集不成系统
+            const bool viable = !members.empty() &&
+                (members.size() >= 2 ||
+                 chains[seedIdx].length >= kDirDiagSeedMinLength);
+            if (!viable) continue;
+
+            DirectionSystemDiag sys;
+            sys.angleRad = sysAngle;
+            double wAngleSum = 0.0;
+            for (std::size_t m : members) {
+                diag[m].system = static_cast<int>(systems.size());
+                sys.totalLength += chains[m].length;
+                sys.weight += chains[m].weight;
+                sys.supportPoints += diag[m].supportPts;
+                wAngleSum += chains[m].weight * chains[m].angleRad;
+            }
+            // 角度精化: 成员加权均值(折叠空间内聚类半径小, 线性均值即可)
+            if (sys.weight > 1e-9) {
+                sys.angleRad = foldedLineAngle90(wAngleSum / sys.weight);
+            }
+            sys.chainCount = static_cast<int>(members.size());
+            systems.push_back(sys);
+        }
+    }
+
+    // 5. 系统统计: rmse/范围/KDE密度/置信度
+    double totalStableWeight = 0.0;
+    for (std::size_t i = 0; i < chains.size(); ++i) {
+        if (diag[i].stable) totalStableWeight += chains[i].weight;
+    }
+    const double bandwidthRad = kDirectionKdeBandwidthDeg * M_PI / 180.0;
+    for (auto& sys : systems) {
+        double rmseSum = 0.0;
+        double minX = 1e18, minY = 1e18, maxX = -1e18, maxY = -1e18;
+        for (std::size_t i = 0; i < chains.size(); ++i) {
+            const auto& c = chains[i];
+            if (diag[i].system == static_cast<int>(&sys - systems.data())) {
+                if (diag[i].stable) rmseSum += c.rmse;
+                minX = std::min(minX, (double)c.startPoint.x);
+                maxX = std::max(maxX, (double)c.startPoint.x);
+                minX = std::min(minX, (double)c.endPoint.x);
+                maxX = std::max(maxX, (double)c.endPoint.x);
+                minY = std::min(minY, (double)c.startPoint.y);
+                maxY = std::max(maxY, (double)c.startPoint.y);
+                minY = std::min(minY, (double)c.endPoint.y);
+                maxY = std::max(maxY, (double)c.endPoint.y);
+            }
+        }
+        // KDE 密度 = 全部链的核贡献(与 DetectDirectionPeaks 同定义)
+        double kdeDensity = 0.0;
+        for (const auto& c : chains) {
+            kdeDensity += c.weight * std::exp(
+                -0.5 * std::pow(foldedAngleDistance90(c.angleRad, sys.angleRad) /
+                                bandwidthRad, 2));
+        }
+        sys.meanRmse = sys.chainCount > 0 ? rmseSum / sys.chainCount : 0.0;
+        sys.extent = (minX <= maxX && minY <= maxY)
+            ? std::hypot(maxX - minX, maxY - minY) : 0.0;
+        sys.kdePeak = kdeDensity;
+        const double supportFrac =
+            totalStableWeight > 1e-9 ? sys.weight / totalStableWeight : 0.0;
+        const double fitFactor = std::exp(-sys.meanRmse / std::max(fitTolerance, 0.01));
+        sys.confidence = std::clamp(supportFrac * fitFactor, 0.0, 1.0);
+    }
+
+    // 6. 短链处置: 归组 / 受保护结构 / 自由边
+    int shortRegrouped = 0, shortProtected = 0, shortFree = 0;
+    {
+        const double shortAssignRad = kDirDiagShortAssignDeg * M_PI / 180.0;
+        for (std::size_t i = 0; i < chains.size(); ++i) {
+            if (diag[i].stable || diag[i].system >= 0) continue;
+            const auto& c = chains[i];
+            // 最近系统
+            int bestSys = -1;
+            double bestDist = shortAssignRad;
+            for (std::size_t s = 0; s < systems.size(); ++s) {
+                const double d = foldedAngleDistance90(
+                    c.angleRad, systems[s].angleRad);
+                if (d < bestDist) { bestDist = d; bestSys = static_cast<int>(s); }
+            }
+            if (bestSys >= 0) {
+                diag[i].system = bestSys;
+                ++systems[static_cast<std::size_t>(bestSys)].shortRegrouped;
+                ++shortRegrouped;
+                continue;
+            }
+            // 显著凹凸/窄颈: 与相邻链的转角大
+            const std::size_t n = chains.size();
+            const auto turnDeg = [&](std::size_t a, std::size_t b) {
+                return foldedAngleDistance90(
+                    chains[a].angleRad, chains[b].angleRad) * 180.0 / M_PI;
+            };
+            const double turnPrev = turnDeg((i + n - 1) % n, i);
+            const double turnNext = turnDeg(i, (i + 1) % n);
+            if (std::max(turnPrev, turnNext) >= kDirDiagStructuralTurnDeg) {
+                diag[i].protectedStructure = true;
+                ++shortProtected;
+            } else {
+                ++shortFree;
+            }
+        }
+    }
+
+    // 7. 单/多方向模型评分: 角度加权残差解释率
+    double singleScore = 0.0, multiScore = 0.0;
+    std::string verdict = "single";
+    {
+        double totalW = 0.0;
+        for (const auto& c : chains) totalW += c.weight;
+        if (totalW > 1e-9 && !systems.empty()) {
+            const double norm = std::pow(45.0 * M_PI / 180.0, 2);
+            auto residualTo = [&](const std::vector<double>& angles) {
+                double r = 0.0;
+                for (std::size_t i = 0; i < chains.size(); ++i) {
+                    double best = foldedAngleDistance90(
+                        chains[i].angleRad, angles.front());
+                    for (double a : angles) {
+                        best = std::min(best, foldedAngleDistance90(
+                            chains[i].angleRad, a));
+                    }
+                    r += chains[i].weight * best * best;
+                }
+                return r;
+            };
+            std::vector<double> singleAngle = { systems.front().angleRad };
+            std::vector<double> multiAngles;
+            for (const auto& s : systems) multiAngles.push_back(s.angleRad);
+            const double rS = residualTo(singleAngle);
+            const double rM = residualTo(multiAngles);
+            singleScore = 1.0 - std::sqrt(rS / (totalW * norm));
+            multiScore = 1.0 - std::sqrt(rM / (totalW * norm));
+            if (systems.size() >= 2) {
+                const double secondFrac =
+                    totalStableWeight > 1e-9
+                        ? systems[1].weight / totalStableWeight
+                        : 0.0;
+                if (multiScore - singleScore >= kDirDiagMultiGainMin &&
+                    secondFrac >= kDirDiagMultiFracMin &&
+                    systems[1].chainCount >= kDirectionMinIndependentChains) {
+                    verdict = "multi";
+                }
+            }
+        }
+    }
+
+    // 8. 日志输出(格式统一, 带 fid)
+    int shortTotal = 0;
+    for (const auto& d : diag) {
+        if (!d.stable) ++shortTotal;
+    }
+    std::cerr << "[DirectionDiag] fid=" << fid
+              << " chains=" << chains.size()
+              << " stable=" << stableChains.size()
+              << " short=" << shortTotal
+              << " systems=" << systems.size()
+              << " kde_peaks=" << peaks.size()
+              << " mean_continuity=" << (chains.empty() ? 0.0 : chordRatioSum / chains.size())
+              << std::endl;
+    for (std::size_t s = 0; s < systems.size(); ++s) {
+        const auto& sys = systems[s];
+        std::cerr << "[DirectionDiag] fid=" << fid
+                  << " system=" << s
+                  << " angle_deg=" << sys.angleRad * 180.0 / M_PI
+                  << " chains=" << sys.chainCount
+                  << " short_regrouped=" << sys.shortRegrouped
+                  << " total_length=" << sys.totalLength
+                  << " mean_rmse=" << sys.meanRmse
+                  << " extent=" << sys.extent
+                  << " kde_peak=" << sys.kdePeak
+                  << " support_pts=" << sys.supportPoints
+                  << " conf=" << sys.confidence
+                  << std::endl;
+    }
+    if (shortTotal > 0) {
+        std::cerr << "[DirectionDiag] fid=" << fid
+                  << " short_regrouped=" << shortRegrouped
+                  << " short_protected=" << shortProtected
+                  << " short_free=" << shortFree
+                  << std::endl;
+    }
+    std::cerr << "[DirectionDiag] fid=" << fid
+              << " single_score=" << singleScore
+              << " multi_score=" << multiScore
+              << " verdict=" << verdict
+              << std::endl;
+    // 多方向案例补链级明细, 便于核对短斜边归属
+    if (verdict == "multi") {
+        for (std::size_t i = 0; i < chains.size(); ++i) {
+            const auto& c = chains[i];
+            std::cerr << "[DirectionDiag] fid=" << fid
+                      << " chain=" << i
+                      << " len=" << c.length
+                      << " rmse=" << c.rmse
+                      << " cont=" << diag[i].continuity
+                      << " ang_deg=" << c.angleRad * 180.0 / M_PI
+                      << " sys=" << diag[i].system
+                      << (diag[i].protectedStructure ? " PROTECTED" : "")
+                      << std::endl;
+        }
+    }
 }
 
 // 结构感知假设修复的运行级汇总(实现在上面的

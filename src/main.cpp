@@ -4377,6 +4377,10 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
               << " peak_ratio=" << contourRatio
               << " pairs=" << contourPairs << std::endl;
 
+    // 方向系统诊断(只读): 加权KDE+稳定链贪心聚类, 只打日志不改行为
+    outlineRegular::RunDirectionSystemDiagnostic(
+        sourceFid, ring, kMaskResidualSpacing, contourCloud);
+
     std::vector<double> weights(contourCloud->size(), 1.0);
     outlineRegular regularizer(ring, contourCloud, weights);
     regularizer.setSourceFeatureId(sourceFid);

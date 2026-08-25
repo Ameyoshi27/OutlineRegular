@@ -140,6 +140,13 @@ public:
 		double& angle,
 		double& peakRatio,
 		std::size_t& pairCount);
+	// 方向系统诊断(只读通道): 加权KDE + 稳定边链贪心聚类,
+	// 仅输出 [DirectionDiag] 日志, 不改变规则化行为。
+	static void RunDirectionSystemDiagnostic(
+		long long fid,
+		const std::vector<pcl::PointXYZ>& ring,
+		double pixelSize,
+		const pcl::PointCloud<pcl::PointXYZ>::Ptr& supportCloud);
 	static bool estimatePcaDirection2D(
 		const pcl::PointCloud<pcl::PointXYZ>::Ptr& points,
 		double& angle,
