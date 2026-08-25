@@ -4338,6 +4338,8 @@ bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring)
 }
 
 enum class MaskOnlyFallback { Final = 0, Hypothesis, Initial };
+// 规则化最终路径(统计与日志用)
+enum class MaskOnlyPath { Topology = 0, Vdp, BestHypothesis, InitialRing };
 
 // Mask-only 规则化入口：轮廓点既是残差点云，
 // 也是方向证据，供原封不动的 regular_Contour 管线使用。
@@ -4345,9 +4347,11 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     const std::vector<pcl::PointXYZ>& ring,
     long long sourceFid,
     std::vector<pcl::PointXYZ>* bestHypothesisOut,
-    MaskOnlyFallback* fallbackLevel)
+    MaskOnlyFallback* fallbackLevel,
+    MaskOnlyPath* pathOut = nullptr)
 {
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
+    if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
     if (ring.size() < 3) {
         if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
         return ring;
@@ -4385,22 +4389,29 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     outlineRegular regularizer(ring, contourCloud, weights);
     regularizer.setSourceFeatureId(sourceFid);
     regularizer.setSupportDirectionHint(contourDir, contourRatio, contourPairs);
+    // 拓扑通道的方向结论(传给 VDP 备用结果做方向一致性检查)
+    outlineRegular::DirectionContextOut dirCtx;
 
-    // ---- 拓扑保持实验通道(可选) ----
+    // ---- 拓扑保持通道(主流程) ----
     // 从边链出发而非VDP假设，保留真实凹凸/窄颈拓扑。
+    // 合格即直接采用; 失败(链不足/方向不确定/候选不合格/Ceres 大位移/
+    // 斜边/圆形轮廓)转 VDP 备用, 方向上下文随之传出。
     if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
         auto topoResult = regularizer.TopologyPreservingRegularize(
-            ring, kMaskResidualSpacing, topoFallback);
+            ring, kMaskResidualSpacing, topoFallback, &dirCtx);
         if (!topoResult.empty()) {
             if (bestHypothesisOut) *bestHypothesisOut = topoResult;
+            if (pathOut) *pathOut = MaskOnlyPath::Topology;
+            std::cerr << "[RegularizationPath] fid=" << sourceFid
+                      << " topology" << std::endl;
             std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
                       << " vertices=" << topoResult.size() << std::endl;
             return topoResult;
         }
         if (topoFallback) {
             std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
-                      << " fallback to normal pipeline" << std::endl;
+                      << " fallback to VDP pipeline" << std::endl;
         }
     }
 
@@ -4427,27 +4438,52 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                       regularizer.final_points->points.end());
         RemoveClosingDuplicate(result);
     }
-    if (result.size() < 3) {
-        result = bestHypothesis;
-        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
-        std::cerr << "[TopologyFallbackToBestHypothesis] fid=" << sourceFid
-                  << " vertices=" << bestHypothesis.size() << std::endl;
+
+    // ---- VDP 备用结果质量闸门: 与拓扑结果同一标准 ----
+    // 不合格的 VDP 结果不能覆盖合格的拓扑结果(拓扑合格已在上方直接
+    // 返回), 也不能直接进入输出; 逐级退到最优假设、初始轮廓。
+    if (result.size() >= 3) {
+        const std::string vdpReason =
+            outlineRegular::CheckRingQuality(result, ring, dirCtx);
+        if (!vdpReason.empty()) {
+            std::cerr << "[VDPReject] fid=" << sourceFid
+                      << " stage=final reason=" << vdpReason << std::endl;
+            result.clear();
+        }
     }
-    if (result.size() < 3) {
-        result = ring;
-        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
-        std::cerr << "[TopologyFallbackToInitial] fid=" << sourceFid
-                  << " vertices=" << ring.size() << std::endl;
+    if (result.size() >= 3) {
+        if (pathOut) *pathOut = MaskOnlyPath::Vdp;
+        std::cerr << "[RegularizationPath] fid=" << sourceFid << " vdp" << std::endl;
+        std::cerr << "[MaskOnlyHypothesis] fid=" << sourceFid
+                  << " initial_vertices=" << ring.size()
+                  << " final_vertices=" << result.size()
+                  << " initial_area=" << PolygonArea2D(ring)
+                  << " final_area=" << PolygonArea2D(result) << std::endl;
+        return result;
     }
-    std::cerr << "[MaskOnlyHypothesis] fid=" << sourceFid
-              << " initial_vertices=" << ring.size()
-              << " best_vertices=" << bestHypothesis.size()
-              << " final_vertices=" << result.size()
-              << " initial_area=" << PolygonArea2D(ring)
-              << " best_area=" << PolygonArea2D(bestHypothesis)
-              << " fallback=" << static_cast<int>(fallbackLevel ? *fallbackLevel
-                                                                : MaskOnlyFallback::Final)
-              << std::endl;
+    if (bestHypothesis.size() >= 3) {
+        const std::string hypReason =
+            outlineRegular::CheckRingQuality(bestHypothesis, ring, dirCtx);
+        if (!hypReason.empty()) {
+            std::cerr << "[VDPReject] fid=" << sourceFid
+                      << " stage=best_hypothesis reason=" << hypReason << std::endl;
+        } else {
+            result = bestHypothesis;
+            if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
+            if (pathOut) *pathOut = MaskOnlyPath::BestHypothesis;
+            std::cerr << "[RegularizationPath] fid=" << sourceFid
+                      << " best_hypothesis" << std::endl;
+            std::cerr << "[TopologyFallbackToBestHypothesis] fid=" << sourceFid
+                      << " vertices=" << bestHypothesis.size() << std::endl;
+            return result;
+        }
+    }
+    result = ring;
+    if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
+    if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
+    std::cerr << "[RegularizationPath] fid=" << sourceFid << " initial_ring" << std::endl;
+    std::cerr << "[TopologyFallbackToInitial] fid=" << sourceFid
+              << " vertices=" << ring.size() << std::endl;
     return result;
 }
 
@@ -4649,6 +4685,14 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
 
     RegularizationDebugCollector debugCollector;
+    // 各路径统计: topology / vdp / best_hypothesis / initial_ring
+    struct PathStatAccum {
+        long long count = 0;
+        double sumVerts = 0.0;
+        long long sumShortEdges = 0;
+        double sumAreaRatio = 0.0;
+    };
+    std::vector<PathStatAccum> pathStats(4);
     long long total = 0;
     long long okCount = 0;
     long long emptyGeom = 0;
@@ -4709,10 +4753,27 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             }
             std::vector<pcl::PointXYZ> bestHypothesis;
             MaskOnlyFallback fallback = MaskOnlyFallback::Final;
+            MaskOnlyPath path = MaskOnlyPath::InitialRing;
             auto result = RegularizeRingFromMaskOnly(
-                ring, static_cast<long long>(buildingId), &bestHypothesis, &fallback);
+                ring, static_cast<long long>(buildingId), &bestHypothesis,
+                &fallback, &path);
             if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
             if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
+            // 路径统计: 顶点数/短边数(<0.5m)/面积变化
+            {
+                auto& st = pathStats[static_cast<std::size_t>(path)];
+                ++st.count;
+                st.sumVerts += static_cast<double>(result.size());
+                for (std::size_t i = 0; i < result.size(); ++i) {
+                    const double len = std::hypot(
+                        result[(i + 1) % result.size()].x - result[i].x,
+                        result[(i + 1) % result.size()].y - result[i].y);
+                    if (len < 0.5) ++st.sumShortEdges;
+                }
+                const double initA = std::abs(PolygonArea2D(ring));
+                const double outA = std::abs(PolygonArea2D(result));
+                if (initA > 1e-6) st.sumAreaRatio += outA / initA;
+            }
 
             if (bestHypothesis.size() >= 3) {
                 debugCollector.hypotheses.push_back(
@@ -4766,6 +4827,21 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     outDataset->FlushCache();
     GDALClose(outDataset);
     GDALClose(inDataset);
+
+    // 路径统计汇总
+    {
+        const char* pathNames[4] = { "topology", "vdp", "best_hypothesis", "initial_ring" };
+        for (int p = 0; p < 4; ++p) {
+            const auto& st = pathStats[static_cast<std::size_t>(p)];
+            if (st.count == 0) continue;
+            std::cout << "[PathStats] path=" << pathNames[p]
+                      << " count=" << st.count
+                      << " avg_verts=" << st.sumVerts / st.count
+                      << " avg_short_edges=" << static_cast<double>(st.sumShortEdges) / st.count
+                      << " avg_area_ratio=" << st.sumAreaRatio / st.count
+                      << std::endl;
+        }
+    }
 
     const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";
     SaveDebugBestHypotheses(debugBestPath, debugCollector, srsClone, originOffset);

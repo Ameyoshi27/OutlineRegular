@@ -3907,6 +3907,170 @@ DirectionSystemBuild BuildDirectionSystems(
     return build;
 }
 
+// 多边形质量检查(拓扑候选/Ceres 结果/VDP 备用结果共用同一标准)。
+// initialRing 为参考环。hasDirection=false 时跳过方向检查(无方向
+// 上下文的备用结果); multiDirection=true 时 >3m 长边须贴近
+// allowedAngles(系统角+自由链角, 折叠角) 12°内, false 时用输出自身
+// 加权主导族 10°。返回空串=通过, 否则返回原因。
+std::string CheckPolygonQualityVsRing(
+    const std::vector<pcl::PointXYZ>& poly,
+    const std::vector<pcl::PointXYZ>& initialRing,
+    bool hasDirection,
+    bool multiDirection,
+    const std::vector<double>& allowedAngles,
+    double maxVertexDisp)
+{
+    if (poly.size() < 3) return "too_few_vertices";
+    if (!isSimplePolygon2D(poly)) return "self_intersecting";
+    // 零长边与异常短边链(凹凸台阶的短边是合法拓扑, 只拦退化)
+    int shortRun = 0;
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const double len = std::hypot(
+            poly[(i + 1) % poly.size()].x - poly[i].x,
+            poly[(i + 1) % poly.size()].y - poly[i].y);
+        if (len < 0.02) return "zero_length_edge";
+        if (len < 0.15) {
+            if (++shortRun >= 3) return "short_edge_run";
+        } else {
+            shortRun = 0;
+        }
+    }
+    // 参考环统计: 面积/面积加权威心/包围盒对角线/边界距离
+    double ringArea = std::abs(polygonArea2D(initialRing));
+    double ra = 0.0, rsx = 0.0, rsy = 0.0;
+    double ringMinX = 1e18, ringMinY = 1e18, ringMaxX = -1e18, ringMaxY = -1e18;
+    for (std::size_t i = 0; i < initialRing.size(); ++i) {
+        const auto& p = initialRing[i];
+        const auto& q = initialRing[(i + 1) % initialRing.size()];
+        const double cross = p.x * q.y - q.x * p.y;
+        ra += cross;
+        rsx += (p.x + q.x) * cross;
+        rsy += (p.y + q.y) * cross;
+        ringMinX = std::min(ringMinX, (double)p.x);
+        ringMaxX = std::max(ringMaxX, (double)p.x);
+        ringMinY = std::min(ringMinY, (double)p.y);
+        ringMaxY = std::max(ringMaxY, (double)p.y);
+    }
+    double ringCx, ringCy;
+    if (std::abs(ra) > 1e-12) {
+        ringCx = rsx / (3.0 * ra);
+        ringCy = rsy / (3.0 * ra);
+    } else {
+        ringCx = 0.0; ringCy = 0.0;
+        for (const auto& p : initialRing) { ringCx += p.x; ringCy += p.y; }
+        ringCx /= static_cast<double>(initialRing.size());
+        ringCy /= static_cast<double>(initialRing.size());
+    }
+    const double ringDiagonal = std::hypot(ringMaxX - ringMinX, ringMaxY - ringMinY);
+    auto distToRing = [&](const pcl::PointXYZ& pt) {
+        double best = std::numeric_limits<double>::max();
+        for (std::size_t i = 0; i < initialRing.size(); ++i) {
+            const auto& a = initialRing[i];
+            const auto& b = initialRing[(i + 1) % initialRing.size()];
+            const double dx = b.x - a.x;
+            const double dy = b.y - a.y;
+            const double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-12) continue;
+            double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+            t = std::clamp(t, 0.0, 1.0);
+            const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+            best = std::min(best, d);
+        }
+        return best;
+    };
+
+    const double polyArea = std::abs(polygonArea2D(poly));
+    const double ratio = polyArea / std::max(ringArea, 1e-6);
+    if (ratio < 0.60 || ratio > 1.60) return "area_ratio=" + std::to_string(ratio);
+    // 异常长边(飞点特征)
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const double len = std::hypot(
+            poly[(i + 1) % poly.size()].x - poly[i].x,
+            poly[(i + 1) % poly.size()].y - poly[i].y);
+        if (len > 1.1 * ringDiagonal) return "abnormal_long_edge";
+    }
+    // 质心位移(面积加权): 规则化不应整体搬动建筑
+    {
+        double pa2 = 0.0, psx = 0.0, psy = 0.0;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const auto& p = poly[i];
+            const auto& q = poly[(i + 1) % poly.size()];
+            const double cross = p.x * q.y - q.x * p.y;
+            pa2 += cross;
+            psx += (p.x + q.x) * cross;
+            psy += (p.y + q.y) * cross;
+        }
+        double cx, cy;
+        if (std::abs(pa2) > 1e-12) {
+            cx = psx / (3.0 * pa2);
+            cy = psy / (3.0 * pa2);
+        } else {
+            cx = 0.0; cy = 0.0;
+            for (const auto& p : poly) { cx += p.x; cy += p.y; }
+            cx /= static_cast<double>(poly.size());
+            cy /= static_cast<double>(poly.size());
+        }
+        if (std::hypot(cx - ringCx, cy - ringCy) > 1.0) return "centroid_shift";
+    }
+    // 墙面贴合(边中点到环边界<=1.2m)与顶点位移(飞点)
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const auto& p1 = poly[i];
+        const auto& p2 = poly[(i + 1) % poly.size()];
+        pcl::PointXYZ mid;
+        mid.x = 0.5f * (p1.x + p2.x);
+        mid.y = 0.5f * (p1.y + p2.y);
+        mid.z = p1.z;
+        if (distToRing(mid) > 1.20) return "wall_deviation";
+    }
+    for (const auto& p : poly) {
+        if (distToRing(p) > maxVertexDisp) return "flying_vertex";
+    }
+    // 方向误差: >3m 长边须贴合法方向(系统/自由链/主导族)
+    if (!hasDirection) return "";
+    struct LongEdge { double len; double ang; };
+    std::vector<LongEdge> longEdges;
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const auto& p1 = poly[i];
+        const auto& p2 = poly[(i + 1) % poly.size()];
+        const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        if (len >= 3.0) {
+            longEdges.push_back({len, std::atan2(p2.y - p1.y, p2.x - p1.x)});
+        }
+    }
+    if (longEdges.empty()) return "";
+    if (multiDirection) {
+        // 多方向容差 12°: 优化基准角允许在系统角附近小幅精化
+        for (const auto& e : longEdges) {
+            bool ok = false;
+            for (double a : allowedAngles) {
+                if (foldedAngleDistance90(e.ang, a) * 180.0 / M_PI <= 12.0) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return "direction_violation";
+        }
+    } else {
+        // 单方向: 总支持长度最大的边方向族为基准
+        double bestRef = 0.0, bestSupport = -1.0;
+        for (const auto& cand : longEdges) {
+            double support = 0.0;
+            for (const auto& e : longEdges) {
+                if (foldedAngleDistance90(e.ang, cand.ang) * 180.0 / M_PI <= 10.0) {
+                    support += e.len;
+                }
+            }
+            if (support > bestSupport) { bestSupport = support; bestRef = cand.ang; }
+        }
+        for (const auto& e : longEdges) {
+            if (foldedAngleDistance90(e.ang, bestRef) * 180.0 / M_PI > 10.0) {
+                return "direction_violation";
+            }
+        }
+    }
+    return "";
+}
+
 } // namespace
 
 
@@ -9099,10 +9263,32 @@ enum class TopologyRegularizationStatus {
     FailedUseNormalPipeline
 };
 
+// 备用结果质量检查的公开入口: 组装方向合法角集合后转发共享实现
+std::string outlineRegular::CheckRingQuality(
+    const std::vector<pcl::PointXYZ>& poly,
+    const std::vector<pcl::PointXYZ>& initialRing,
+    const DirectionContextOut& dirContext,
+    double maxVertexDisp)
+{
+    std::vector<double> allowed;
+    bool multi = false;
+    if (dirContext.valid && dirContext.multiDirection) {
+        allowed = dirContext.systemAngles;
+        allowed.insert(allowed.end(),
+                       dirContext.freeChainAngles.begin(),
+                       dirContext.freeChainAngles.end());
+        multi = true;
+    }
+    return CheckPolygonQualityVsRing(
+        poly, initialRing, /*hasDirection=*/dirContext.valid, multi,
+        allowed, maxVertexDisp);
+}
+
 std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     const std::vector<pcl::PointXYZ>& initialRing,
     double pixelSize,
-    bool& usedFallback)
+    bool& usedFallback,
+    DirectionContextOut* dirContext)
 {
     usedFallback = false;
     if (initialRing.size() < 6) {
@@ -9114,6 +9300,28 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     if (area < 5.0) {
         usedFallback = true;
         return {};
+    }
+
+    // ---- 0.5 圆形/曲线轮廓预检 ----
+    // 等周比接近 1 的圆形轮廓在正交格网吸附下会产生劣质多边形;
+    // regular_Contour 内置圆/椭圆检测, 此类轮廓直接交给 VDP。
+    // 方形建筑等周比≈0.785, 一般建筑 <=0.85, 阈值 0.90 只拦真圆。
+    {
+        double perim = 0.0;
+        for (std::size_t i = 0; i < initialRing.size(); ++i) {
+            perim += std::hypot(
+                initialRing[(i + 1) % initialRing.size()].x - initialRing[i].x,
+                initialRing[(i + 1) % initialRing.size()].y - initialRing[i].y);
+        }
+        const double roundness =
+            4.0 * M_PI * std::abs(area) / std::max(perim * perim, 1e-9);
+        if (roundness >= 0.90) {
+            usedFallback = true;
+            std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
+                      << " reason=contour_circular roundness=" << roundness
+                      << std::endl;
+            return {};
+        }
     }
 
     // ---- 1. 边链提取(split-and-merge, 修复版) ----
@@ -9222,6 +9430,26 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         return {};
     }
     const bool isMultiDirection = dirBuild.multiDirection;
+
+    // 方向上下文传出: 供 VDP 备用结果的方向一致性检查(多方向建筑
+    // 不能被 VDP 无条件压成单方向)。方向不确定时不带约束。
+    if (dirContext) {
+        dirContext->valid = dirBuild.directionCertain;
+        dirContext->multiDirection = isMultiDirection;
+        dirContext->systemAngles.clear();
+        dirContext->freeChainAngles.clear();
+        if (dirBuild.directionCertain) {
+            for (const auto& s : dirBuild.systems) {
+                dirContext->systemAngles.push_back(s.angleRad);
+            }
+            for (std::size_t i = 0; i < allChains.size(); ++i) {
+                if (dirBuild.chainInfo[i].stable &&
+                    dirBuild.chainInfo[i].system < 0) {
+                    dirContext->freeChainAngles.push_back(allChains[i].angleRad);
+                }
+            }
+        }
+    }
 
     std::cerr << "[DirectionApply] fid=" << source_feature_id_
               << " mode=" << (isMultiDirection ? "multi" : "single")
@@ -9442,57 +9670,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         }
     }
 
-    // ---- 3.5 几何参考量与质量检查器(候选与 Ceres 结果共用) ----
-    // 面积加权威心(顶点均值在顶点分布不均时会严重偏移, 不能用作位移判据)
-    auto areaCentroid = [](const std::vector<pcl::PointXYZ>& poly,
-                           double& cx, double& cy) {
-        double a = 0.0, sx = 0.0, sy = 0.0;
-        for (std::size_t i = 0; i < poly.size(); ++i) {
-            const auto& p = poly[i];
-            const auto& q = poly[(i + 1) % poly.size()];
-            const double cross = p.x * q.y - q.x * p.y;
-            a += cross;
-            sx += (p.x + q.x) * cross;
-            sy += (p.y + q.y) * cross;
-        }
-        if (std::abs(a) < 1e-12) {
-            cx = 0.0; cy = 0.0;
-            for (const auto& p : poly) { cx += p.x; cy += p.y; }
-            cx /= static_cast<double>(poly.size());
-            cy /= static_cast<double>(poly.size());
-            return;
-        }
-        cx = sx / (3.0 * a);
-        cy = sy / (3.0 * a);
-    };
-    double ringCx = 0.0, ringCy = 0.0;
-    double ringMinX = 1e18, ringMinY = 1e18, ringMaxX = -1e18, ringMaxY = -1e18;
-    for (const auto& p : initialRing) {
-        ringMinX = std::min(ringMinX, (double)p.x);
-        ringMaxX = std::max(ringMaxX, (double)p.x);
-        ringMinY = std::min(ringMinY, (double)p.y);
-        ringMaxY = std::max(ringMaxY, (double)p.y);
-    }
-    areaCentroid(initialRing, ringCx, ringCy);
-    const double ringDiagonal = std::hypot(ringMaxX - ringMinX, ringMaxY - ringMinY);
-    auto distToRing = [&](const pcl::PointXYZ& pt) {
-        double best = std::numeric_limits<double>::max();
-        for (std::size_t i = 0; i < initialRing.size(); ++i) {
-            const auto& a = initialRing[i];
-            const auto& b = initialRing[(i + 1) % initialRing.size()];
-            const double dx = b.x - a.x;
-            const double dy = b.y - a.y;
-            const double lenSq = dx * dx + dy * dy;
-            if (lenSq < 1e-12) continue;
-            double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
-            t = std::clamp(t, 0.0, 1.0);
-            const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
-            best = std::min(best, d);
-        }
-        return best;
-    };
-    // 方向检查的合法角集合: 多方向=系统角+自由稳定链角; 单方向用
-    // 输出自身加权主导族(Ceres 允许整体精化基准角, 一致旋转合法)
+    // ---- 3.5 质量检查器(转发到共享实现, 候选与 Ceres 结果共用; ----
+    //      VDP 备用结果经 CheckRingQuality 走同一标准)
+    // 方向检查的合法角集合: 多方向=系统角+自由稳定链角; 单方向由
+    // 共享检查器取输出自身加权主导族(Ceres 允许整体精化基准角)
     std::vector<double> allowedAngles;
     if (isMultiDirection) {
         for (const auto& s : dirBuild.systems) allowedAngles.push_back(s.angleRad);
@@ -9503,98 +9684,11 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
             }
         }
     }
-    // 质量检查: 返回空串=通过, 否则返回原因(不含 fid)
     auto qualityCheck = [&](const std::vector<pcl::PointXYZ>& poly,
                             double maxVertexDisp) -> std::string {
-        if (poly.size() < 3) return "too_few_vertices";
-        if (!isSimplePolygon2D(poly)) return "self_intersecting";
-        // 零长边与异常短边链(凹凸台阶的短边是合法拓扑, 只拦退化)
-        int shortRun = 0;
-        for (std::size_t i = 0; i < poly.size(); ++i) {
-            const double len = std::hypot(
-                poly[(i + 1) % poly.size()].x - poly[i].x,
-                poly[(i + 1) % poly.size()].y - poly[i].y);
-            if (len < 0.02) return "zero_length_edge";
-            if (len < 0.15) {
-                if (++shortRun >= 3) return "short_edge_run";
-            } else {
-                shortRun = 0;
-            }
-        }
-        const double polyArea = std::abs(polygonArea2D(poly));
-        const double ratio = polyArea / std::max(area, 1e-6);
-        if (ratio < 0.60 || ratio > 1.60) return "area_ratio=" + std::to_string(ratio);
-        // 异常长边(飞点特征)
-        for (std::size_t i = 0; i < poly.size(); ++i) {
-            const double len = std::hypot(
-                poly[(i + 1) % poly.size()].x - poly[i].x,
-                poly[(i + 1) % poly.size()].y - poly[i].y);
-            if (len > 1.1 * ringDiagonal) return "abnormal_long_edge";
-        }
-        // 质心位移: 规则化不应整体搬动建筑(面积加权威心)
-        double cx = 0.0, cy = 0.0;
-        areaCentroid(poly, cx, cy);
-        if (std::hypot(cx - ringCx, cy - ringCy) > 1.0) return "centroid_shift";
-        // 墙面贴合(边中点到环边界)与顶点位移(飞点)
-        for (std::size_t i = 0; i < poly.size(); ++i) {
-            const auto& p1 = poly[i];
-            const auto& p2 = poly[(i + 1) % poly.size()];
-            pcl::PointXYZ mid;
-            mid.x = 0.5f * (p1.x + p2.x);
-            mid.y = 0.5f * (p1.y + p2.y);
-            mid.z = p1.z;
-            if (distToRing(mid) > 1.20) return "wall_deviation";
-        }
-        for (const auto& p : poly) {
-            if (distToRing(p) > maxVertexDisp) return "flying_vertex";
-        }
-        // 方向误差: >3m 长边须贴合法方向(系统/自由链/主导族)
-        struct LongEdge { double len; double ang; };
-        std::vector<LongEdge> longEdges;
-        for (std::size_t i = 0; i < poly.size(); ++i) {
-            const auto& p1 = poly[i];
-            const auto& p2 = poly[(i + 1) % poly.size()];
-            const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
-            if (len >= 3.0) {
-                longEdges.push_back({len, std::atan2(p2.y - p1.y, p2.x - p1.x)});
-            }
-        }
-        if (!longEdges.empty()) {
-            if (isMultiDirection) {
-                // 多方向容差 12°: Ceres 的基准角是优化变量, 允许在
-                // 系统角附近小幅精化
-                for (const auto& e : longEdges) {
-                    bool ok = false;
-                    for (double a : allowedAngles) {
-                        if (foldedAngleDistance90(e.ang, a) * 180.0 / M_PI <= 12.0) {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    if (!ok) {
-                        return "direction_violation";
-                    }
-                }
-            } else {
-                // 单方向: 总支持长度最大的边方向族为基准
-                double bestRef = 0.0, bestSupport = -1.0;
-                for (const auto& cand : longEdges) {
-                    double support = 0.0;
-                    for (const auto& e : longEdges) {
-                        if (foldedAngleDistance90(e.ang, cand.ang) * 180.0 / M_PI <= 10.0) {
-                            support += e.len;
-                        }
-                    }
-                    if (support > bestSupport) { bestSupport = support; bestRef = cand.ang; }
-                }
-                for (const auto& e : longEdges) {
-                    if (foldedAngleDistance90(e.ang, bestRef) * 180.0 / M_PI > 10.0) {
-                        return "direction_violation";
-                    }
-                }
-            }
-        }
-        return "";
+        return CheckPolygonQualityVsRing(
+            poly, initialRing, /*hasDirection=*/true, isMultiDirection,
+            allowedAngles, maxVertexDisp);
     };
 
     // ---- 4. 候选拓扑质量验证(不合格→VDP, 不直接输出) ----

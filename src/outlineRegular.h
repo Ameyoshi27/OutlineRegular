@@ -123,11 +123,27 @@ public:
 	~outlineRegular();
 
 	void regular_Contour();
-	// 拓扑保持规则化实验通道：从边链出发(非VDP假设)，稠密残差+线参数Ceres。
+	// 方向上下文：拓扑通道传出，供 VDP 备用结果的方向一致性检查
+	// (多方向建筑不能被 VDP 无条件压成单方向)。
+	struct DirectionContextOut {
+		bool valid = false;          // 方向判定可信时才带约束
+		bool multiDirection = false;
+		std::vector<double> systemAngles;     // 折叠角 [0,90°)
+		std::vector<double> freeChainAngles;  // 多方向时未归组稳定链角
+	};
+	// 拓扑保持规则化主通道：从边链出发(非VDP假设)，稠密残差+线参数Ceres。
 	std::vector<pcl::PointXYZ> TopologyPreservingRegularize(
 		const std::vector<pcl::PointXYZ>& initialRing,
 		double pixelSize,
-		bool& usedFallback);
+		bool& usedFallback,
+		DirectionContextOut* dirContext = nullptr);
+	// 备用结果(VDP等)的质量检查，与拓扑通道同一标准。
+	// 返回空串=通过，否则返回原因。
+	static std::string CheckRingQuality(
+		const std::vector<pcl::PointXYZ>& poly,
+		const std::vector<pcl::PointXYZ>& initialRing,
+		const DirectionContextOut& dirContext,
+		double maxVertexDisp = 2.5);
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
 // Mask-only 模式关闭曲线恢复：无正射证据仲裁时，
