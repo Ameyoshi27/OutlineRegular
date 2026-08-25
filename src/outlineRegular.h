@@ -123,13 +123,16 @@ public:
 	~outlineRegular();
 
 	void regular_Contour();
-	// 方向上下文：拓扑通道传出，供 VDP 备用结果的方向一致性检查
-	// (多方向建筑不能被 VDP 无条件压成单方向)。
+	// 方向上下文：拓扑通道传出，供 VDP 备用结果的方向一致性检查。
+	// 无论方向是否确定都会填写(部分证据也约束 VDP 的主导长边);
 	// 合法方向只有 systemAngles——未归组链不得自我合法化。
 	struct DirectionContextOut {
-		bool valid = false;          // 方向判定可信时才带约束
+		bool valid = false;            // 存在任何可信方向证据(严格或部分检查)
+		bool completeEvidence = false; // 方向完全可信(严格检查全部受约束边)
 		bool multiDirection = false;
-		std::vector<double> systemAngles;     // 折叠角 [0,90°)
+		double primaryAngle = 0.0;     // 折叠角 [0°,90°)
+		std::vector<double> systemAngles;
+		double unassignedLengthRatio = 0.0;  // 未归组长链长度占比(诊断)
 	};
 	// 拓扑保持规则化主通道：从边链出发(非VDP假设)，稠密残差+线参数Ceres。
 	// partIndex 为环序号(诊断日志标识, 不依赖输出 Shapefile FID)。
@@ -148,6 +151,19 @@ public:
 		double maxVertexDisp = 2.5,
 		long long fid = -1,
 		int partIndex = 0);
+	// 兜底局部规则性检查(仅用于 VDP 结果/最优假设/直接输出的拓扑候选):
+	// 短斜边(>=0.8m 方向检查)/尖刺(窄角+低面积)/近共线锯齿。
+	// 返回空串=通过; statsOut 可选输出计数。
+	static std::string CheckFallbackLocalRegularity(
+		const std::vector<pcl::PointXYZ>& poly,
+		const DirectionContextOut& dirContext,
+		long long fid = -1,
+		int partIndex = 0,
+		const char* stage = "");
+	// 保守清理: 只删除有明确低面积证据的尖刺和近共线锯齿顶点,
+	// 不影响真实矩形凹凸(90°角不受影响)。返回清理后的环。
+	static std::vector<pcl::PointXYZ> CleanLowEvidenceIrregularities(
+		const std::vector<pcl::PointXYZ>& poly);
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
 // Mask-only 模式关闭曲线恢复：无正射证据仲裁时，

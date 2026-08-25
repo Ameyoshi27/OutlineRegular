@@ -4860,13 +4860,19 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
 
     // ---- VDP 备用结果质量闸门: 与拓扑结果同一标准 ----
     // 不合格的 VDP 结果不能覆盖合格的拓扑结果(拓扑合格已在上方直接
-    // 返回), 也不能直接进入输出; 逐级退到最优假设、初始轮廓。
+    // 返回), 也不能直接进入输出; VDP 结果额外过兜底局部规则性检查
+    // (短斜边/尖刺/锯齿); 逐级退到最优假设(保守清理后重验)、初始轮廓。
     if (result.size() >= 3) {
         const std::string vdpReason =
             outlineRegular::CheckRingQuality(result, ring, dirCtx, 2.5, sourceFid, partIndex);
-        if (!vdpReason.empty()) {
+        const std::string vdpLocal = vdpReason.empty()
+            ? outlineRegular::CheckFallbackLocalRegularity(
+                  result, dirCtx, sourceFid, partIndex, "vdp")
+            : std::string();
+        if (!vdpReason.empty() || !vdpLocal.empty()) {
             std::cerr << "[VDPReject] fid=" << sourceFid
-                      << " stage=final reason=" << vdpReason << std::endl;
+                      << " stage=final reason="
+                      << (!vdpReason.empty() ? vdpReason : vdpLocal) << std::endl;
             result.clear();
         }
     }
@@ -4883,9 +4889,37 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     if (bestHypothesis.size() >= 3) {
         const std::string hypReason =
             outlineRegular::CheckRingQuality(bestHypothesis, ring, dirCtx, 2.5, sourceFid, partIndex);
-        if (!hypReason.empty()) {
-            std::cerr << "[VDPReject] fid=" << sourceFid
-                      << " stage=best_hypothesis reason=" << hypReason << std::endl;
+        const std::string hypLocal = hypReason.empty()
+            ? outlineRegular::CheckFallbackLocalRegularity(
+                  bestHypothesis, dirCtx, sourceFid, partIndex, "best")
+            : std::string();
+        if (!hypReason.empty() || !hypLocal.empty()) {
+            // 最优假设不合格: 保守清理低面积尖刺/近共线锯齿后重验
+            // (只删确定性噪声, 真实 90° 凹凸不受影响)
+            auto cleaned = outlineRegular::CleanLowEvidenceIrregularities(bestHypothesis);
+            const std::string cleanReason =
+                outlineRegular::CheckRingQuality(cleaned, ring, dirCtx, 2.5, sourceFid, partIndex);
+            const std::string cleanLocal = cleanReason.empty()
+                ? outlineRegular::CheckFallbackLocalRegularity(
+                      cleaned, dirCtx, sourceFid, partIndex, "best_cleaned")
+                : std::string();
+            if (!cleanReason.empty() || !cleanLocal.empty() || cleaned.size() < 3) {
+                std::cerr << "[VDPReject] fid=" << sourceFid
+                          << " stage=best_hypothesis reason="
+                          << (!hypReason.empty() ? hypReason : hypLocal)
+                          << " (cleaned 也未通过: "
+                          << (!cleanReason.empty() ? cleanReason : cleanLocal)
+                          << ")" << std::endl;
+            } else {
+                result = cleaned;
+                if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
+                if (pathOut) *pathOut = MaskOnlyPath::BestHypothesis;
+                std::cerr << "[RegularizationPath] fid=" << sourceFid
+                          << " best_hypothesis (cleaned "
+                          << bestHypothesis.size() << "->" << cleaned.size()
+                          << " verts)" << std::endl;
+                return result;
+            }
         } else {
             result = bestHypothesis;
             if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
@@ -4897,6 +4931,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
             return result;
         }
     }
+
     result = ring;
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
     if (pathOut) *pathOut = MaskOnlyPath::InitialRing;

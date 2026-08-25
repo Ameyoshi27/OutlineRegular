@@ -3621,13 +3621,22 @@ DirectionEvidence2D EstimateDirectionEvidence(
 namespace {
 
 constexpr double kDirDiagStableMinLength = 1.5;    // m, 稳定链长度下限(高于投票下限 0.8)
-constexpr double kDirDiagSeedMinLength = 3.0;      // m, 单链即可成系统的种子长度
-constexpr double kDirDiagSystemMinSeparationDeg = 12.0; // 种子间最小角距(防一个系统吞掉相邻方向)
-constexpr double kDirDiagAssignDeg = 9.0;          // 稳定链归组阈值(统一分配, 就近种子)
+constexpr double kDirDiagSeedMinLength = 3.0;      // m, 单链成系统的最小长度(配合连续性/占比约束)
+constexpr double kDirDiagSystemMinSeparationDeg = 12.0; // 候选方向间最小角距(防吞并相邻方向)
+constexpr double kDirDiagAssignDeg = 9.0;          // 稳定链归组阈值(统一分配, 就近候选)
 constexpr double kDirDiagShortAssignDeg = 13.0;    // 短链归组阈值
-constexpr double kDirDiagLongRescueDeg = 18.0;     // 未归组长链(>=3m)抢救归组上限(超过则方向证据不足)
+constexpr double kDirDiagLongRescueDeg = 18.0;     // 未归组长链(>=3m)抢救归组上限
 constexpr double kDirDiagStructuralTurnDeg = 45.0; // 相邻链转角超过此值=显著凹凸/窄颈
-constexpr int kDirDiagMaxSystems = 3;              // 方向系统上限
+constexpr int kDirDiagMaxCandidates = 7;           // 候选方向上限(防御异常; 90°/12°分离理论约7)
+constexpr int kDirDiagMaxFinalSystems = 5;         // 最终可信系统上限(超过标记 complex 不静默丢弃)
+constexpr double kDirDiagSystemMinChainFrac = 0.08; // 多链系统最小支持长度占稳定链总长比
+constexpr double kDirDiagUnassignedWeakRatio = 0.05;  // 未归组长链弱支持占比阈值(≤此值不回退)
+constexpr double kDirDiagUnassignedHighRatio = 0.10;  // 未归组长链占比>此值且无法成新系统→不确定
+constexpr double kDirDiagGrayZoneScoreMin = 0.60;     // 灰区(5%~10%)时单/多方向模型评分下限
+constexpr double kDirDiagSpikeAngleDeg = 32.0;     // 尖刺内角阈值(<此值且低面积证据=尖刺)
+constexpr double kDirDiagSpikeMaxArea = 0.30;      // m², 尖刺三角面积上限
+constexpr double kDirDiagZigzagChordDev = 0.12;    // m, 近共线锯齿顶点偏离弦的上限
+constexpr double kDirDiagShortDiagMinLen = 0.8;    // m, 短斜边方向检查的长度下限
 constexpr double kDirDiagSupportRadius = 0.6;      // m, 支撑点计数半径
 constexpr double kDirDiagMultiGainMin = 0.10;      // 多方向判定: multi比single评分高多少
 constexpr double kDirDiagMultiFracMin = 0.15;      // 多方向判定: 次系统权重占比下限
@@ -3679,9 +3688,16 @@ struct DirectionSystemBuild {
     int shortProtected = 0;
     int shortFree = 0;
     int rescuedLongChains = 0;   // 抢救阈值内归入系统的 >=3m 长链
-    int unassignedLong = 0;      // 归组+抢救后仍无归属的 >=3m 稳定长链
+    int unassignedLongCount = 0;     // 最终仍未归组的 >=3m 稳定长链数
+    double unassignedLongLength = 0.0;  // 未归组长链总长(m)
+    double unassignedLongWeight = 0.0;  // 未归组长链总权重
+    double unassignedLengthRatio = 0.0; // 未归组长链总长 / 稳定链总长
+    double unassignedWeightRatio = 0.0; // 未归组长链权重 / 稳定链总权重
+    double maxUnassignedLength = 0.0;   // 最长未归组长链(m)
+    bool complexDirectionEvidence = false; // 可信系统数超过上限(证据复杂, 未静默丢弃)
     double totalStableWeight = 0.0;
-    double totalChainLength = 0.0;  // 全部链总长(≈周长, 供占比判定)
+    double totalStableLength = 0.0;    // 稳定链总长
+    double totalChainLength = 0.0;     // 全部链总长(≈周长, 供占比判定)
     double singleScore = 0.0;
     double multiScore = 0.0;
     bool multiDirection = false;
@@ -3731,17 +3747,108 @@ DirectionSystemBuild BuildDirectionSystems(
     }
     const auto peaks = DetectDirectionPeaks(stableChains, fitTolerance);
 
-    // 两阶段方向系统聚类。
-    // 阶段一(种子发现): 全部稳定链按权重降序考察, 与既有种子角距
-    //   < 最小分离角则跳过, 否则立新种子(KDE 峰近旁用峰角校正);
-    //   达到系统上限后停止立种。不做前 N 截断——主方向占据权重
-    //   前列时, 真实第二方向的链必须仍有成为种子的机会。
-    // 阶段二(统一分配): 种子全部确定后, 每条稳定链分配给角距最近
-    //   的种子且须在归组阈值内; 不因种子建立顺序不同而归属不同。
-    //   >=3m 未归组长链先按抢救阈值(稍宽有上限)重新归组,
-    //   仍失败则计入 unassignedLong → 方向不确定。
+    // 多阶段方向系统聚类: 候选发现与最终保留彻底分离。
+    // 阶段一(候选发现): 全部稳定链按权重降序, 12°分离, 候选上限
+    //   kDirDiagMaxCandidates(防御异常, 不在生成第3个时停止)。
+    // 阶段二(初始分配): 就近候选 9° 归组, 圆均值精化。
+    // 阶段三(候选验证): 弱候选删除后对全部稳定链重新就近分配,
+    //   再精化再分配, 迭代至稳定(≤3轮)——避免删除后留下的
+    //   归组真空和漂移角。
+    // 阶段四(合并): 精化后角距<8°的系统合并(索引统一重映射)。
+    // 阶段五(未归组核算): 长链能成新可信系统则新增重分配;
+    //   按支持占比(而非数量)决定是否方向不确定。
     std::vector<DirectionSystemDiag>& systems = build.systems;
+    const double minSepRad = kDirDiagSystemMinSeparationDeg * M_PI / 180.0;
+    const double assignRad = kDirDiagAssignDeg * M_PI / 180.0;
+    const double rescueRad = kDirDiagLongRescueDeg * M_PI / 180.0;
+
+    // 就近分配全部稳定链(9°归组, >=3m 长链 18° 抢救)
+    auto assignAllStable = [&]() {
+        build.rescuedLongChains = 0;
+        for (auto& info : build.chainInfo) {
+            if (info.stable) info.system = -1;
+        }
+        if (systems.empty()) return;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!build.chainInfo[i].stable) continue;
+            const auto& c = chains[i];
+            std::size_t nearest = 0;
+            double nearestDist = foldedAngleDistance90(
+                c.angleRad, systems.front().angleRad);
+            for (std::size_t s = 1; s < systems.size(); ++s) {
+                const double d = foldedAngleDistance90(
+                    c.angleRad, systems[s].angleRad);
+                if (d < nearestDist) { nearestDist = d; nearest = s; }
+            }
+            if (nearestDist <= assignRad) {
+                build.chainInfo[i].system = static_cast<int>(nearest);
+            } else if (c.length >= 3.0 && nearestDist <= rescueRad) {
+                build.chainInfo[i].system = static_cast<int>(nearest);
+                ++build.rescuedLongChains;
+            }
+        }
+    };
+    // 汇总系统成员 + 折叠角圆均值精化(算术平均在 1°/89° 相邻角对
+    // 上会得到错误的 45°)
+    auto aggregateSystems = [&]() {
+        std::vector<double> angles(systems.size(), 0.0);
+        for (std::size_t s = 0; s < systems.size(); ++s) {
+            DirectionSystemDiag fresh;
+            fresh.angleRad = systems[s].angleRad;  // 空系统保留原角待清理
+            systems[s] = fresh;
+            DirectionSystemDiag& sys = systems[s];
+            std::vector<double> memberAngles;
+            std::vector<double> memberWeights;
+            double continuitySum = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (build.chainInfo[i].system != static_cast<int>(s)) continue;
+                if (!build.chainInfo[i].stable) continue;
+                const auto& c = chains[i];
+                sys.totalLength += c.length;
+                sys.weight += c.weight;
+                sys.supportPoints += build.chainInfo[i].supportPts;
+                continuitySum += build.chainInfo[i].continuity;
+                memberAngles.push_back(c.angleRad);
+                memberWeights.push_back(c.weight);
+            }
+            sys.chainCount = static_cast<int>(memberAngles.size());
+            if (!memberAngles.empty()) {
+                sys.angleRad = circularMeanAngle90(memberAngles, memberWeights);
+                sys.meanContinuity = continuitySum / memberAngles.size();
+            }
+            angles[s] = sys.angleRad;
+        }
+    };
+    // 删除指定系统并统一重映射 chainInfo.system 索引
+    // (donor<keeper 时 erase 会使 keeper 及其后继索引前移)
+    auto removeSystem = [&](std::size_t donor, std::size_t keeper) {
+        const int keeperAfter = static_cast<int>(
+            keeper > donor ? keeper - 1 : keeper);
+        for (auto& info : build.chainInfo) {
+            int& s = info.system;
+            if (s < 0) continue;
+            if (s == static_cast<int>(donor)) s = keeperAfter;
+            else if (s > static_cast<int>(donor)) --s;
+        }
+        systems.erase(systems.begin() + donor);
+    };
+    // 候选可信度: ≥2 条稳定链且支持长度占比达标;
+    // 或单条可信长链(连续性≥0.85, 长度≥max(15m, 周长10%))
+    auto systemCredible = [&](const DirectionSystemDiag& sys) {
+        if (sys.chainCount <= 0) return false;
+        if (sys.chainCount >= 2) {
+            return sys.totalLength >=
+                kDirDiagSystemMinChainFrac *
+                std::max(build.totalStableLength, 1e-9);
+        }
+        const double minSingle = std::max(
+            kDirDiagSeedMinLength * 5.0,
+            0.10 * std::max(build.totalChainLength, 1e-9));
+        return sys.meanContinuity >= 0.85 && sys.totalLength >= minSingle;
+    };
+
     {
+        // ---- 阶段一: 候选发现 ----
         std::vector<std::size_t> sorted;
         for (std::size_t i = 0; i < n; ++i) {
             if (build.chainInfo[i].stable) sorted.push_back(i);
@@ -3750,10 +3857,9 @@ DirectionSystemBuild BuildDirectionSystems(
                   [&](std::size_t a, std::size_t b) {
                       return chains[a].weight > chains[b].weight;
                   });
-        const double minSepRad = kDirDiagSystemMinSeparationDeg * M_PI / 180.0;
         std::vector<double> seedAngles;
         for (std::size_t seedIdx : sorted) {
-            if (static_cast<int>(seedAngles.size()) >= kDirDiagMaxSystems) break;
+            if (static_cast<int>(seedAngles.size()) >= kDirDiagMaxCandidates) break;
             const double seedAngle = chains[seedIdx].angleRad;
             bool nearExisting = false;
             for (double a : seedAngles) {
@@ -3763,9 +3869,7 @@ DirectionSystemBuild BuildDirectionSystems(
                 }
             }
             if (nearExisting) continue;
-            // KDE 峰近旁用峰角校正种子角(离散化的峰位置更稳定)。
-            // 校正后必须复查与既有种子的分离角——峰角可能把种子
-            // 拉到既有种子近旁形成近重复系统(实测出现过 2° 间隔)
+            // KDE 峰近旁用峰角校正(校正后复查分离角, 防形成近重复)
             double sysAngle = seedAngle;
             for (const auto& pk : peaks) {
                 if (foldedAngleDistance90(seedAngle, pk.angleRad) < minSepRad) {
@@ -3788,71 +3892,48 @@ DirectionSystemBuild BuildDirectionSystems(
             systems[s].angleRad = seedAngles[s];
         }
 
-        // 统一分配: 每条稳定链就近分配
-        const double assignRad = kDirDiagAssignDeg * M_PI / 180.0;
-        const double rescueRad = kDirDiagLongRescueDeg * M_PI / 180.0;
-        if (!systems.empty()) {
-            for (std::size_t i = 0; i < n; ++i) {
-                if (!build.chainInfo[i].stable) continue;
-                const auto& c = chains[i];
-                std::size_t nearest = 0;
-                double nearestDist = foldedAngleDistance90(
-                    c.angleRad, systems.front().angleRad);
-                for (std::size_t s = 1; s < systems.size(); ++s) {
-                    const double d = foldedAngleDistance90(
-                        c.angleRad, systems[s].angleRad);
-                    if (d < nearestDist) { nearestDist = d; nearest = s; }
-                }
-                if (nearestDist <= assignRad) {
-                    build.chainInfo[i].system = static_cast<int>(nearest);
-                } else if (c.length >= 3.0 && nearestDist <= rescueRad) {
-                    // 长链抢救: 稍宽但有上限的阈值内归入最近可信系统
-                    build.chainInfo[i].system = static_cast<int>(nearest);
-                    ++build.rescuedLongChains;
-                } else if (c.length >= 3.0) {
-                    ++build.unassignedLong;
+        // ---- 阶段二+三: 分配 → 精化 → 验证删弱 → 重分配, 迭代至稳定 ----
+        for (int iter = 0; iter < 3; ++iter) {
+            assignAllStable();
+            aggregateSystems();
+            // 删除不可信候选(从后往前, 索引安全)
+            bool removedAny = false;
+            for (std::size_t s = systems.size(); s-- > 0;) {
+                if (!systemCredible(systems[s])) {
+                    // 并入最近的幸存系统(无幸存则全部置未分配)
+                    std::size_t nearest = systems.size();
+                    double nearestDist = 1e9;
+                    for (std::size_t t = 0; t < systems.size(); ++t) {
+                        if (t == s) continue;
+                        const double d = foldedAngleDistance90(
+                            systems[s].angleRad, systems[t].angleRad);
+                        if (d < nearestDist) { nearestDist = d; nearest = t; }
+                    }
+                    removeSystem(s, nearest < systems.size() ? nearest : 0);
+                    removedAny = true;
                 }
             }
-        } else {
-            for (std::size_t i = 0; i < n; ++i) {
-                if (build.chainInfo[i].stable && chains[i].length >= 3.0) {
-                    ++build.unassignedLong;
+            if (!removedAny) break;
+        }
+        // 空系统清理(种子立了但无人归入)
+        {
+            std::vector<DirectionSystemDiag> kept;
+            std::vector<int> remap(systems.size(), -1);
+            for (std::size_t s = 0; s < systems.size(); ++s) {
+                if (systems[s].chainCount > 0) {
+                    remap[s] = static_cast<int>(kept.size());
+                    kept.push_back(systems[s]);
                 }
             }
+            for (auto& info : build.chainInfo) {
+                if (info.system >= 0) {
+                    info.system = remap[static_cast<std::size_t>(info.system)];
+                }
+            }
+            systems.swap(kept);
         }
 
-        // 汇总系统成员 + 系统角用折叠角圆均值精化(算术平均在
-        // 1°/89° 这类相邻角对上会得到错误的 45°)
-        auto aggregateSystems = [&]() {
-            for (std::size_t s = 0; s < systems.size(); ++s) {
-                systems[s] = DirectionSystemDiag{};
-                systems[s].angleRad = 0.0;
-                DirectionSystemDiag& sys = systems[s];
-                std::vector<double> memberAngles;
-                std::vector<double> memberWeights;
-                double continuitySum = 0.0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (build.chainInfo[i].system != static_cast<int>(s)) continue;
-                    if (!build.chainInfo[i].stable) continue;
-                    const auto& c = chains[i];
-                    sys.totalLength += c.length;
-                    sys.weight += c.weight;
-                    sys.supportPoints += build.chainInfo[i].supportPts;
-                    continuitySum += build.chainInfo[i].continuity;
-                    memberAngles.push_back(c.angleRad);
-                    memberWeights.push_back(c.weight);
-                }
-                sys.chainCount = static_cast<int>(memberAngles.size());
-                if (!memberAngles.empty()) {
-                    sys.angleRad = circularMeanAngle90(memberAngles, memberWeights);
-                    sys.meanContinuity = continuitySum / memberAngles.size();
-                }
-            }
-        };
-        aggregateSystems();
-        // 成员精化后合并漂移到一起的系统: 种子间隔>=12°, 但成员均值
-        // 可互相靠近(<8°)形成近重复系统分割支持——角距过近的系统
-        // 合并(权重小者并入大者)后重聚合
+        // ---- 阶段四: 精化后角距<8°的系统合并 ----
         {
             const double mergeRad = 8.0 * M_PI / 180.0;
             bool merged = true;
@@ -3871,40 +3952,110 @@ DirectionSystemBuild BuildDirectionSystems(
                     const std::size_t donor =
                         systems[bj].weight > systems[bi].weight ? bi : bj;
                     const std::size_t keeper = donor == bi ? bj : bi;
-                    for (auto& info : build.chainInfo) {
-                        if (info.system == static_cast<int>(donor)) {
-                            info.system = static_cast<int>(keeper);
-                        }
-                    }
-                    systems.erase(systems.begin() + donor);
+                    removeSystem(donor, keeper);
                     aggregateSystems();
                     merged = true;
                 }
             }
         }
-        // 丢弃没有稳定成员的空系统(种子立了但没人归入)
+
+        // ---- 阶段五: 未归组长链核算 ----
+        // 5.1 未归组长链尝试组成新的可信系统(≤12° 内聚, 满足可信度)
+        //     且最终系统数未超上限 → 新增后全量重分配
         {
-            std::vector<DirectionSystemDiag> kept;
-            std::vector<int> remap(systems.size(), -1);
-            for (std::size_t s = 0; s < systems.size(); ++s) {
-                if (systems[s].chainCount > 0) {
-                    remap[s] = static_cast<int>(kept.size());
-                    kept.push_back(systems[s]);
+            std::vector<std::size_t> unassigned;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (build.chainInfo[i].stable &&
+                    build.chainInfo[i].system < 0 &&
+                    chains[i].length >= 3.0) {
+                    unassigned.push_back(i);
                 }
             }
-            for (auto& info : build.chainInfo) {
-                if (info.system >= 0) {
-                    info.system = remap[static_cast<std::size_t>(info.system)];
+            if (!unassigned.empty() &&
+                static_cast<int>(systems.size()) < kDirDiagMaxFinalSystems) {
+                // 未归组长链内部再聚类(权重降序, 12°分离)
+                std::sort(unassigned.begin(), unassigned.end(),
+                          [&](std::size_t a, std::size_t b) {
+                              return chains[a].weight > chains[b].weight;
+                          });
+                std::vector<std::size_t> group;
+                double groupAngle = 0.0;
+                for (std::size_t cand : unassigned) {
+                    if (group.empty()) {
+                        group.push_back(cand);
+                        groupAngle = chains[cand].angleRad;
+                        continue;
+                    }
+                    if (foldedAngleDistance90(chains[cand].angleRad, groupAngle) <
+                        minSepRad) {
+                        group.push_back(cand);
+                    }
+                }
+                // 评估这一组的可信度
+                double lenSum = 0.0, wSum = 0.0, contSum = 0.0;
+                std::vector<double> ga, gw;
+                for (std::size_t m : group) {
+                    lenSum += chains[m].length;
+                    wSum += chains[m].weight;
+                    contSum += build.chainInfo[m].continuity;
+                    ga.push_back(chains[m].angleRad);
+                    gw.push_back(chains[m].weight);
+                }
+                const double groupMeanAngle = circularMeanAngle90(ga, gw);
+                const double minSingle = std::max(
+                    15.0, 0.10 * std::max(build.totalChainLength, 1e-9));
+                const bool credible = lenSum >= std::max(minSingle,
+                    kDirDiagSystemMinChainFrac *
+                    std::max(build.totalStableLength, 1e-9)) &&
+                    (group.size() >= 2 ||
+                     (contSum / group.size() >= 0.85 && lenSum >= minSingle));
+                if (credible && group.size() >= 2) {
+                    DirectionSystemDiag newSys;
+                    newSys.angleRad = groupMeanAngle;
+                    systems.push_back(newSys);
+                    assignAllStable();
+                    aggregateSystems();
                 }
             }
-            systems.swap(kept);
         }
+        // 5.2 统计未归组长链占比
+        build.unassignedLongCount = 0;
+        build.unassignedLongLength = 0.0;
+        build.unassignedLongWeight = 0.0;
+        build.maxUnassignedLength = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!build.chainInfo[i].stable || build.chainInfo[i].system >= 0) {
+                continue;
+            }
+            const auto& c = chains[i];
+            if (c.length < 3.0) continue;
+            ++build.unassignedLongCount;
+            build.unassignedLongLength += c.length;
+            build.unassignedLongWeight += c.weight;
+            build.maxUnassignedLength =
+                std::max(build.maxUnassignedLength, c.length);
+        }
+        build.totalStableLength = 0.0;
+        build.totalStableWeight = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (build.chainInfo[i].stable) {
+                build.totalStableLength += chains[i].length;
+                build.totalStableWeight += chains[i].weight;
+            }
+        }
+        build.unassignedLengthRatio =
+            build.totalStableLength > 1e-9
+                ? build.unassignedLongLength / build.totalStableLength : 0.0;
+        build.unassignedWeightRatio =
+            build.totalStableWeight > 1e-9
+                ? build.unassignedLongWeight / build.totalStableWeight : 0.0;
+        // 5.3 可信系统超上限标记(不静默丢弃)
+        build.complexDirectionEvidence =
+            static_cast<int>(systems.size()) > kDirDiagMaxFinalSystems;
     }
 
     // 系统统计: rmse/范围/KDE密度/置信度
-    for (std::size_t i = 0; i < n; ++i) {
-        if (build.chainInfo[i].stable) build.totalStableWeight += chains[i].weight;
-    }
+    // (totalStableWeight/Length 已在未归组核算阶段计算, 不重复累加)
     const double bandwidthRad = kDirectionKdeBandwidthDeg * M_PI / 180.0;
     for (std::size_t s = 0; s < systems.size(); ++s) {
         auto& sys = systems[s];
@@ -4039,13 +4190,24 @@ DirectionSystemBuild BuildDirectionSystems(
                     second.confidence >= kDirDiagMultiSecondConf;
             }
         }
-        // 方向不确定门槛: 主系统至少2条链、置信度与评分达标、
-        // 且不存在无法归组的 >=3m 稳定长链(有则该轮廓方向证据不足,
-        // 交给 VDP, 不强行套用方向系统)
+        // 方向确定性: 支持比例 + 方向组证据, 不做单条边二元否决。
+        // - 未归组占比 >10%(长度或权重) 且无法形成新可信系统 → 不确定;
+        // - 灰区(5%~10%): 用单/多方向模型评分裁决;
+        // - ≤5% 弱支持: 不回退(低支持异常链交由格网吸附兜底)。
         if (systems.empty()) {
             build.uncertainReason = "no_systems";
-        } else if (build.unassignedLong > 0) {
+        } else if (build.unassignedLengthRatio > kDirDiagUnassignedHighRatio ||
+                   build.unassignedWeightRatio > kDirDiagUnassignedHighRatio) {
             build.uncertainReason = "unassigned_long_chain";
+        } else if (build.unassignedLengthRatio > kDirDiagUnassignedWeakRatio ||
+                   build.unassignedWeightRatio > kDirDiagUnassignedWeakRatio) {
+            // 灰区: 模型解释率不足才判不确定
+            const double bestScore =
+                std::max(build.singleScore,
+                         build.multiDirection ? build.multiScore : build.singleScore);
+            if (bestScore < kDirDiagGrayZoneScoreMin) {
+                build.uncertainReason = "unassigned_gray_zone_low_score";
+            }
         } else if (systems.front().chainCount < 2) {
             build.uncertainReason = "primary_single_chain";
         } else if (systems.front().confidence < kDirDiagCertaintyConf) {
@@ -9460,11 +9622,212 @@ std::string outlineRegular::CheckRingQuality(
     long long fid,
     int partIndex)
 {
-    // 合法方向只有 systemAngles; 未归组链角度不再进入验收集合
-    const bool multi = dirContext.valid && dirContext.multiDirection;
-    return CheckPolygonQualityVsRing(
-        poly, initialRing, /*hasDirection=*/dirContext.valid, multi,
+    // 合法方向只有 systemAngles; 未归组链角度不再进入验收集合。
+    // 三级证据: 完整(严格检查全部受约束边) / 部分(只检查主导长边
+    // 与 primaryAngle 一致) / 无证据(几何检查+自估方向兜底)。
+    const bool multi = dirContext.completeEvidence && dirContext.multiDirection;
+    const std::string base = CheckPolygonQualityVsRing(
+        poly, initialRing, /*hasDirection=*/dirContext.completeEvidence, multi,
         dirContext.systemAngles, maxVertexDisp, fid, partIndex);
+    if (!base.empty()) return base;
+    if (!dirContext.completeEvidence && dirContext.valid &&
+        !dirContext.systemAngles.empty()) {
+        // 部分证据: 最长边(前3条)必须贴近某个已确认系统角(12°)
+        struct LongEdge { double len; double ang; };
+        std::vector<LongEdge> edges;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const auto& p1 = poly[i];
+            const auto& p2 = poly[(i + 1) % poly.size()];
+            edges.push_back({std::hypot(p2.x - p1.x, p2.y - p1.y),
+                             std::atan2(p2.y - p1.y, p2.x - p1.x)});
+        }
+        std::sort(edges.begin(), edges.end(),
+                  [](const LongEdge& a, const LongEdge& b) { return a.len > b.len; });
+        const std::size_t checkCount = std::min<std::size_t>(3, edges.size());
+        for (std::size_t k = 0; k < checkCount; ++k) {
+            if (edges[k].len < 3.0) break;
+            bool ok = false;
+            for (double a : dirContext.systemAngles) {
+                if (foldedAngleDistance90(edges[k].ang, a) * 180.0 / M_PI <= 12.0) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return "partial_direction_violation";
+        }
+    }
+    return "";
+}
+
+// 兜底局部规则性检查: 方向检查覆盖 0.8~3m 的短斜边, 加上尖刺与
+// 近共线锯齿。仅用于 VDP 结果/最优假设/直接输出的拓扑候选——
+// 这些结果没有受保护短边的显式标记, 不做任何豁免。
+std::string outlineRegular::CheckFallbackLocalRegularity(
+    const std::vector<pcl::PointXYZ>& poly,
+    const DirectionContextOut& dirContext,
+    long long fid,
+    int partIndex,
+    const char* stage)
+{
+    if (poly.size() < 3) return "too_few_vertices";
+    const std::size_t m = poly.size();
+    int shortDiagonal = 0, spike = 0, zigzag = 0;
+    double irregularLength = 0.0, perimeter = 0.0;
+    for (std::size_t i = 0; i < m; ++i) {
+        const auto& p1 = poly[i];
+        const auto& p2 = poly[(i + 1) % m];
+        perimeter += std::hypot(p2.x - p1.x, p2.y - p1.y);
+    }
+    // 1) 短斜边: 0.8~3m 的边做方向检查(有方向证据时)
+    if (dirContext.valid && !dirContext.systemAngles.empty()) {
+        for (std::size_t i = 0; i < m; ++i) {
+            const auto& p1 = poly[i];
+            const auto& p2 = poly[(i + 1) % m];
+            const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+            if (len < kDirDiagShortDiagMinLen || len >= 3.0) continue;
+            const double ang = std::atan2(p2.y - p1.y, p2.x - p1.x);
+            bool ok = false;
+            for (double a : dirContext.systemAngles) {
+                if (foldedAngleDistance90(ang, a) * 180.0 / M_PI <= 12.0) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                ++shortDiagonal;
+                irregularLength += len;
+            }
+        }
+    }
+    // 2) 尖刺与 3) 近共线锯齿: 逐顶点检查
+    for (std::size_t i = 0; i < m; ++i) {
+        const auto& prev = poly[(i + m - 1) % m];
+        const auto& cur = poly[i];
+        const auto& next = poly[(i + 1) % m];
+        const double v1x = cur.x - prev.x, v1y = cur.y - prev.y;
+        const double v2x = next.x - cur.x, v2y = next.y - cur.y;
+        const double l1 = std::hypot(v1x, v1y);
+        const double l2 = std::hypot(v2x, v2y);
+        if (l1 < 1e-9 || l2 < 1e-9) continue;
+        const double cosA = (v1x * v2x + v1y * v2y) / (l1 * l2);
+        const double angleDeg =
+            std::acos(std::clamp(cosA, -1.0, 1.0)) * 180.0 / M_PI;
+        // 尖刺: 内角 <32° 且 三角面积小(删除该点几何损失可忽略)
+        // 或两侧都是短边(细尖残留)
+        if (angleDeg < kDirDiagSpikeAngleDeg) {
+            const double triArea = 0.5 * std::abs(
+                (cur.x - prev.x) * (next.y - prev.y) -
+                (next.x - prev.x) * (cur.y - prev.y));
+            if (triArea < kDirDiagSpikeMaxArea ||
+                (l1 < 2.0 && l2 < 2.0)) {
+                ++spike;
+                irregularLength += std::min(l1, l2);
+            }
+        }
+        // 近共线锯齿: 顶点紧贴前后连线但转角明显(>5°)
+        {
+            const double chordDx = next.x - prev.x;
+            const double chordDy = next.y - prev.y;
+            const double chordLen = std::hypot(chordDx, chordDy);
+            if (chordLen > 1e-9) {
+                const double dev = std::abs(
+                    (cur.x - prev.x) * chordDy - (cur.y - prev.y) * chordDx) /
+                    chordLen;
+                const double turnDeg = 180.0 - angleDeg;
+                if (dev < kDirDiagZigzagChordDev && turnDeg > 5.0 && turnDeg < 45.0) {
+                    ++zigzag;
+                    irregularLength += std::min(l1, l2);
+                }
+            }
+        }
+    }
+    const double irregularRatio =
+        perimeter > 1e-9 ? irregularLength / perimeter : 0.0;
+    // 短斜边容忍度: ≤2 条且占比 ≤10%(个别锯齿边不否决整栋——
+    // 拓扑候选实测存在 2 条/6% 的合法候选被零容忍误杀);
+    // 尖刺零容忍(窄角尖刺是明确错误), 锯齿 ≥3 顶点才否决
+    const bool accepted =
+        (shortDiagonal <= 2 && irregularRatio <= 0.10) &&
+        spike == 0 && zigzag < 3;
+    std::string reason;
+    if (!accepted) {
+        if (shortDiagonal > 0) reason = "short_diagonal";
+        else if (spike > 0) reason = "spike";
+        else reason = "zigzag";
+    }
+    if (fid >= 0) {
+        std::cerr << "[FallbackQuality] fid=" << fid << " part=" << partIndex
+                  << " stage=" << (stage ? stage : "?")
+                  << " short_diagonal=" << shortDiagonal
+                  << " spike=" << spike
+                  << " zigzag=" << zigzag
+                  << " irregular_ratio=" << irregularRatio
+                  << " accepted=" << (accepted ? 1 : 0)
+                  << " reason=" << (accepted ? "-" : reason)
+                  << std::endl;
+    }
+    return accepted ? "" : ("fallback_" + reason);
+}
+
+// 保守清理: 只删除有明确低面积证据的尖刺和近共线锯齿顶点。
+// 真实矩形凹凸的角是 90°(不会被尖刺判据命中), 凹凸底部顶点
+// 距弦 0.3~0.5m(不会被锯齿判据命中)——只清确定性噪声。
+std::vector<pcl::PointXYZ> outlineRegular::CleanLowEvidenceIrregularities(
+    const std::vector<pcl::PointXYZ>& poly)
+{
+    std::vector<pcl::PointXYZ> current = poly;
+    for (int pass = 0; pass < 3; ++pass) {
+        if (current.size() < 5) break;
+        std::vector<pcl::PointXYZ> next;
+        next.reserve(current.size());
+        const std::size_t m = current.size();
+        std::vector<bool> drop(m, false);
+        for (std::size_t i = 0; i < m; ++i) {
+            const auto& prev = current[(i + m - 1) % m];
+            const auto& cur = current[i];
+            const auto& nx = current[(i + 1) % m];
+            const double v1x = cur.x - prev.x, v1y = cur.y - prev.y;
+            const double v2x = nx.x - cur.x, v2y = nx.y - cur.y;
+            const double l1 = std::hypot(v1x, v1y);
+            const double l2 = std::hypot(v2x, v2y);
+            if (l1 < 1e-9 || l2 < 1e-9) { drop[i] = true; continue; }
+            const double cosA = (v1x * v2x + v1y * v2y) / (l1 * l2);
+            const double angleDeg =
+                std::acos(std::clamp(cosA, -1.0, 1.0)) * 180.0 / M_PI;
+            if (angleDeg < kDirDiagSpikeAngleDeg) {
+                const double triArea = 0.5 * std::abs(
+                    (cur.x - prev.x) * (nx.y - prev.y) -
+                    (nx.x - prev.x) * (cur.y - prev.y));
+                if (triArea < kDirDiagSpikeMaxArea ||
+                    (l1 < 2.0 && l2 < 2.0)) {
+                    drop[i] = true;
+                    continue;
+                }
+            }
+            const double chordDx = nx.x - prev.x;
+            const double chordDy = nx.y - prev.y;
+            const double chordLen = std::hypot(chordDx, chordDy);
+            if (chordLen > 1e-9) {
+                const double dev = std::abs(
+                    (cur.x - prev.x) * chordDy - (cur.y - prev.y) * chordDx) /
+                    chordLen;
+                const double turnDeg = 180.0 - angleDeg;
+                if (dev < kDirDiagZigzagChordDev && turnDeg > 5.0 && turnDeg < 45.0) {
+                    drop[i] = true;
+                }
+            }
+        }
+        bool changed = false;
+        for (std::size_t i = 0; i < m; ++i) {
+            if (drop[i]) changed = true;
+            else next.push_back(current[i]);
+        }
+        if (!changed || next.size() < 4) break;
+        // 清理后自交/退化检查, 失败则放弃本轮结果
+        if (!isSimplePolygon2D(next)) break;
+        current.swap(next);
+    }
+    return current;
 }
 
 std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
@@ -9635,7 +9998,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                   << " part=" << partIndex
                   << " stable=" << stableCount
                   << " assigned=" << assignedCount
-                  << " unassigned_long=" << dirBuild.unassignedLong
+                  << " unassigned_long=" << dirBuild.unassignedLongCount
+                  << " unassigned_len=" << dirBuild.unassignedLongLength
+                  << " unassigned_ratio=" << dirBuild.unassignedLengthRatio
+                  << " rescued=" << dirBuild.rescuedLongChains
                   << " protected_short=" << dirBuild.shortProtected << std::endl;
         std::cerr << "[DirectionModel] fid=" << source_feature_id_
                   << " part=" << partIndex
@@ -9645,9 +10011,24 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                   << std::endl;
     }
 
+    // 方向上下文传出: 无论最终是否回退都先填写——部分可信方向
+    // 也约束 VDP/最优假设的主导长边, 完全无证据才允许自估兜底
+    if (dirContext) {
+        dirContext->valid = !dirBuild.systems.empty();
+        dirContext->completeEvidence = dirBuild.directionCertain;
+        dirContext->multiDirection = isMultiDirection;
+        dirContext->primaryAngle = dirBuild.systems.empty()
+            ? 0.0 : dirBuild.systems.front().angleRad;
+        dirContext->systemAngles.clear();
+        for (const auto& s : dirBuild.systems) {
+            dirContext->systemAngles.push_back(s.angleRad);
+        }
+        dirContext->unassignedLengthRatio = dirBuild.unassignedLengthRatio;
+    }
+
     if (!dirBuild.directionCertain) {
         // 方向不确定: 交给 VDP 备用流程, 不强行套用方向系统。
-        // 区分原因: 未归组长链(方向证据不足) vs 置信度/评分不足
+        // 区分原因: 未归组占比超限(方向证据冲突) vs 置信度/评分不足
         usedFallback = true;
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                   << " part=" << partIndex
@@ -9656,17 +10037,6 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                           ? "direction_uncertain" : dirBuild.uncertainReason)
                   << std::endl;
         return {};
-    }
-
-    // 方向上下文传出: 供 VDP 备用结果的方向一致性检查。
-    // 合法方向只有 systemAngles(未归组链不得自我合法化)。
-    if (dirContext) {
-        dirContext->valid = true;
-        dirContext->multiDirection = isMultiDirection;
-        dirContext->systemAngles.clear();
-        for (const auto& s : dirBuild.systems) {
-            dirContext->systemAngles.push_back(s.angleRad);
-        }
     }
 
     // ---- 2.5 按方向系统格网吸附 + 相邻共线链合并 ----
@@ -9943,12 +10313,33 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     std::vector<pcl::PointXYZ> ceresResult = best_hypothesis;
 
     // ---- 7. Ceres 结果验收 ----
-    // 三级回退: Ceres 结果不合格 → 退回已验证合格的候选拓扑;
+    // 三级回退: Ceres 结果不合格 → 退回已验证合格的候选拓扑
+    // (直接输出的候选同样要过兜底局部规则性检查);
     // 候选不合格已在第 4 步直接转 VDP; VDP 失败由调用方回退最优假设。
     removeDuplicatePoints2D(ceresResult, 0.05f);
+    // 候选直接输出前的局部规则性闸门(短斜边/尖刺/锯齿)
+    auto candidateUsable = [&]() {
+        outlineRegular::DirectionContextOut ctx;
+        ctx.valid = true;
+        ctx.completeEvidence = true;
+        ctx.multiDirection = isMultiDirection;
+        ctx.primaryAngle = dirBuild.systems.front().angleRad;
+        ctx.systemAngles = systemAngles;
+        return CheckFallbackLocalRegularity(
+            topologyPolygon, ctx, source_feature_id_, partIndex,
+            "topology_candidate");
+    };
     if (ceresResult.size() < 3) {
         std::cerr << "[TopologyCeresReject] fid=" << source_feature_id_
                   << " reason=empty_result" << std::endl;
+        const std::string localReason = candidateUsable();
+        if (!localReason.empty()) {
+            usedFallback = true;
+            std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " reason=candidate_local_" << localReason << std::endl;
+            return {};
+        }
         std::cerr << "[TopologyAccept] fid=" << source_feature_id_
                   << " source=candidate vertices=" << topologyPolygon.size() << std::endl;
         return topologyPolygon;
@@ -9957,6 +10348,14 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     if (!ceresReason.empty()) {
         std::cerr << "[TopologyCeresReject] fid=" << source_feature_id_
                   << " reason=" << ceresReason << std::endl;
+        const std::string localReason = candidateUsable();
+        if (!localReason.empty()) {
+            usedFallback = true;
+            std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " reason=candidate_local_" << localReason << std::endl;
+            return {};
+        }
         std::cerr << "[TopologyAccept] fid=" << source_feature_id_
                   << " source=candidate vertices=" << topologyPolygon.size() << std::endl;
         return topologyPolygon;
