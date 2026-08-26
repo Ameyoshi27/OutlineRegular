@@ -195,7 +195,7 @@ const int kNarrowNeckMaxCutsPerFeature = 12;
 // Experimental Mask-only branch. It is isolated from the OSGB pipeline and
 // falls back to the existing VDP path whenever topology checks fail.
 constexpr bool kUseTopologyPreservingResidualRegularization = true;
-constexpr bool kMaskCurveDetectionDebugOnly = true;
+constexpr bool kMaskCurveDetectionDebugOnly = false;
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -2761,7 +2761,8 @@ bool LineIntersection2D(
 }
 
 // 作用：把输出多边形转为组平差模型(边参数化 θ/d)。
-bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,    const Eigen::Vector3d& metadataOffset,
+bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
+    const Eigen::Vector3d& metadataOffset,
     GroupBuildingModel& model)
 {
     model = {};

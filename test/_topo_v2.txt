@@ -1,0 +1,211 @@
+// ===== TopologyPreservingRegularize =====
+// 拓扑保持规则化实验通道：从初始轮廓的连续边链出发（非 VDP 假设），
+// 保留显著凹凸/窄颈/方向转折作为受保护顶点，用等弧长轮廓采样点
+// 作为稠密几何残差，Ceres 只优化每条链的线参数(θ,d)。
+// v2: 修复闭环旋转/原环索引/拟合直线offset/角点锚定/多方向。
+enum class TopologyRegularizationStatus {
+    SuccessCeres,
+    SuccessTopologyCandidate,
+    FailedUseNormalPipeline
+};
+
+std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
+    const std::vector<pcl::PointXYZ>& initialRing,
+    double pixelSize,
+    bool& usedFallback)
+{
+    usedFallback = false;
+    if (initialRing.size() < 6) {
+        usedFallback = true;
+        return {};
+    }
+
+    const double area = polygonArea2D(initialRing);
+    if (area < 5.0) {
+        usedFallback = true;
+        return {};
+    }
+
+    // ---- 1. 边链提取(split-and-merge, 修复版) ----
+    const double fitTolerance = std::clamp(
+        0.5 * std::max(pixelSize, 0.3), 0.15, 0.60);
+    auto allChains = ExtractDirectionChains(initialRing, fitTolerance);
+    if (allChains.size() < 3) {
+        usedFallback = true;
+        return {};
+    }
+
+    // 方向投票只用长链(>=kDirectionMinChainLength)
+    std::vector<DirectionChain> directionChains;
+    for (const auto& c : allChains) {
+        if (!c.isShort) directionChains.push_back(c);
+    }
+
+    std::cerr << "[TopologyChain] fid=" << source_feature_id_
+              << " raw_vertices=" << initialRing.size()
+              << " all_chains=" << allChains.size()
+              << " direction_chains=" << directionChains.size()
+              << " short_preserved=" << (allChains.size() - directionChains.size())
+              << std::endl;
+
+    // ---- 2. 方向峰检测(用长链) ----
+    auto peaks = DetectDirectionPeaks(directionChains, fitTolerance);
+    bool isMultiDirection = peaks.size() >= 2 &&
+        peaks[1].ratio >= kDirectionMinSecondaryRatio &&
+        peaks[1].chainCount >= kDirectionMinIndependentChains;
+
+    std::cerr << "[TopologyDirection] fid=" << source_feature_id_
+              << " peak_count=" << peaks.size()
+              << " primary_deg=" << (peaks.empty() ? 0.0 : peaks[0].angleRad * 180.0 / M_PI)
+              << " secondary_deg=" << (peaks.size() >= 2 ? peaks[1].angleRad * 180.0 / M_PI : -1.0)
+              << " mode=" << (isMultiDirection ? "multi" : "single") << std::endl;
+
+    // ---- 3. 构造候选拓扑: 用原始角点锚定 + 拟合线交点 ----
+    std::vector<pcl::PointXYZ> topologyPolygon;
+    topologyPolygon.reserve(allChains.size());
+    const float zVal = initialRing[0].z;
+
+    for (std::size_t c = 0; c < allChains.size(); ++c) {
+        const auto& chainA = allChains[c];
+        const auto& chainB = allChains[(c + 1) % allChains.size()];
+
+        // 原始角点 = 链A终点(直接用存储的端点坐标)
+        pcl::PointXYZ rawCorner = chainA.endPoint;
+
+        // 尝试用拟合线交点优化角点位置(必须在原始角点附近才用)
+        pcl::PointXYZ vertex = rawCorner;
+        {
+            const double det = chainA.normalX * chainB.normalY -
+                               chainB.normalX * chainA.normalY;
+            if (std::abs(det) > 1e-9) {
+                // Cramer's rule
+                const double xx = (chainA.lineOffset * chainB.normalY -
+                                   chainA.normalY * chainB.lineOffset) / det;
+                const double yy = (chainA.normalX * chainB.lineOffset -
+                                   chainA.lineOffset * chainB.normalX) / det;
+                const double shift = std::hypot(xx - rawCorner.x, yy - rawCorner.y);
+                // 交点必须在原始角点附近(<=1.0m)才使用，否则保留原始角点
+                if (shift <= 1.0 && std::isfinite(xx) && std::isfinite(yy)) {
+                    vertex.x = static_cast<float>(xx);
+                    vertex.y = static_cast<float>(yy);
+                    vertex.z = zVal;
+                }
+            }
+        }
+        topologyPolygon.push_back(vertex);
+    }
+
+    // ---- 4. 拓扑安全检查 ----
+    if (topologyPolygon.size() < 3) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=degenerate_topology_polygon" << std::endl;
+        return {};
+    }
+    removeDuplicatePoints2D(topologyPolygon, 0.05f);
+    if (topologyPolygon.size() < 3 || !isSimplePolygon2D(topologyPolygon)) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=self_intersecting_or_too_few_vertices" << std::endl;
+        return {};
+    }
+    const double topoArea = polygonArea2D(topologyPolygon);
+    const double areaRatio = topoArea / std::max(area, 1e-6);
+    if (areaRatio < 0.60 || areaRatio > 1.60) {
+        usedFallback = true;
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=area_ratio=" << areaRatio << std::endl;
+        return {};
+    }
+
+    // ---- 5. 按链弧段采样残差点(每条链只采样自己的区间) ----
+    pcl::PointCloud<pcl::PointXYZ>::Ptr residualCloud(new pcl::PointCloud<pcl::PointXYZ>);
+    {
+        const double step = std::clamp(pixelSize, 0.3, 0.8);
+        for (const auto& chain : allChains) {
+            if (chain.isShort) continue;  // 短链不参与残差
+            const auto& sp = chain.startPoint;
+            const auto& ep = chain.endPoint;
+            const double len = std::hypot(ep.x - sp.x, ep.y - sp.y);
+            if (len < 0.5) continue;
+            const int steps = std::max(2, static_cast<int>(std::ceil(len / step)));
+            for (int s2 = 0; s2 < steps; ++s2) {
+                const double t = static_cast<double>(s2) / steps;
+                // 遮蔽两端5%
+                const double tt = 0.05 + 0.90 * t;
+                pcl::PointXYZ pt;
+                pt.x = static_cast<float>(sp.x + tt * (ep.x - sp.x));
+                pt.y = static_cast<float>(sp.y + tt * (ep.y - sp.y));
+                pt.z = zVal;
+                residualCloud->push_back(pt);
+            }
+        }
+    }
+    if (residualCloud->size() < 6) {
+        usedFallback = true;
+        return {};
+    }
+    std::cerr << "[DenseResidual] fid=" << source_feature_id_
+              << " residual_points=" << residualCloud->size() << std::endl;
+
+    // ---- 6. Ceres 平差(用正确的拟合直线参数和多方向) ----
+    std::vector<double> preferredAngles;
+    if (!peaks.empty()) {
+        preferredAngles.push_back(peaks[0].angleRad);
+        if (isMultiDirection) {
+            preferredAngles.push_back(peaks[1].angleRad);
+        }
+    }
+
+    std::vector<pcl::PointXYZ> ceresResult = topologyPolygon;
+    optimizeWithHardConstraints(
+        ceresResult, residualCloud, isMultiDirection, preferredAngles);
+
+    // ---- 7. Ceres 结果拓扑验收 ----
+    removeDuplicatePoints2D(ceresResult, 0.05f);
+    if (ceresResult.size() < 3 || !isSimplePolygon2D(ceresResult)) {
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=ceres_invalid_using_topology" << std::endl;
+        return topologyPolygon;
+    }
+    const double ceresArea = polygonArea2D(ceresResult);
+    const double ceresAreaRatio = ceresArea / std::max(area, 1e-6);
+    if (ceresAreaRatio < 0.60 || ceresAreaRatio > 1.60) {
+        std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                  << " reason=ceres_area_ratio=" << ceresAreaRatio
+                  << " using_topology" << std::endl;
+        return topologyPolygon;
+    }
+
+    // 简化偏差检查
+    {
+        double maxDev = 0.0;
+        for (const auto& pt : ceresResult) {
+            double best = std::numeric_limits<double>::max();
+            for (std::size_t i = 0; i < initialRing.size(); ++i) {
+                const auto& a = initialRing[i];
+                const auto& b = initialRing[(i + 1) % initialRing.size()];
+                const double dx = b.x - a.x;
+                const double dy = b.y - a.y;
+                const double lenSq = dx * dx + dy * dy;
+                if (lenSq < 1e-12) continue;
+                double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+                t = std::clamp(t, 0.0, 1.0);
+                const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+                best = std::min(best, d);
+            }
+            maxDev = std::max(maxDev, best);
+        }
+        if (maxDev > 1.20) {
+            std::cerr << "[TopologyFallback] fid=" << source_feature_id_
+                      << " reason=max_deviation=" << maxDev << " using_topology" << std::endl;
+            return topologyPolygon;
+        }
+    }
+
+    std::cerr << "[CeresTopology] fid=" << source_feature_id_
+              << " chains=" << allChains.size()
+              << " final_vertices=" << ceresResult.size()
+              << " mode=" << (isMultiDirection ? "multi" : "single") << std::endl;
+    return ceresResult;
+}

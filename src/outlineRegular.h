@@ -80,9 +80,11 @@ struct MaskConicArc {
     double cx = 0.0, cy = 0.0, radius = 0.0;
     double startAngle = 0.0, sweepAngle = 0.0;
     double rmse = 0.0, q90 = 0.0, lineRmse = 0.0;
+    double twoLineRmse = 0.0;
     double arcLength = 0.0, chordLength = 0.0, sagitta = 0.0;
     double sweepDeg = 0.0;
     int supportCount = 0;
+    int sourceOrientation = 0; // +1=CCW, -1=CW in the detected smooth ring.
     double score = 0.0;
     pcl::PointXYZ startPoint, endPoint;
 };

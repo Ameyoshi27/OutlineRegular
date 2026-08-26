@@ -2697,6 +2697,52 @@ static double LineFitRmseOf(const std::vector<pcl::PointXYZ>& pts,
     return std::sqrt(e2 / count);
 }
 
+// A rasterized right-angle corner often fits a circle better than one line,
+// but it should still be represented by two walls. Use the best two-line fit
+// as the competing model so only genuinely curved intervals survive.
+static double BestTwoLineFitRmseOf(
+    const std::vector<pcl::PointXYZ>& pts)
+{
+    const std::size_t n = pts.size();
+    if (n < 9) return std::numeric_limits<double>::infinity();
+    struct Moments {
+        double x = 0.0, y = 0.0, xx = 0.0, yy = 0.0, xy = 0.0;
+    };
+    std::vector<Moments> prefix(n + 1);
+    for (std::size_t i = 0; i < n; ++i) {
+        prefix[i + 1] = prefix[i];
+        const double x = pts[i].x;
+        const double y = pts[i].y;
+        prefix[i + 1].x += x;
+        prefix[i + 1].y += y;
+        prefix[i + 1].xx += x * x;
+        prefix[i + 1].yy += y * y;
+        prefix[i + 1].xy += x * y;
+    }
+    auto lineSquaredError = [&](std::size_t begin, std::size_t end) {
+        const double count = static_cast<double>(end - begin);
+        const double sx = prefix[end].x - prefix[begin].x;
+        const double sy = prefix[end].y - prefix[begin].y;
+        const double sxx = prefix[end].xx - prefix[begin].xx - sx * sx / count;
+        const double syy = prefix[end].yy - prefix[begin].yy - sy * sy / count;
+        const double sxy = prefix[end].xy - prefix[begin].xy - sx * sy / count;
+        const double trace = sxx + syy;
+        const double discriminant = std::hypot(sxx - syy, 2.0 * sxy);
+        return std::max(0.0, 0.5 * (trace - discriminant));
+    };
+    constexpr std::size_t kMinSidePoints = 4;
+    double bestSquaredError = std::numeric_limits<double>::infinity();
+    for (std::size_t split = kMinSidePoints - 1;
+         split + kMinSidePoints < n; ++split) {
+        // Include the split point in both segments so the competing walls
+        // meet at a shared corner.
+        const double squaredError = lineSquaredError(0, split + 1) +
+            lineSquaredError(split, n);
+        bestSquaredError = std::min(bestSquaredError, squaredError);
+    }
+    return std::sqrt(bestSquaredError / static_cast<double>(n + 1));
+}
+
 // v2: 开放曲线转角(仅内部顶点,无闭合)
 struct OpenTurnStats {
     double signedTurnDeg = 0.0;
@@ -2705,6 +2751,107 @@ struct OpenTurnStats {
     int reversalCount = 0;
     int totalTurns = 0;
 };
+
+struct CircleAngleProgressionStats {
+    double signedSweep = 0.0;
+    double absoluteSweep = 0.0;
+    double monotonicity = 0.0;
+    int significantSteps = 0;
+    int reverseSteps = 0;
+};
+
+struct CircleFitStability {
+    double centerShift = 0.0;
+    double radiusRelativeDifference = 0.0;
+    double score = 0.0;
+    bool valid = false;
+};
+
+static CircleFitStability EvaluateCircleFitStability(
+    const std::vector<pcl::PointXYZ>& centeredPts,
+    double fullCx,
+    double fullCy,
+    double fullRadius)
+{
+    CircleFitStability result;
+    const std::size_t n = centeredPts.size();
+    if (n < 10 || fullRadius <= 1e-6) {
+        result.valid = true;
+        result.score = 1.0;
+        return result;
+    }
+
+    const std::size_t split = n / 2;
+    if (split < 4 || n - split < 4) return result;
+    double cxA = 0.0, cyA = 0.0, radiusA = 0.0, rmseA = 0.0;
+    double cxB = 0.0, cyB = 0.0, radiusB = 0.0, rmseB = 0.0;
+    if (!fitCircle2D(centeredPts, 0, split, cxA, cyA, radiusA, rmseA) ||
+        !fitCircle2D(centeredPts, split, n - split,
+                     cxB, cyB, radiusB, rmseB)) {
+        return result;
+    }
+    if (!std::isfinite(cxA) || !std::isfinite(cyA) ||
+        !std::isfinite(cxB) || !std::isfinite(cyB) ||
+        !std::isfinite(radiusA) || !std::isfinite(radiusB) ||
+        radiusA <= 1e-6 || radiusB <= 1e-6) {
+        return result;
+    }
+
+    result.centerShift = std::hypot(cxA - cxB, cyA - cyB) / fullRadius;
+    result.radiusRelativeDifference =
+        std::abs(radiusA - radiusB) / fullRadius;
+    const double error = result.centerShift + result.radiusRelativeDifference;
+    result.score = std::exp(-error);
+    result.valid = std::isfinite(result.score);
+    return result;
+}
+
+// Evaluate the ordered support directly in the fitted circle's parameter
+// space. Raster stair steps can alternate their polyline turn signs while the
+// polar angle around the correct circle still progresses monotonically.
+static CircleAngleProgressionStats CircleAngleProgression(
+    const std::vector<pcl::PointXYZ>& centeredPts,
+    double cx,
+    double cy)
+{
+    CircleAngleProgressionStats stats;
+    if (centeredPts.size() < 3) return stats;
+
+    constexpr double kMinSignificantStep = 0.25 * M_PI / 180.0;
+    double positive = 0.0;
+    double negative = 0.0;
+    double previous = std::atan2(
+        centeredPts.front().y - cy, centeredPts.front().x - cx);
+    std::vector<double> deltas;
+    deltas.reserve(centeredPts.size() - 1);
+    for (std::size_t i = 1; i < centeredPts.size(); ++i) {
+        const double angle = std::atan2(
+            centeredPts[i].y - cy, centeredPts[i].x - cx);
+        double delta = angle - previous;
+        while (delta > M_PI) delta -= 2.0 * M_PI;
+        while (delta < -M_PI) delta += 2.0 * M_PI;
+        previous = angle;
+        if (std::abs(delta) < kMinSignificantStep) continue;
+        deltas.push_back(delta);
+        if (delta > 0.0) positive += delta;
+        else negative -= delta;
+    }
+
+    stats.significantSteps = static_cast<int>(deltas.size());
+    stats.absoluteSweep = positive + negative;
+    stats.signedSweep = positive - negative;
+    if (stats.absoluteSweep <= 1e-9) return stats;
+
+    const bool positiveDominant = positive >= negative;
+    for (double delta : deltas) {
+        if ((positiveDominant && delta < 0.0) ||
+            (!positiveDominant && delta > 0.0)) {
+            ++stats.reverseSteps;
+        }
+    }
+    stats.monotonicity = std::max(positive, negative) / stats.absoluteSweep;
+    return stats;
+}
 static OpenTurnStats OpenCurveTurnStats(const std::vector<pcl::PointXYZ>& pts)
 {
     OpenTurnStats s;
@@ -2777,20 +2924,29 @@ static SmoothRawMap BuildSmoothRawMap(
         if (k + 1 < rn) m.rawCumArc[k + 1] = cum;
     }
     m.totalRawArc = cum;
+    auto rawIndexAtOffset = [&](std::size_t offset) {
+        return m.rawReversed
+            ? (m.rawStart + rn - (offset % rn)) % rn
+            : (m.rawStart + offset) % rn;
+    };
+
+    // Store oriented offsets from rawStart, not physical raw indices. This
+    // keeps the sequence monotonic and makes wrapped smooth intervals map to
+    // the same directed side of the raw ring.
     m.rawUnwrapped.resize(sn);
+    m.rawUnwrapped[0] = 0;
     std::size_t rawPtr = 0;
-    for (std::size_t si = 0; si < sn; ++si) {
-        std::size_t bestOff = 0;
+    for (std::size_t si = 1; si < sn; ++si) {
+        std::size_t bestOffset = rawPtr;
         double bestD = 1e18;
-        for (std::size_t off = 0; off < rn; ++off) {
-            const std::size_t ri = (rawPtr + off) % rn;
+        for (std::size_t offset = rawPtr; offset < rn; ++offset) {
+            const std::size_t ri = rawIndexAtOffset(offset);
             const double d = std::hypot(rawRing[ri].x - smoothRing[si].x,
                                         rawRing[ri].y - smoothRing[si].y);
-            if (d < bestD) { bestD = d; bestOff = off; }
-            if (off > 10 && d > bestD * 3) break;
+            if (d < bestD) { bestD = d; bestOffset = offset; }
         }
-        rawPtr = (rawPtr + bestOff) % rn;
-        m.rawUnwrapped[si] = rawPtr;
+        rawPtr = bestOffset;
+        m.rawUnwrapped[si] = bestOffset;
     }
     m.valid = true;
     return m;
@@ -2829,6 +2985,7 @@ static RawInterval ExtractRawInterval(
 
 static std::vector<pcl::PointXYZ> CollectRawPoints(
     const std::vector<pcl::PointXYZ>& rawRing,
+    const SmoothRawMap& map,
     const RawInterval& ri)
 {
     std::vector<pcl::PointXYZ> pts;
@@ -2836,7 +2993,11 @@ static std::vector<pcl::PointXYZ> CollectRawPoints(
     const std::size_t rn = rawRing.size();
     pts.reserve((std::size_t)ri.pointCount);
     for (std::size_t k = 0; k < (std::size_t)ri.pointCount; ++k) {
-        pts.push_back(rawRing[(ri.rawStartIdx + k) % rn]);
+        const std::size_t offset = (ri.rawStartIdx + k) % rn;
+        const std::size_t physical = map.rawReversed
+            ? (map.rawStart + rn - offset) % rn
+            : (map.rawStart + offset) % rn;
+        pts.push_back(rawRing[physical]);
     }
     return pts;
 }
@@ -2894,55 +3055,77 @@ static std::string EvalCircleV2(
     double q90 = 0;
     CircleDistStats(c, 0, n, cx, cy, r, rmse, q90);
     const double lineRmse = LineFitRmseOf(c, 0, n);
+    const double twoLineRmse = BestTwoLineFitRmseOf(c);
     const double chord = std::hypot(c[n-1].x - c[0].x, c[n-1].y - c[0].y);
     double arcLen = 0;
     for (int i = 0; i < n - 1; ++i)
         arcLen += std::hypot(c[i+1].x - c[i].x, c[i+1].y - c[i].y);
-    // 转角: 用smoothPts(去中心化+采样)
-    OpenTurnStats ts;
-    if (smoothPts.size() >= 3) {
-        double smx = 0, smy = 0;
-        for (const auto& p : smoothPts) { smx += p.x; smy += p.y; }
-        smx /= smoothPts.size(); smy /= smoothPts.size();
-        std::vector<pcl::PointXYZ> sc(smoothPts.size());
-        for (std::size_t i = 0; i < smoothPts.size(); ++i) {
-            sc[i].x = (float)(smoothPts[i].x - smx);
-            sc[i].y = (float)(smoothPts[i].y - smy);
-            sc[i].z = smoothPts[i].z;
-        }
-        auto sampled = WeightedSample(sc, std::max(12, (int)sc.size()));
-        ts = OpenCurveTurnStats(sampled);
-    } else {
-        ts = OpenCurveTurnStats(c);
-    }
-    double sa = 0;
-    const double sweep = unwrapArcSweep(c, 0, n, cx, cy, sa);
+    const CircleAngleProgressionStats angleStats =
+        CircleAngleProgression(c, cx, cy);
+    const CircleFitStability stability =
+        EvaluateCircleFitStability(c, cx, cy, r);
+    const double sa = std::atan2(c.front().y - cy, c.front().x - cx);
+    const double sweep = angleStats.signedSweep;
     const double sweepDeg = std::abs(sweep) * 180.0 / M_PI;
+
+    double sagitta = 0.0;
+    const double chordDx = c.back().x - c.front().x;
+    const double chordDy = c.back().y - c.front().y;
+    const double chordSq = chordDx * chordDx + chordDy * chordDy;
+    if (chordSq > 1e-12) {
+        for (const auto& p : c) {
+            double t = ((p.x - c.front().x) * chordDx +
+                        (p.y - c.front().y) * chordDy) / chordSq;
+            t = std::clamp(t, 0.0, 1.0);
+            sagitta = std::max(sagitta, std::hypot(
+                p.x - c.front().x - t * chordDx,
+                p.y - c.front().y - t * chordDy));
+        }
+    }
 
     // 门限
     if (arcLen < 10.0) return "too_short";
     if (chord < 6.0) return "chord_too_short";
-    if (ts.absoluteTurnDeg < 20.0) return "turn_too_small";
-    if (ts.consistency < 0.80) return "turn_inconsistent";
-    if (ts.totalTurns > 0 && (double)ts.reversalCount / ts.totalTurns > 0.10)
-        return "reversal_too_many";
+    if (sagitta < std::max(2.0 * pixelSize, 0.60)) return "sagitta_too_small";
+    if (angleStats.significantSteps < 2) return "angle_progress_too_short";
+    if (angleStats.monotonicity < 0.85) return "angle_not_monotonic";
+    if (angleStats.significantSteps > 0 &&
+        static_cast<double>(angleStats.reverseSteps) /
+            static_cast<double>(angleStats.significantSteps) > 0.15) {
+        return "angle_reversal_too_many";
+    }
+    if (!stability.valid) return "circle_fit_unstable";
+    if (stability.centerShift > 0.65 ||
+        stability.radiusRelativeDifference > 0.45) {
+        return "circle_fit_unstable";
+    }
     if (rmse > std::max(2.0 * pixelSize, 0.60)) return "circle_rmse";
     if (q90 > std::max(3.0 * pixelSize, 1.00)) return "circle_q90";
     if (lineRmse / std::max(rmse, 0.01) < 2.0) return "line_explains_better";
+    const double lineImprovement = lineRmse / std::max(rmse, 0.01);
+    const bool strongShallowArc = sweepDeg <= 70.0 && lineImprovement >= 2.5;
+    if (std::isfinite(twoLineRmse) && !strongShallowArc &&
+        twoLineRmse / std::max(rmse, 0.01) < 1.35) {
+        return "two_lines_explain_better";
+    }
     if (sweepDeg < 20.0 || sweepDeg > 240.0) return "sweep_out_of_range";
 
     const double improve = std::max(0.0, 1.0 - rmse / std::max(lineRmse, 0.01));
-    const double fitTol = std::max(0.5 * pixelSize, 0.1);
-    const double fitQ = std::exp(-(rmse / fitTol) * (rmse / fitTol));
+    const double rmseLimit = std::max(2.0 * pixelSize, 0.60);
+    const double normalizedRmse = rmse / rmseLimit;
+    const double fitQ = std::exp(-0.5 * normalizedRmse * normalizedRmse);
     out.type = MaskCurveType::CircleArc;
     out.cx = cx + mx; out.cy = cy + my; out.radius = r;
     out.startAngle = sa; out.sweepAngle = sweep;
     out.rmse = rmse; out.q90 = q90; out.lineRmse = lineRmse;
+    out.twoLineRmse = twoLineRmse;
     out.arcLength = arcLen; out.chordLength = chord;
+    out.sagitta = sagitta;
     out.sweepDeg = sweepDeg;
     out.supportCount = sourceVertexCount;
-    out.score = improve * fitQ * ts.consistency * std::min(1.0, arcLen / 15.0);
-    if (out.score <= 0.0) return "zero_score";
+    out.score = std::sqrt(std::min(arcLen, 40.0)) * improve * fitQ *
+        angleStats.monotonicity * stability.score;
+    if (out.score < 1.80) return "weak_curve_evidence";
     return "";
 }
 
@@ -11243,7 +11426,7 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
             if (rawMap.valid) {
                 RawInterval ri = ExtractRawInterval(rawMap, start, end);
                 if (ri.valid && ri.pointCount >= 3) {
-                    fitPts = CollectRawPoints(rawRing, ri);
+                    fitPts = CollectRawPoints(rawRing, rawMap, ri);
                     sourceN = ri.pointCount;
                 }
             }
@@ -11274,6 +11457,8 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
                 a.startIdx = start; a.endIdx = end; a.wrapsZero = w;
                 a.startPoint = smoothRing[start];
                 a.endPoint = smoothRing[end];
+                a.sourceOrientation = polygonSignedArea2D(smoothRing) >= 0.0
+                    ? 1 : -1;
                 all.push_back({start, end, w, a});
             } else {
                 if (a.arcLength > bestRejectScore) {
@@ -11317,6 +11502,7 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
                   << " sweep_deg=" << a.sweepDeg
                   << " rmse=" << a.rmse
                   << " line_rmse=" << a.lineRmse
+                  << " two_line_rmse=" << a.twoLineRmse
                   << " score=" << a.score << std::endl;
     }
     return candidates;
@@ -11330,8 +11516,14 @@ std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
     std::vector<pcl::PointXYZ> result = candidate;
     for (std::size_t ai = 0; ai < arcs.size(); ++ai) {
         const auto& arc = arcs[ai];
-        auto proj = [&](const pcl::PointXYZ& pt) {
-            double bd = 1e18; std::size_t be = 0; double bt = 0.0;
+        struct Projection {
+            std::size_t edge = 0;
+            double t = 0.0;
+            double distance = 0.0;
+            pcl::PointXYZ point;
+        };
+        auto projections = [&](const pcl::PointXYZ& pt) {
+            std::vector<Projection> out;
             for (std::size_t e = 0; e < result.size(); ++e) {
                 const auto& a = result[e];
                 const auto& b = result[(e + 1) % result.size()];
@@ -11340,45 +11532,132 @@ std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
                 if (ls < 1e-12) continue;
                 double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
                 t = std::clamp(t, 0.0, 1.0);
-                const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
-                if (d < bd) { bd = d; be = e; bt = t; }
+                Projection p;
+                p.edge = e;
+                p.t = t;
+                p.point.x = static_cast<float>(a.x + t * dx);
+                p.point.y = static_cast<float>(a.y + t * dy);
+                p.point.z = pt.z;
+                p.distance = std::hypot(pt.x - p.point.x, pt.y - p.point.y);
+                out.push_back(p);
             }
-            return std::make_tuple(be, bt, bd);
+            std::sort(out.begin(), out.end(),
+                [](const Projection& a, const Projection& b) {
+                    return a.distance < b.distance;
+                });
+            // Keep enough alternatives to recover endpoints that moved onto
+            // an adjacent edge after orthogonalization, without pairing every
+            // distant edge in a large building.
+            if (out.size() > 8) out.resize(8);
+            return out;
         };
-        auto [sE, sT, sD] = proj(arc.startPoint);
-        auto [eE, eT, eD] = proj(arc.endPoint);
-        const double lim = std::max(3.0 * pixelSize, 1.5);
-        if (sD > lim || eD > lim) {
+
+        const auto startProjections = projections(arc.startPoint);
+        const auto endProjections = projections(arc.endPoint);
+        if (startProjections.empty() || endProjections.empty()) continue;
+
+        auto edgeLength = [&](std::size_t e) {
+            const auto& a = result[e];
+            const auto& b = result[(e + 1) % result.size()];
+            return std::hypot(b.x - a.x, b.y - a.y);
+        };
+        double perimeter = 0.0;
+        for (std::size_t e = 0; e < result.size(); ++e) {
+            perimeter += edgeLength(e);
+        }
+        auto forwardDistance = [&](const Projection& s, const Projection& e) {
+            const std::size_t n = result.size();
+            if (s.edge == e.edge) {
+                if (e.t >= s.t) {
+                    return (e.t - s.t) * edgeLength(s.edge);
+                }
+                return perimeter - (s.t - e.t) * edgeLength(s.edge);
+            }
+            double length = (1.0 - s.t) * edgeLength(s.edge);
+            std::size_t edge = (s.edge + 1) % n;
+            while (edge != e.edge) {
+                length += edgeLength(edge);
+                edge = (edge + 1) % n;
+            }
+            length += e.t * edgeLength(e.edge);
+            return length;
+        };
+        auto reverseDistance = [&](const Projection& s, const Projection& e) {
+            return perimeter - forwardDistance(s, e);
+        };
+
+        struct PathChoice {
+            Projection start;
+            Projection end;
+            bool forward = true;
+            double length = 0.0;
+            double score = std::numeric_limits<double>::max();
+        };
+        PathChoice best;
+        const double sourceArcLength = std::max(arc.arcLength, arc.chordLength);
+        const double sourcePathLength = std::max(arc.chordLength, 1e-6);
+        const int candidateOrientation = polygonSignedArea2D(result) >= 0.0
+            ? 1 : -1;
+        const bool desiredForward = arc.sourceOrientation == 0 ||
+            candidateOrientation == arc.sourceOrientation;
+        const double maxEndpointDistance = std::clamp(
+            std::max(4.0, 0.35 * sourceArcLength), 4.0, 8.5);
+        for (const auto& sp : startProjections) {
+            for (const auto& ep : endProjections) {
+                if (sp.distance > maxEndpointDistance ||
+                    ep.distance > maxEndpointDistance) continue;
+                const double pathLength = desiredForward
+                    ? forwardDistance(sp, ep) : reverseDistance(sp, ep);
+                if (pathLength < 1e-6 || pathLength > 0.50 * perimeter) {
+                    continue;
+                }
+                // Orthogonalization replaces a curved span by approximately
+                // its chord, so compare candidate path length with chord
+                // length, not source arc length.
+                const double lengthRatio = pathLength / sourcePathLength;
+                if (lengthRatio < 0.70 || lengthRatio > 1.60) continue;
+                const double lengthPenalty = std::abs(std::log(lengthRatio));
+                const double endpointPenalty =
+                    (sp.distance + ep.distance) /
+                    std::max(sourcePathLength, 1.0);
+                const double score = 2.0 * endpointPenalty + lengthPenalty;
+                if (score < best.score) {
+                    best = {sp, ep, desiredForward, pathLength, score};
+                }
+            }
+        }
+        if (best.score == std::numeric_limits<double>::max()) {
             std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
-                      << " index=" << ai << " restored=0 reason=endpoint_dist"
-                      << " s=" << sD << " e=" << eD << std::endl;
+                      << " index=" << ai << " restored=0 reason=no_compatible_path"
+                      << std::endl;
             continue;
         }
         const std::size_t rn = result.size();
-        double fwdL = 0.0, bwdL = 0.0;
-        std::size_t fwdE = 0, bwdE = 0;
-        { std::size_t e = sE;
-          while (e != eE) {
-              const auto& a = result[e]; const auto& b = result[(e + 1) % rn];
-              fwdL += std::hypot(b.x - a.x, b.y - a.y);
-              e = (e + 1) % rn; ++fwdE; if (fwdE > rn) break; } }
-        { std::size_t e = sE;
-          while (e != eE) {
-              const auto& a = result[(e + rn - 1) % rn]; const auto& b = result[e];
-              bwdL += std::hypot(b.x - a.x, b.y - a.y);
-              e = (e + rn - 1) % rn; ++bwdE; if (bwdE > rn) break; } }
-        const bool fwd = std::abs(fwdL - arc.arcLength) <= std::abs(bwdL - arc.arcLength);
-        pcl::PointXYZ pS; { const auto& a = result[sE]; const auto& b = result[(sE + 1) % rn];
-          pS.x = (float)(a.x + sT * (b.x - a.x)); pS.y = (float)(a.y + sT * (b.y - a.y));
-          pS.z = arc.startPoint.z; }
-        pcl::PointXYZ pE; { const auto& a = result[eE]; const auto& b = result[(eE + 1) % rn];
-          pE.x = (float)(a.x + eT * (b.x - a.x)); pE.y = (float)(a.y + eT * (b.y - a.y));
-          pE.z = arc.endPoint.z; }
+        const std::size_t sE = best.start.edge;
+        const std::size_t eE = best.end.edge;
+        const double sT = best.start.t;
+        const double eT = best.end.t;
+        const bool fwd = best.forward;
+        const pcl::PointXYZ pS = best.start.point;
+        const pcl::PointXYZ pE = best.end.point;
         const double srcLen = arc.chordLength;
         const double dstLen = std::hypot(pE.x - pS.x, pE.y - pS.y);
-        if (srcLen < 1e-6 || dstLen < 1e-6) continue;
+        if (srcLen < 1e-6 || dstLen < 1e-6) {
+            std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                      << " index=" << ai
+                      << " restored=0 reason=degenerate_chord" << std::endl;
+            continue;
+        }
         const double scale = dstLen / srcLen;
-        if (scale < 0.85 || scale > 1.20) continue;
+        if (scale < 0.78 || scale > 1.25) {
+            std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                      << " index=" << ai << " restored=0 reason=scale"
+                      << " value=" << scale
+                      << " path_length=" << best.length
+                      << " endpoint_dist=" << best.start.distance << ","
+                      << best.end.distance << std::endl;
+            continue;
+        }
         const double sa = std::atan2(arc.endPoint.y - arc.startPoint.y,
                                       arc.endPoint.x - arc.startPoint.x);
         const double da = std::atan2(pE.y - pS.y, pE.x - pS.x);
@@ -11402,32 +11681,52 @@ std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
             p.x = (float)(arc.cx + arc.radius * std::cos(ang));
             p.y = (float)(arc.cy + arc.radius * std::sin(ang));
             p.z = arc.startPoint.z; cs.push_back(xf(p)); }
-        std::vector<bool> inSpan(rn, false);
-        if (fwd) { std::size_t e = (sE + 1) % rn;
-            for (std::size_t g = 0; g < rn && e != (eE + 1) % rn; e = (e + 1) % rn, ++g)
-                inSpan[e] = true; }
-        else { std::size_t e = eE;
-            for (std::size_t g = 0; g < rn && e != sE; e = (e + 1) % rn, ++g)
-                inSpan[e] = true; }
         std::vector<pcl::PointXYZ> nr;
-        if (fwd) { for (std::size_t k = 0; k < rn; ++k) {
-                const std::size_t idx = (eE + 1 + k) % rn;
-                if (!inSpan[idx]) nr.push_back(result[idx]); } }
-        else { for (std::size_t k = 0; k < rn; ++k) {
-                const std::size_t idx = (sE + 1 + k) % rn;
-                if (!inSpan[idx]) nr.push_back(result[idx]); } }
-        for (const auto& p : cs) nr.push_back(p);
-        if (nr.size() > 1) { const auto& f = nr.front(); const auto& l = nr.back();
-            if (std::hypot(f.x - l.x, f.y - l.y) < 0.01) nr.pop_back(); }
+        if (fwd) {
+            // Replace candidate's forward pS->pE span. The fitted arc and the
+            // retained complement both keep the candidate ring orientation.
+            nr.insert(nr.end(), cs.begin(), cs.end());
+            std::size_t idx = (eE + 1) % rn;
+            nr.push_back(result[idx]);
+            while (idx != sE) {
+                idx = (idx + 1) % rn;
+                nr.push_back(result[idx]);
+            }
+        } else {
+            // The source interval corresponds to candidate's reverse span,
+            // hence its pE->pS samples replace candidate's forward pE->pS
+            // span. Keep the resulting ring in candidate order.
+            nr.insert(nr.end(), cs.rbegin(), cs.rend());
+            std::size_t idx = (sE + 1) % rn;
+            nr.push_back(result[idx]);
+            while (idx != eE) {
+                idx = (idx + 1) % rn;
+                nr.push_back(result[idx]);
+            }
+        }
+        removeDuplicatePoints2D(nr, 0.01f);
         if (nr.size() < 4) continue;
-        if (!isSimplePolygon2D(nr)) continue;
+        if (!isSimplePolygon2D(nr)) {
+            std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                      << " index=" << ai
+                      << " restored=0 reason=self_intersection" << std::endl;
+            continue;
+        }
         const double oldA = std::abs(polygonArea2D(result));
         const double newA = std::abs(polygonArea2D(nr));
         const double ar = newA / std::max(oldA, 1e-6);
-        if (ar < 0.90 || ar > 1.10) continue;
+        if (ar < 0.75 || ar > 1.25) {
+            std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                      << " index=" << ai << " restored=0 reason=area_change"
+                      << " ratio=" << ar << std::endl;
+            continue;
+        }
         result = nr;
         std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
                   << " index=" << ai << " restored=1 scale=" << scale
+                  << " path_length=" << best.length
+                  << " endpoint_dist=" << best.start.distance << ","
+                  << best.end.distance
                   << " samples=" << cs.size() << std::endl;
     }
     return result;
