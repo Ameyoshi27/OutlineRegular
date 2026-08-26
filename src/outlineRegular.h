@@ -69,6 +69,32 @@ struct ShapeResult {
 
 // outlineRegular：轮廓规则化器。输入原始多边形 + RANSAC 支撑点云(+可选 DLG 先验)，
 // 调用 regular_Contour() 完成规则化，结果存于 final_points。
+// Mask-only 局部圆弧/椭圆弧检测与恢复的公共接口
+enum class MaskCurveType { CircleArc, EllipseArc };
+
+struct MaskConicArc {
+    std::size_t startIdx = 0;
+    std::size_t endIdx = 0;
+    bool wrapsZero = false;
+    MaskCurveType type = MaskCurveType::CircleArc;
+    double cx = 0.0, cy = 0.0, radius = 0.0;
+    double startAngle = 0.0, sweepAngle = 0.0;
+    double rmse = 0.0, q90 = 0.0, lineRmse = 0.0;
+    double arcLength = 0.0, chordLength = 0.0, sagitta = 0.0;
+    double sweepDeg = 0.0;
+    int supportCount = 0;
+    double score = 0.0;
+    pcl::PointXYZ startPoint, endPoint;
+};
+
+std::vector<MaskConicArc> DetectMaskConicArcs(
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>& rawRing,
+    double pixelSize, long long fid, int partIdx);
+std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
+    const std::vector<pcl::PointXYZ>& candidate,
+    const std::vector<MaskConicArc>& arcs,
+    double pixelSize, long long fid, int partIdx);
 class outlineRegular
 {
 
@@ -153,6 +179,17 @@ public:
 		const std::vector<pcl::PointXYZ>& input,
 		double mainAngle,
 		std::vector<pcl::PointXYZ>& result) const;
+	// Mask-only 局部圆弧检测(在平滑环上搜索, raw提供支撑)
+	struct MaskConicArc;
+	static std::vector<MaskConicArc> DetectMaskConicArcs(
+		const std::vector<pcl::PointXYZ>& smoothRing,
+		const std::vector<pcl::PointXYZ>& rawRing,
+		double pixelSize, long long fid, int partIdx);
+	// Mask-only 曲线回贴(将检测到的弧替换到最终候选)
+	static std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
+		const std::vector<pcl::PointXYZ>& candidate,
+		const std::vector<MaskConicArc>& arcs,
+		double pixelSize, long long fid, int partIdx);
 	// 覆盖残差点权重(双残差按 70:30 总权比); 空则用构造时的权重
 	void setResidualWeights(const std::vector<double>& w) {
 		residual_weights_override_ = w;

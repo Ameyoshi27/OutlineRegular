@@ -4972,7 +4972,14 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // 从边链出发而非VDP假设，保留真实凹凸/窄颈拓扑。
     // 合格即直接采用; 失败(链不足/方向不确定/候选不合格/Ceres 大位移/
     // 斜边/圆形轮廓)转 VDP 备用, 方向上下文随之传出。
-    if (kUseTopologyPreservingResidualRegularization) {
+    // ---- Mask-only 局部圆弧检测(所有路径共用) ----
+    // 检测在平滑环上确定区间; rawRing 可用时提供拟合支撑;
+    // 恢复在各路径的直线候选通过质量检查后执行
+    const auto maskCurves = DetectMaskConicArcs(
+        ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
+        kMaskResidualSpacing, sourceFid, partIndex);
+
+        if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
         auto topoResult = regularizer.TopologyPreservingRegularize(
             ring, kMaskResidualSpacing, topoFallback, &dirCtx, partIndex,
@@ -4984,6 +4991,9 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                       << " topology" << std::endl;
             std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
                       << " vertices=" << topoResult.size() << std::endl;
+            // 曲线恢复: 直线候选已通过质量检查, 回贴圆弧采样
+            topoResult = RestoreMaskConicArcs(
+                topoResult, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
             return topoResult;
         }
         if (topoFallback) {
@@ -5044,6 +5054,9 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << " final_vertices=" << result.size()
                   << " initial_area=" << PolygonArea2D(ring)
                   << " final_area=" << PolygonArea2D(result) << std::endl;
+        // 曲线恢复: VDP直线候选通过质量检查后回贴
+        result = RestoreMaskConicArcs(
+            result, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
         return result;
     }
     // The VDP hypothesis is diagnostic data and a source for the strict
@@ -5107,6 +5120,9 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << " strict_direction_fallback angle_deg="
                   << fallbackAngle * 180.0 / M_PI
                   << " vertices=" << strictFallback.size() << std::endl;
+        // 曲线恢复: 严格方向候选通过质量检查后回贴
+        strictFallback = RestoreMaskConicArcs(
+            strictFallback, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
         return strictFallback;
     }
 

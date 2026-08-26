@@ -2644,6 +2644,236 @@ double unwrapArcSweep(const std::vector<pcl::PointXYZ>& pts,
     return unwrapped - start_angle;
 }
 
+void RemoveClosingDuplicate(std::vector<pcl::PointXYZ>& points);
+
+// ===== Mask-only 局部圆弧/椭圆弧检测与恢复(独立通道) =====
+// 不复用 OSGB 的 detectPreservedArcs(Bezier); Mask-only 只允许 CircleArc。
+// 检测在平滑环上定区间, rawRing 提供拟合支撑(raw==smooth 时用环采样+严格条件)。
+// 恢复在直线候选通过质量检查之后执行。
+
+static void CircleDistStats(const std::vector<pcl::PointXYZ>& pts,
+    std::size_t start, std::size_t count, double cx, double cy, double radius,
+    double& rmse, double& q90)
+{
+    std::vector<double> dists;
+    dists.reserve(count);
+    double err2 = 0.0;
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto& p = pts[(start + k) % pts.size()];
+        const double d = std::abs(std::hypot(p.x - cx, p.y - cy) - radius);
+        dists.push_back(d);
+        err2 += d * d;
+    }
+    rmse = std::sqrt(err2 / count);
+    std::sort(dists.begin(), dists.end());
+    q90 = dists[static_cast<std::size_t>(count * 0.9)];
+}
+
+static double LineFitRmseOf(const std::vector<pcl::PointXYZ>& pts,
+    std::size_t start, std::size_t count)
+{
+    if (count < 2) return 0.0;
+    double mx = 0.0, my = 0.0;
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto& p = pts[(start + k) % pts.size()];
+        mx += p.x; my += p.y;
+    }
+    mx /= count; my /= count;
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto& p = pts[(start + k) % pts.size()];
+        const double dx = p.x - mx, dy = p.y - my;
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+    const double th = 0.5 * std::atan2(2 * sxy, sxx - syy);
+    const double dX = std::cos(th), dY = std::sin(th);
+    double e2 = 0.0;
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto& p = pts[(start + k) % pts.size()];
+        const double dx = p.x - mx, dy = p.y - my;
+        const double perp = -dx * dY + dy * dX;
+        e2 += perp * perp;
+    }
+    return std::sqrt(e2 / count);
+}
+
+static double CumTurnDeg(const std::vector<pcl::PointXYZ>& pts,
+    std::size_t start, std::size_t count, double& netTurnDeg)
+{
+    double sum = 0.0;
+    int pos = 0, tot = 0;
+    double prevA = 0.0;
+    for (std::size_t k = 0; k + 2 < count + 1; ++k) {
+        const auto& a = pts[(start + k) % pts.size()];
+        const auto& b = pts[(start + k + 1) % pts.size()];
+        const auto& c = pts[(start + k + 2) % pts.size()];
+        const double v1x = b.x - a.x, v1y = b.y - a.y;
+        const double v2x = c.x - b.x, v2y = c.y - b.y;
+        const double cross = v1x * v2y - v1y * v2x;
+        const double ang = std::atan2(cross, v1x * v2x + v1y * v2y);
+        if (k == 0) prevA = ang;
+        else {
+            sum += (ang - prevA) * 180.0 / M_PI;
+            prevA = ang;
+            ++tot;
+            if (cross > 0) ++pos;
+        }
+    }
+    netTurnDeg = sum;
+    return tot > 0 ? (double)pos / tot : 0.5;
+}
+
+static std::vector<pcl::PointXYZ> MapToRawSupport(
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>& rawRing,
+    std::size_t startIdx, std::size_t endIdx)
+{
+    std::vector<pcl::PointXYZ> support;
+    const std::size_t rn = rawRing.size();
+    if (rn < 10 || smoothRing.size() < 4) return support;
+    auto nearest = [&](const pcl::PointXYZ& q) {
+        std::size_t b = 0; double bd = 1e18;
+        for (std::size_t i = 0; i < rn; ++i) {
+            double d = std::hypot(rawRing[i].x - q.x, rawRing[i].y - q.y);
+            if (d < bd) { bd = d; b = i; }
+        }
+        return b;
+    };
+    const std::size_t rs = nearest(smoothRing[startIdx]);
+    const std::size_t re = nearest(smoothRing[endIdx]);
+    if (rs == re) return support;
+    double fwd = 0.0, bwd = 0.0;
+    std::size_t fc = 0, bc = 0;
+    for (std::size_t k = rs; k != re; k = (k + 1) % rn) {
+        fwd += std::hypot(rawRing[(k + 1) % rn].x - rawRing[k].x,
+                          rawRing[(k + 1) % rn].y - rawRing[k].y);
+        ++fc; if (fc > rn) return support;
+    }
+    for (std::size_t k = rs; k != re; k = (k + rn - 1) % rn) {
+        bwd += std::hypot(rawRing[k].x - rawRing[(k + rn - 1) % rn].x,
+                          rawRing[k].y - rawRing[(k + rn - 1) % rn].y);
+        ++bc; if (bc > rn) return support;
+    }
+    if (fwd <= bwd && fc >= 3) {
+        for (std::size_t k = 0; k <= fc; ++k)
+            support.push_back(rawRing[(rs + k) % rn]);
+    } else if (bc >= 3) {
+        for (std::size_t k = 0; k <= bc; ++k)
+            support.push_back(rawRing[(rs + rn - k) % rn]);
+    }
+    return support;
+}
+
+static std::vector<pcl::PointXYZ> SampleRingInt(
+    const std::vector<pcl::PointXYZ>& ring,
+    std::size_t startIdx, std::size_t endIdx, int minPts, double maxStep)
+{
+    const std::size_t n = ring.size();
+    std::size_t count = (startIdx <= endIdx)
+        ? (endIdx - startIdx + 1) : (n - startIdx + endIdx + 1);
+    if (count < 2 || count >= n) return {};
+    double total = 0.0;
+    for (std::size_t k = 0; k < count - 1; ++k) {
+        const auto& a = ring[(startIdx + k) % n];
+        const auto& b = ring[(startIdx + k + 1) % n];
+        total += std::hypot(b.x - a.x, b.y - a.y);
+    }
+    const int steps = std::max(minPts, (int)std::ceil(total / maxStep));
+    std::vector<pcl::PointXYZ> out;
+    out.reserve(steps);
+    for (int k = 0; k < steps; ++k) {
+        const double t = (double)k / (steps - 1) * (count - 1);
+        const std::size_t seg = (std::size_t)t;
+        const double f = t - seg;
+        const auto& a = ring[(startIdx + seg) % n];
+        const auto& b = ring[(startIdx + seg + 1) % n];
+        pcl::PointXYZ p;
+        p.x = (float)(a.x + f * (b.x - a.x));
+        p.y = (float)(a.y + f * (b.y - a.y));
+        p.z = a.z;
+        out.push_back(p);
+    }
+    return out;
+}
+
+static bool EvalCircle(const std::vector<pcl::PointXYZ>& support, double pixelSize,
+    MaskConicArc& out)
+{
+    const int n = (int)support.size();
+    if (n < 10) return false;
+    double mx = 0.0, my = 0.0;
+    for (const auto& p : support) { mx += p.x; my += p.y; }
+    mx /= n; my /= n;
+    std::vector<pcl::PointXYZ> c(n);
+    for (int i = 0; i < n; ++i) {
+        c[i].x = (float)(support[i].x - mx);
+        c[i].y = (float)(support[i].y - my);
+        c[i].z = support[i].z;
+    }
+    double cx = 0.0, cy = 0.0, r = 0.0, rmse = 0.0;
+    if (!fitCircle2D(c, 0, n, cx, cy, r, rmse)) return false;
+    double q90 = 0.0;
+    CircleDistStats(c, 0, n, cx, cy, r, rmse, q90);
+    const double lineRmse = LineFitRmseOf(c, 0, n);
+    double netTurn = 0.0;
+    std::vector<pcl::PointXYZ> ft = c;
+    ft.push_back(c[0]); ft.push_back(c[1]);
+    const double cons = CumTurnDeg(ft, 0, n, netTurn);
+    const double chord = std::hypot(c[n - 1].x - c[0].x, c[n - 1].y - c[0].y);
+    double arcLen = 0.0;
+    for (int i = 0; i < n - 1; ++i)
+        arcLen += std::hypot(c[i + 1].x - c[i].x, c[i + 1].y - c[i].y);
+    double sag = 0.0;
+    {
+        const double dx = c[n - 1].x - c[0].x, dy = c[n - 1].y - c[0].y;
+        const double ls = dx * dx + dy * dy;
+        if (ls > 1e-12) {
+            for (int i = 0; i < n; ++i) {
+                double t = ((c[i].x - c[0].x) * dx + (c[i].y - c[0].y) * dy) / ls;
+                t = std::clamp(t, 0.0, 1.0);
+                sag = std::max(sag, std::hypot(
+                    c[i].x - c[0].x - t * dx, c[i].y - c[0].y - t * dy));
+            }
+        }
+    }
+    const double fitTol = std::max(0.5 * pixelSize, 0.15);
+    if (lineRmse < fitTol * 1.5 && lineRmse < rmse * 2.0) return false;
+    if (sag < std::max(2.0 * pixelSize, 0.3)) return false;
+    if (std::abs(netTurn) < 15.0) return false;
+    if (cons < 0.7) return false;
+    if (rmse > std::max(1.5 * pixelSize, 0.45)) return false;
+    if (q90 > std::max(3.0 * pixelSize, 0.9)) return false;
+    if (std::hypot(cx, cy) > chord * 5.0 + 50.0) return false;
+    if (std::abs(netTurn) > 270.0) return false;
+    double sa = 0.0;
+    const double sweep = unwrapArcSweep(c, 0, n, cx, cy, sa);
+    {
+        int rev = 0; double prev = sa;
+        for (int i = 1; i < n; ++i) {
+            double a = std::atan2(c[i].y - cy, c[i].x - cx);
+            double d = a - prev;
+            while (d > M_PI) d -= 2 * M_PI;
+            while (d < -M_PI) d += 2 * M_PI;
+            if (std::abs(d) > 0.1 && d * sweep < 0) ++rev;
+            prev = a;
+        }
+        if (rev > n / 5) return false;
+    }
+    const double improve = std::max(0.0, 1.0 - rmse / std::max(lineRmse, 0.01));
+    const double fq = std::exp(-(rmse / fitTol) * (rmse / fitTol));
+    out.type = MaskCurveType::CircleArc;
+    out.cx = cx + mx; out.cy = cy + my; out.radius = r;
+    out.startAngle = sa; out.sweepAngle = sweep;
+    out.rmse = rmse; out.q90 = q90; out.lineRmse = lineRmse;
+    out.arcLength = arcLen; out.chordLength = chord; out.sagitta = sag;
+    out.sweepDeg = std::abs(sweep) * 180.0 / M_PI;
+    out.supportCount = n;
+    out.score = improve * fq * cons * std::min(1.0, arcLen / 5.0);
+    return true;
+}
+
+
+
 double polylineLength(const std::vector<pcl::PointXYZ>& pts, size_t start, size_t count)
 {
     if (pts.empty() || count < 2) return 0.0;
@@ -4645,6 +4875,8 @@ SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
 // Close the outer file-local helper namespace.  The direction diagnostic
 // helpers above use a nested anonymous namespace, while the class member
 // implementations below must remain in the outlineRegular namespace.
+
+
 }
 
 bool outlineRegular::BuildStrictDirectionalFallback(
@@ -10896,4 +11128,196 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
               << " chains=" << topoChains.size()
               << " mode=" << (isMultiDirection ? "multi" : "single") << std::endl;
     return ceresResult;
+}
+// ===== Mask-only 圆弧检测/恢复的公共实现(全局作用域) =====
+std::vector<MaskConicArc> DetectMaskConicArcs(
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>& rawRing,
+    double pixelSize, long long fid, int partIdx)
+{
+    std::vector<MaskConicArc> candidates;
+    const std::size_t n = smoothRing.size();
+    if (n < 12) return candidates;
+    struct Cand { std::size_t s, e; bool w; MaskConicArc a; };
+    std::vector<Cand> all;
+    const std::size_t minC = 5, maxC = n * 2 / 3;
+    for (std::size_t start = 0; start < n; ++start) {
+        for (std::size_t cnt = minC; cnt <= maxC; ++cnt) {
+            if (cnt >= n) break;
+            const std::size_t end = (start + cnt - 1) % n;
+            const bool w = (start + cnt - 1) >= n;
+            std::vector<pcl::PointXYZ> sup;
+            if (!rawRing.empty() && rawRing.size() > n) {
+                sup = MapToRawSupport(smoothRing, rawRing, start, end);
+            }
+            if ((int)sup.size() < 10) {
+                sup = SampleRingInt(smoothRing, start, end, 12,
+                    std::max(pixelSize, 0.3));
+            }
+            MaskConicArc a;
+            if (EvalCircle(sup, pixelSize, a)) {
+                a.startIdx = start; a.endIdx = end; a.wrapsZero = w;
+                a.startPoint = smoothRing[start];
+                a.endPoint = smoothRing[end];
+                all.push_back({start, end, w, a});
+            }
+        }
+    }
+    {
+        std::sort(all.begin(), all.end(), [](const Cand& a, const Cand& b) {
+            if (a.s != b.s) return a.s < b.s;
+            return a.a.score > b.a.score;
+        });
+        std::size_t w = 0;
+        for (std::size_t i = 0; i < all.size(); ++i)
+            if (i == 0 || all[i].s != all[w].s) all[w++] = all[i];
+        all.resize(w);
+    }
+    {
+        std::sort(all.begin(), all.end(),
+            [](const Cand& a, const Cand& b) { return a.a.score > b.a.score; });
+        std::vector<bool> used(n, false);
+        for (const auto& c : all) {
+            bool ov = false;
+            const std::size_t cnt = c.w ? (n - c.s + c.e + 1) : (c.e - c.s + 1);
+            for (std::size_t k = 0; k < cnt; ++k)
+                if (used[(c.s + k) % n]) { ov = true; break; }
+            if (ov) continue;
+            for (std::size_t k = 0; k < cnt; ++k) used[(c.s + k) % n] = true;
+            candidates.push_back(c.a);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const MaskConicArc& a, const MaskConicArc& b) {
+            return a.startIdx < b.startIdx;
+        });
+    std::cerr << "[MaskCurveDetect] fid=" << fid << " part=" << partIdx
+              << " raw_candidates=" << all.size()
+              << " accepted=" << candidates.size() << std::endl;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const auto& a = candidates[i];
+        std::cerr << "[MaskCurve] fid=" << fid << " part=" << partIdx
+                  << " index=" << i
+                  << " type=circle start=" << a.startIdx
+                  << " end=" << a.endIdx
+                  << " wrap=" << (a.wrapsZero ? 1 : 0)
+                  << " support=" << a.supportCount
+                  << " length=" << a.arcLength
+                  << " sweep_deg=" << a.sweepDeg
+                  << " rmse=" << a.rmse
+                  << " line_rmse=" << a.lineRmse
+                  << " score=" << a.score << std::endl;
+    }
+    return candidates;
+}
+std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
+    const std::vector<pcl::PointXYZ>& candidate,
+    const std::vector<MaskConicArc>& arcs,
+    double pixelSize, long long fid, int partIdx)
+{
+    if (arcs.empty() || candidate.size() < 4) return candidate;
+    std::vector<pcl::PointXYZ> result = candidate;
+    for (std::size_t ai = 0; ai < arcs.size(); ++ai) {
+        const auto& arc = arcs[ai];
+        auto proj = [&](const pcl::PointXYZ& pt) {
+            double bd = 1e18; std::size_t be = 0; double bt = 0.0;
+            for (std::size_t e = 0; e < result.size(); ++e) {
+                const auto& a = result[e];
+                const auto& b = result[(e + 1) % result.size()];
+                const double dx = b.x - a.x, dy = b.y - a.y;
+                const double ls = dx * dx + dy * dy;
+                if (ls < 1e-12) continue;
+                double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
+                t = std::clamp(t, 0.0, 1.0);
+                const double d = std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+                if (d < bd) { bd = d; be = e; bt = t; }
+            }
+            return std::make_tuple(be, bt, bd);
+        };
+        auto [sE, sT, sD] = proj(arc.startPoint);
+        auto [eE, eT, eD] = proj(arc.endPoint);
+        const double lim = std::max(3.0 * pixelSize, 1.5);
+        if (sD > lim || eD > lim) {
+            std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                      << " index=" << ai << " restored=0 reason=endpoint_dist"
+                      << " s=" << sD << " e=" << eD << std::endl;
+            continue;
+        }
+        const std::size_t rn = result.size();
+        double fwdL = 0.0, bwdL = 0.0;
+        std::size_t fwdE = 0, bwdE = 0;
+        { std::size_t e = sE;
+          while (e != eE) {
+              const auto& a = result[e]; const auto& b = result[(e + 1) % rn];
+              fwdL += std::hypot(b.x - a.x, b.y - a.y);
+              e = (e + 1) % rn; ++fwdE; if (fwdE > rn) break; } }
+        { std::size_t e = sE;
+          while (e != eE) {
+              const auto& a = result[(e + rn - 1) % rn]; const auto& b = result[e];
+              bwdL += std::hypot(b.x - a.x, b.y - a.y);
+              e = (e + rn - 1) % rn; ++bwdE; if (bwdE > rn) break; } }
+        const bool fwd = std::abs(fwdL - arc.arcLength) <= std::abs(bwdL - arc.arcLength);
+        pcl::PointXYZ pS; { const auto& a = result[sE]; const auto& b = result[(sE + 1) % rn];
+          pS.x = (float)(a.x + sT * (b.x - a.x)); pS.y = (float)(a.y + sT * (b.y - a.y));
+          pS.z = arc.startPoint.z; }
+        pcl::PointXYZ pE; { const auto& a = result[eE]; const auto& b = result[(eE + 1) % rn];
+          pE.x = (float)(a.x + eT * (b.x - a.x)); pE.y = (float)(a.y + eT * (b.y - a.y));
+          pE.z = arc.endPoint.z; }
+        const double srcLen = arc.chordLength;
+        const double dstLen = std::hypot(pE.x - pS.x, pE.y - pS.y);
+        if (srcLen < 1e-6 || dstLen < 1e-6) continue;
+        const double scale = dstLen / srcLen;
+        if (scale < 0.85 || scale > 1.20) continue;
+        const double sa = std::atan2(arc.endPoint.y - arc.startPoint.y,
+                                      arc.endPoint.x - arc.startPoint.x);
+        const double da = std::atan2(pE.y - pS.y, pE.x - pS.x);
+        const double rot = da - sa;
+        const double cR = std::cos(rot), sR = std::sin(rot);
+        auto xf = [&](const pcl::PointXYZ& p) {
+            const double dx = p.x - arc.startPoint.x;
+            const double dy = p.y - arc.startPoint.y;
+            pcl::PointXYZ q;
+            q.x = (float)(pS.x + scale * (dx * cR - dy * sR));
+            q.y = (float)(pS.y + scale * (dx * sR + dy * cR));
+            q.z = p.z; return q; };
+        const double step = std::clamp(pixelSize, 0.3, 0.8);
+        const double aLen = std::abs(arc.sweepAngle) * arc.radius;
+        const int steps = std::max(8, (int)std::ceil(aLen / step));
+        std::vector<pcl::PointXYZ> cs; cs.reserve(steps);
+        for (int k = 0; k < steps; ++k) {
+            const double t = (double)k / (steps - 1);
+            const double ang = arc.startAngle + t * arc.sweepAngle;
+            pcl::PointXYZ p;
+            p.x = (float)(arc.cx + arc.radius * std::cos(ang));
+            p.y = (float)(arc.cy + arc.radius * std::sin(ang));
+            p.z = arc.startPoint.z; cs.push_back(xf(p)); }
+        std::vector<bool> inSpan(rn, false);
+        if (fwd) { std::size_t e = (sE + 1) % rn;
+            for (std::size_t g = 0; g < rn && e != (eE + 1) % rn; e = (e + 1) % rn, ++g)
+                inSpan[e] = true; }
+        else { std::size_t e = eE;
+            for (std::size_t g = 0; g < rn && e != sE; e = (e + 1) % rn, ++g)
+                inSpan[e] = true; }
+        std::vector<pcl::PointXYZ> nr;
+        if (fwd) { for (std::size_t k = 0; k < rn; ++k) {
+                const std::size_t idx = (eE + 1 + k) % rn;
+                if (!inSpan[idx]) nr.push_back(result[idx]); } }
+        else { for (std::size_t k = 0; k < rn; ++k) {
+                const std::size_t idx = (sE + 1 + k) % rn;
+                if (!inSpan[idx]) nr.push_back(result[idx]); } }
+        for (const auto& p : cs) nr.push_back(p);
+        if (nr.size() > 1) { const auto& f = nr.front(); const auto& l = nr.back();
+            if (std::hypot(f.x - l.x, f.y - l.y) < 0.01) nr.pop_back(); }
+        if (nr.size() < 4) continue;
+        if (!isSimplePolygon2D(nr)) continue;
+        const double oldA = std::abs(polygonArea2D(result));
+        const double newA = std::abs(polygonArea2D(nr));
+        const double ar = newA / std::max(oldA, 1e-6);
+        if (ar < 0.90 || ar > 1.10) continue;
+        result = nr;
+        std::cerr << "[MaskCurveRestore] fid=" << fid << " part=" << partIdx
+                  << " index=" << ai << " restored=1 scale=" << scale
+                  << " samples=" << cs.size() << std::endl;
+    }
+    return result;
 }
