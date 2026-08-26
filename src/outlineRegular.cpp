@@ -2697,179 +2697,253 @@ static double LineFitRmseOf(const std::vector<pcl::PointXYZ>& pts,
     return std::sqrt(e2 / count);
 }
 
-static double CumTurnDeg(const std::vector<pcl::PointXYZ>& pts,
-    std::size_t start, std::size_t count, double& netTurnDeg)
+// v2: 开放曲线转角(仅内部顶点,无闭合)
+struct OpenTurnStats {
+    double signedTurnDeg = 0.0;
+    double absoluteTurnDeg = 0.0;
+    double consistency = 0.0;
+    int reversalCount = 0;
+    int totalTurns = 0;
+};
+static OpenTurnStats OpenCurveTurnStats(const std::vector<pcl::PointXYZ>& pts)
 {
-    double sum = 0.0;
-    int pos = 0, tot = 0;
-    double prevA = 0.0;
-    for (std::size_t k = 0; k + 2 < count + 1; ++k) {
-        const auto& a = pts[(start + k) % pts.size()];
-        const auto& b = pts[(start + k + 1) % pts.size()];
-        const auto& c = pts[(start + k + 2) % pts.size()];
-        const double v1x = b.x - a.x, v1y = b.y - a.y;
-        const double v2x = c.x - b.x, v2y = c.y - b.y;
+    OpenTurnStats s;
+    const int n = (int)pts.size();
+    if (n < 3) return s;
+    double prevCross = 0.0;
+    for (int i = 1; i < n - 1; ++i) {
+        const double v1x = pts[i].x - pts[i-1].x;
+        const double v1y = pts[i].y - pts[i-1].y;
+        const double v2x = pts[i+1].x - pts[i].x;
+        const double v2y = pts[i+1].y - pts[i].y;
         const double cross = v1x * v2y - v1y * v2x;
         const double ang = std::atan2(cross, v1x * v2x + v1y * v2y);
-        if (k == 0) prevA = ang;
-        else {
-            sum += (ang - prevA) * 180.0 / M_PI;
-            prevA = ang;
-            ++tot;
-            if (cross > 0) ++pos;
-        }
+        s.signedTurnDeg += ang * 180.0 / M_PI;
+        s.absoluteTurnDeg += std::abs(ang) * 180.0 / M_PI;
+        ++s.totalTurns;
+        if (i > 1 && cross * prevCross < 0) ++s.reversalCount;
+        prevCross = cross;
     }
-    netTurnDeg = sum;
-    return tot > 0 ? (double)pos / tot : 0.5;
+    s.consistency = s.absoluteTurnDeg > 1e-9
+        ? std::abs(s.signedTurnDeg) / s.absoluteTurnDeg : 0.0;
+    return s;
 }
 
-static std::vector<pcl::PointXYZ> MapToRawSupport(
+// v2: smooth→raw全局单调映射
+struct SmoothRawMap {
+    std::vector<std::size_t> rawUnwrapped;
+    std::size_t rawStart = 0;
+    bool rawReversed = false;
+    bool valid = false;
+    std::vector<double> rawCumArc;
+    double totalRawArc = 0.0;
+    std::size_t rawN = 0;
+};
+
+static SmoothRawMap BuildSmoothRawMap(
     const std::vector<pcl::PointXYZ>& smoothRing,
-    const std::vector<pcl::PointXYZ>& rawRing,
-    std::size_t startIdx, std::size_t endIdx)
+    const std::vector<pcl::PointXYZ>& rawRing)
 {
-    std::vector<pcl::PointXYZ> support;
+    SmoothRawMap m;
+    const std::size_t sn = smoothRing.size();
     const std::size_t rn = rawRing.size();
-    if (rn < 10 || smoothRing.size() < 4) return support;
-    auto nearest = [&](const pcl::PointXYZ& q) {
-        std::size_t b = 0; double bd = 1e18;
-        for (std::size_t i = 0; i < rn; ++i) {
-            double d = std::hypot(rawRing[i].x - q.x, rawRing[i].y - q.y);
-            if (d < bd) { bd = d; b = i; }
+    if (sn < 4 || rn < 4) return m;
+    m.rawN = rn;
+    auto ringArea = [](const std::vector<pcl::PointXYZ>& r) {
+        double a = 0;
+        for (std::size_t i = 0; i < r.size(); ++i) {
+            const std::size_t j = (i + 1) % r.size();
+            a += r[i].x * r[j].y - r[j].x * r[i].y;
         }
-        return b;
+        return a;
     };
-    const std::size_t rs = nearest(smoothRing[startIdx]);
-    const std::size_t re = nearest(smoothRing[endIdx]);
-    if (rs == re) return support;
-    double fwd = 0.0, bwd = 0.0;
-    std::size_t fc = 0, bc = 0;
-    for (std::size_t k = rs; k != re; k = (k + 1) % rn) {
-        fwd += std::hypot(rawRing[(k + 1) % rn].x - rawRing[k].x,
-                          rawRing[(k + 1) % rn].y - rawRing[k].y);
-        ++fc; if (fc > rn) return support;
+    m.rawReversed = ((ringArea(smoothRing) > 0) != (ringArea(rawRing) > 0));
+    auto nearestRaw = [&](const pcl::PointXYZ& q) {
+        std::size_t best = 0; double bd = 1e18;
+        for (std::size_t i = 0; i < rn; ++i) {
+            const double d = std::hypot(rawRing[i].x - q.x, rawRing[i].y - q.y);
+            if (d < bd) { bd = d; best = i; }
+        }
+        return best;
+    };
+    m.rawStart = nearestRaw(smoothRing[0]);
+    m.rawCumArc.resize(rn);
+    m.rawCumArc[0] = 0.0;
+    double cum = 0.0;
+    for (std::size_t k = 0; k < rn; ++k) {
+        const std::size_t cur = m.rawReversed ? (m.rawStart + rn - k) % rn : (m.rawStart + k) % rn;
+        const std::size_t nxt = m.rawReversed ? (m.rawStart + rn - k - 1) % rn : (m.rawStart + k + 1) % rn;
+        cum += std::hypot(rawRing[nxt].x - rawRing[cur].x, rawRing[nxt].y - rawRing[cur].y);
+        if (k + 1 < rn) m.rawCumArc[k + 1] = cum;
     }
-    for (std::size_t k = rs; k != re; k = (k + rn - 1) % rn) {
-        bwd += std::hypot(rawRing[k].x - rawRing[(k + rn - 1) % rn].x,
-                          rawRing[k].y - rawRing[(k + rn - 1) % rn].y);
-        ++bc; if (bc > rn) return support;
+    m.totalRawArc = cum;
+    m.rawUnwrapped.resize(sn);
+    std::size_t rawPtr = 0;
+    for (std::size_t si = 0; si < sn; ++si) {
+        std::size_t bestOff = 0;
+        double bestD = 1e18;
+        for (std::size_t off = 0; off < rn; ++off) {
+            const std::size_t ri = (rawPtr + off) % rn;
+            const double d = std::hypot(rawRing[ri].x - smoothRing[si].x,
+                                        rawRing[ri].y - smoothRing[si].y);
+            if (d < bestD) { bestD = d; bestOff = off; }
+            if (off > 10 && d > bestD * 3) break;
+        }
+        rawPtr = (rawPtr + bestOff) % rn;
+        m.rawUnwrapped[si] = rawPtr;
     }
-    if (fwd <= bwd && fc >= 3) {
-        for (std::size_t k = 0; k <= fc; ++k)
-            support.push_back(rawRing[(rs + k) % rn]);
-    } else if (bc >= 3) {
-        for (std::size_t k = 0; k <= bc; ++k)
-            support.push_back(rawRing[(rs + rn - k) % rn]);
-    }
-    return support;
+    m.valid = true;
+    return m;
 }
 
-static std::vector<pcl::PointXYZ> SampleRingInt(
-    const std::vector<pcl::PointXYZ>& ring,
-    std::size_t startIdx, std::size_t endIdx, int minPts, double maxStep)
+struct RawInterval {
+    std::size_t rawStartIdx = 0;
+    std::size_t rawEndIdx = 0;
+    int pointCount = 0;
+    double arcLength = 0.0;
+    bool valid = false;
+};
+
+static RawInterval ExtractRawInterval(
+    const SmoothRawMap& map,
+    std::size_t smoothStart, std::size_t smoothEnd)
 {
-    const std::size_t n = ring.size();
-    std::size_t count = (startIdx <= endIdx)
-        ? (endIdx - startIdx + 1) : (n - startIdx + endIdx + 1);
-    if (count < 2 || count >= n) return {};
-    double total = 0.0;
-    for (std::size_t k = 0; k < count - 1; ++k) {
-        const auto& a = ring[(startIdx + k) % n];
-        const auto& b = ring[(startIdx + k + 1) % n];
-        total += std::hypot(b.x - a.x, b.y - a.y);
+    RawInterval ri;
+    if (!map.valid || map.rawUnwrapped.empty()) return ri;
+    const std::size_t rn = map.rawN;
+    const std::size_t uS = map.rawUnwrapped[smoothStart];
+    const std::size_t uE = map.rawUnwrapped[smoothEnd];
+    std::size_t span = (uE >= uS) ? (uE - uS) : (rn - uS + uE);
+    if (span >= rn) return ri;
+    ri.rawStartIdx = uS;
+    ri.rawEndIdx = uE;
+    ri.pointCount = (int)span + 1;
+    if (uE < uS) {
+        ri.arcLength = map.totalRawArc - map.rawCumArc[uS] + map.rawCumArc[uE];
+    } else {
+        ri.arcLength = map.rawCumArc[uE] - map.rawCumArc[uS];
     }
-    const int steps = std::max(minPts, (int)std::ceil(total / maxStep));
+    ri.valid = ri.pointCount >= 2;
+    return ri;
+}
+
+static std::vector<pcl::PointXYZ> CollectRawPoints(
+    const std::vector<pcl::PointXYZ>& rawRing,
+    const RawInterval& ri)
+{
+    std::vector<pcl::PointXYZ> pts;
+    if (!ri.valid) return pts;
+    const std::size_t rn = rawRing.size();
+    pts.reserve((std::size_t)ri.pointCount);
+    for (std::size_t k = 0; k < (std::size_t)ri.pointCount; ++k) {
+        pts.push_back(rawRing[(ri.rawStartIdx + k) % rn]);
+    }
+    return pts;
+}
+
+static std::vector<pcl::PointXYZ> WeightedSample(
+    const std::vector<pcl::PointXYZ>& pts, int targetCount)
+{
+    const int n = (int)pts.size();
+    if (n < 2 || targetCount < 2 || n >= targetCount) return pts;
+    std::vector<double> cum(n, 0.0);
+    for (int i = 1; i < n; ++i)
+        cum[i] = cum[i-1] + std::hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y);
+    const double total = cum[n-1];
+    if (total < 1e-9) return pts;
     std::vector<pcl::PointXYZ> out;
-    out.reserve(steps);
-    for (int k = 0; k < steps; ++k) {
-        const double t = (double)k / (steps - 1) * (count - 1);
-        const std::size_t seg = (std::size_t)t;
-        const double f = t - seg;
-        const auto& a = ring[(startIdx + seg) % n];
-        const auto& b = ring[(startIdx + seg + 1) % n];
+    out.reserve(targetCount);
+    for (int k = 0; k < targetCount; ++k) {
+        const double target = (double)k / (targetCount - 1) * total;
+        int lo = 0, hi = n - 1;
+        while (lo < hi - 1) {
+            const int mid = (lo + hi) / 2;
+            if (cum[mid] <= target) lo = mid; else hi = mid;
+        }
+        const double t = (target - cum[lo]) / std::max(cum[hi] - cum[lo], 1e-12);
         pcl::PointXYZ p;
-        p.x = (float)(a.x + f * (b.x - a.x));
-        p.y = (float)(a.y + f * (b.y - a.y));
-        p.z = a.z;
+        p.x = (float)(pts[lo].x + t * (pts[hi].x - pts[lo].x));
+        p.y = (float)(pts[lo].y + t * (pts[hi].y - pts[lo].y));
+        p.z = pts[lo].z;
         out.push_back(p);
     }
     return out;
 }
 
-static bool EvalCircle(const std::vector<pcl::PointXYZ>& support, double pixelSize,
+// v2: 圆弧评估(转角用smoothPts, 拟合用fitPts)
+static std::string EvalCircleV2(
+    const std::vector<pcl::PointXYZ>& fitPts,
+    const std::vector<pcl::PointXYZ>& smoothPts,
+    int sourceVertexCount,
+    double pixelSize,
     MaskConicArc& out)
 {
-    const int n = (int)support.size();
-    if (n < 10) return false;
-    double mx = 0.0, my = 0.0;
-    for (const auto& p : support) { mx += p.x; my += p.y; }
+    const int n = (int)fitPts.size();
+    if (n < 5) return "too_few_points";
+    double mx = 0, my = 0;
+    for (const auto& p : fitPts) { mx += p.x; my += p.y; }
     mx /= n; my /= n;
     std::vector<pcl::PointXYZ> c(n);
     for (int i = 0; i < n; ++i) {
-        c[i].x = (float)(support[i].x - mx);
-        c[i].y = (float)(support[i].y - my);
-        c[i].z = support[i].z;
+        c[i].x = (float)(fitPts[i].x - mx);
+        c[i].y = (float)(fitPts[i].y - my);
+        c[i].z = fitPts[i].z;
     }
-    double cx = 0.0, cy = 0.0, r = 0.0, rmse = 0.0;
-    if (!fitCircle2D(c, 0, n, cx, cy, r, rmse)) return false;
-    double q90 = 0.0;
+    double cx = 0, cy = 0, r = 0, rmse = 0;
+    if (!fitCircle2D(c, 0, n, cx, cy, r, rmse)) return "circle_fit_failed";
+    double q90 = 0;
     CircleDistStats(c, 0, n, cx, cy, r, rmse, q90);
     const double lineRmse = LineFitRmseOf(c, 0, n);
-    double netTurn = 0.0;
-    std::vector<pcl::PointXYZ> ft = c;
-    ft.push_back(c[0]); ft.push_back(c[1]);
-    const double cons = CumTurnDeg(ft, 0, n, netTurn);
-    const double chord = std::hypot(c[n - 1].x - c[0].x, c[n - 1].y - c[0].y);
-    double arcLen = 0.0;
+    const double chord = std::hypot(c[n-1].x - c[0].x, c[n-1].y - c[0].y);
+    double arcLen = 0;
     for (int i = 0; i < n - 1; ++i)
-        arcLen += std::hypot(c[i + 1].x - c[i].x, c[i + 1].y - c[i].y);
-    double sag = 0.0;
-    {
-        const double dx = c[n - 1].x - c[0].x, dy = c[n - 1].y - c[0].y;
-        const double ls = dx * dx + dy * dy;
-        if (ls > 1e-12) {
-            for (int i = 0; i < n; ++i) {
-                double t = ((c[i].x - c[0].x) * dx + (c[i].y - c[0].y) * dy) / ls;
-                t = std::clamp(t, 0.0, 1.0);
-                sag = std::max(sag, std::hypot(
-                    c[i].x - c[0].x - t * dx, c[i].y - c[0].y - t * dy));
-            }
+        arcLen += std::hypot(c[i+1].x - c[i].x, c[i+1].y - c[i].y);
+    // 转角: 用smoothPts(去中心化+采样)
+    OpenTurnStats ts;
+    if (smoothPts.size() >= 3) {
+        double smx = 0, smy = 0;
+        for (const auto& p : smoothPts) { smx += p.x; smy += p.y; }
+        smx /= smoothPts.size(); smy /= smoothPts.size();
+        std::vector<pcl::PointXYZ> sc(smoothPts.size());
+        for (std::size_t i = 0; i < smoothPts.size(); ++i) {
+            sc[i].x = (float)(smoothPts[i].x - smx);
+            sc[i].y = (float)(smoothPts[i].y - smy);
+            sc[i].z = smoothPts[i].z;
         }
+        auto sampled = WeightedSample(sc, std::max(12, (int)sc.size()));
+        ts = OpenCurveTurnStats(sampled);
+    } else {
+        ts = OpenCurveTurnStats(c);
     }
-    const double fitTol = std::max(0.5 * pixelSize, 0.15);
-    if (lineRmse < fitTol * 1.5 && lineRmse < rmse * 2.0) return false;
-    if (sag < std::max(2.0 * pixelSize, 0.3)) return false;
-    if (std::abs(netTurn) < 15.0) return false;
-    if (cons < 0.7) return false;
-    if (rmse > std::max(1.5 * pixelSize, 0.45)) return false;
-    if (q90 > std::max(3.0 * pixelSize, 0.9)) return false;
-    if (std::hypot(cx, cy) > chord * 5.0 + 50.0) return false;
-    if (std::abs(netTurn) > 270.0) return false;
-    double sa = 0.0;
+    double sa = 0;
     const double sweep = unwrapArcSweep(c, 0, n, cx, cy, sa);
-    {
-        int rev = 0; double prev = sa;
-        for (int i = 1; i < n; ++i) {
-            double a = std::atan2(c[i].y - cy, c[i].x - cx);
-            double d = a - prev;
-            while (d > M_PI) d -= 2 * M_PI;
-            while (d < -M_PI) d += 2 * M_PI;
-            if (std::abs(d) > 0.1 && d * sweep < 0) ++rev;
-            prev = a;
-        }
-        if (rev > n / 5) return false;
-    }
+    const double sweepDeg = std::abs(sweep) * 180.0 / M_PI;
+
+    // 门限
+    if (arcLen < 10.0) return "too_short";
+    if (chord < 6.0) return "chord_too_short";
+    if (ts.absoluteTurnDeg < 20.0) return "turn_too_small";
+    if (ts.consistency < 0.80) return "turn_inconsistent";
+    if (ts.totalTurns > 0 && (double)ts.reversalCount / ts.totalTurns > 0.10)
+        return "reversal_too_many";
+    if (rmse > std::max(2.0 * pixelSize, 0.60)) return "circle_rmse";
+    if (q90 > std::max(3.0 * pixelSize, 1.00)) return "circle_q90";
+    if (lineRmse / std::max(rmse, 0.01) < 2.0) return "line_explains_better";
+    if (sweepDeg < 20.0 || sweepDeg > 240.0) return "sweep_out_of_range";
+
     const double improve = std::max(0.0, 1.0 - rmse / std::max(lineRmse, 0.01));
-    const double fq = std::exp(-(rmse / fitTol) * (rmse / fitTol));
+    const double fitTol = std::max(0.5 * pixelSize, 0.1);
+    const double fitQ = std::exp(-(rmse / fitTol) * (rmse / fitTol));
     out.type = MaskCurveType::CircleArc;
     out.cx = cx + mx; out.cy = cy + my; out.radius = r;
     out.startAngle = sa; out.sweepAngle = sweep;
     out.rmse = rmse; out.q90 = q90; out.lineRmse = lineRmse;
-    out.arcLength = arcLen; out.chordLength = chord; out.sagitta = sag;
-    out.sweepDeg = std::abs(sweep) * 180.0 / M_PI;
-    out.supportCount = n;
-    out.score = improve * fq * cons * std::min(1.0, arcLen / 5.0);
-    return true;
+    out.arcLength = arcLen; out.chordLength = chord;
+    out.sweepDeg = sweepDeg;
+    out.supportCount = sourceVertexCount;
+    out.score = improve * fitQ * ts.consistency * std::min(1.0, arcLen / 15.0);
+    if (out.score <= 0.0) return "zero_score";
+    return "";
 }
 
 
@@ -11138,40 +11212,76 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
     std::vector<MaskConicArc> candidates;
     const std::size_t n = smoothRing.size();
     if (n < 12) return candidates;
+    const SmoothRawMap rawMap = BuildSmoothRawMap(smoothRing, rawRing);
+    std::string bestReject = "none";
+    double bestRejectScore = -1;
+
     struct Cand { std::size_t s, e; bool w; MaskConicArc a; };
     std::vector<Cand> all;
-    const std::size_t minC = 5, maxC = n * 2 / 3;
+    const std::size_t minC = 5, maxC = n * 3 / 4;
+
+    std::vector<double> cumArc(n, 0.0);
+    for (std::size_t i = 1; i < n; ++i)
+        cumArc[i] = cumArc[i-1] + std::hypot(
+            smoothRing[i].x - smoothRing[i-1].x,
+            smoothRing[i].y - smoothRing[i-1].y);
+    const double totalArc = cumArc[n-1] + std::hypot(
+        smoothRing[0].x - smoothRing[n-1].x,
+        smoothRing[0].y - smoothRing[n-1].y);
+
     for (std::size_t start = 0; start < n; ++start) {
         for (std::size_t cnt = minC; cnt <= maxC; ++cnt) {
             if (cnt >= n) break;
             const std::size_t end = (start + cnt - 1) % n;
             const bool w = (start + cnt - 1) >= n;
-            std::vector<pcl::PointXYZ> sup;
-            if (!rawRing.empty() && rawRing.size() > n) {
-                sup = MapToRawSupport(smoothRing, rawRing, start, end);
+            double iArc = w ? (totalArc - cumArc[start] + cumArc[end])
+                            : (cumArc[end] - cumArc[start]);
+            if (iArc < 10.0) continue;
+
+            std::vector<pcl::PointXYZ> fitPts;
+            int sourceN = 0;
+            if (rawMap.valid) {
+                RawInterval ri = ExtractRawInterval(rawMap, start, end);
+                if (ri.valid && ri.pointCount >= 3) {
+                    fitPts = CollectRawPoints(rawRing, ri);
+                    sourceN = ri.pointCount;
+                }
             }
-            if ((int)sup.size() < 10) {
-                sup = SampleRingInt(smoothRing, start, end, 12,
-                    std::max(pixelSize, 0.3));
+            if (fitPts.empty()) {
+                const std::size_t c2 = w ? (n - start + end + 1) : (end - start + 1);
+                fitPts.reserve(c2);
+                for (std::size_t k = 0; k < c2; ++k)
+                    fitPts.push_back(smoothRing[(start + k) % n]);
+                sourceN = (int)c2;
+            }
+            bool ok = sourceN >= 10;
+            if (!ok && sourceN >= 5 && iArc >= 10.0) {
+                fitPts = WeightedSample(fitPts, 12);
+                ok = true;
+            }
+            if (!ok) continue;
+
+            std::vector<pcl::PointXYZ> smoothIvl;
+            {
+                const std::size_t c3 = w ? (n - start + end + 1) : (end - start + 1);
+                smoothIvl.reserve(c3);
+                for (std::size_t k = 0; k < c3; ++k)
+                    smoothIvl.push_back(smoothRing[(start + k) % n]);
             }
             MaskConicArc a;
-            if (EvalCircle(sup, pixelSize, a)) {
+            const std::string reason = EvalCircleV2(fitPts, smoothIvl, sourceN, pixelSize, a);
+            if (reason.empty()) {
                 a.startIdx = start; a.endIdx = end; a.wrapsZero = w;
                 a.startPoint = smoothRing[start];
                 a.endPoint = smoothRing[end];
                 all.push_back({start, end, w, a});
+            } else {
+                if (a.arcLength > bestRejectScore) {
+                    bestRejectScore = a.arcLength;
+                    bestReject = reason;
+                }
             }
         }
-    }
-    {
-        std::sort(all.begin(), all.end(), [](const Cand& a, const Cand& b) {
-            if (a.s != b.s) return a.s < b.s;
-            return a.a.score > b.a.score;
-        });
-        std::size_t w = 0;
-        for (std::size_t i = 0; i < all.size(); ++i)
-            if (i == 0 || all[i].s != all[w].s) all[w++] = all[i];
-        all.resize(w);
     }
     {
         std::sort(all.begin(), all.end(),
@@ -11189,20 +11299,21 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
     }
     std::sort(candidates.begin(), candidates.end(),
         [](const MaskConicArc& a, const MaskConicArc& b) {
-            return a.startIdx < b.startIdx;
-        });
+            return a.startIdx < b.startIdx; });
     std::cerr << "[MaskCurveDetect] fid=" << fid << " part=" << partIdx
               << " raw_candidates=" << all.size()
-              << " accepted=" << candidates.size() << std::endl;
+              << " accepted=" << candidates.size()
+              << " best_reject=" << bestReject
+              << " pixel_size=" << pixelSize << std::endl;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const auto& a = candidates[i];
         std::cerr << "[MaskCurve] fid=" << fid << " part=" << partIdx
-                  << " index=" << i
-                  << " type=circle start=" << a.startIdx
-                  << " end=" << a.endIdx
+                  << " index=" << i << " type=circle"
+                  << " start=" << a.startIdx << " end=" << a.endIdx
                   << " wrap=" << (a.wrapsZero ? 1 : 0)
-                  << " support=" << a.supportCount
+                  << " source_n=" << a.supportCount
                   << " length=" << a.arcLength
+                  << " chord=" << a.chordLength
                   << " sweep_deg=" << a.sweepDeg
                   << " rmse=" << a.rmse
                   << " line_rmse=" << a.lineRmse

@@ -195,6 +195,7 @@ const int kNarrowNeckMaxCutsPerFeature = 12;
 // Experimental Mask-only branch. It is isolated from the OSGB pipeline and
 // falls back to the existing VDP path whenever topology checks fail.
 constexpr bool kUseTopologyPreservingResidualRegularization = true;
+constexpr bool kMaskCurveDetectionDebugOnly = true;
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -4915,7 +4916,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     MaskOnlyPath* pathOut = nullptr,
     int partIndex = 0,
     const std::vector<pcl::PointXYZ>* rawRing = nullptr,
-    outlineRegular::DirectionContextOut* dirCtxOut = nullptr)
+    outlineRegular::DirectionContextOut* dirCtxOut = nullptr,
+    double maskPixelSize = 0.5)
 {
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
     if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
@@ -4977,7 +4979,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // 恢复在各路径的直线候选通过质量检查后执行
     const auto maskCurves = DetectMaskConicArcs(
         ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
-        kMaskResidualSpacing, sourceFid, partIndex);
+        maskPixelSize > 0.0 ? maskPixelSize : 0.3, sourceFid, partIndex);
 
         if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
@@ -4992,7 +4994,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
             std::cerr << "[MaskOnlyTopology] fid=" << sourceFid
                       << " vertices=" << topoResult.size() << std::endl;
             // 曲线恢复: 直线候选已通过质量检查, 回贴圆弧采样
-            topoResult = RestoreMaskConicArcs(
+            if (!kMaskCurveDetectionDebugOnly) topoResult = RestoreMaskConicArcs(
                 topoResult, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
             return topoResult;
         }
@@ -5055,7 +5057,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << " initial_area=" << PolygonArea2D(ring)
                   << " final_area=" << PolygonArea2D(result) << std::endl;
         // 曲线恢复: VDP直线候选通过质量检查后回贴
-        result = RestoreMaskConicArcs(
+        if (!kMaskCurveDetectionDebugOnly) result = RestoreMaskConicArcs(
             result, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
         return result;
     }
@@ -5121,7 +5123,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << fallbackAngle * 180.0 / M_PI
                   << " vertices=" << strictFallback.size() << std::endl;
         // 曲线恢复: 严格方向候选通过质量检查后回贴
-        strictFallback = RestoreMaskConicArcs(
+        if (!kMaskCurveDetectionDebugOnly) strictFallback = RestoreMaskConicArcs(
             strictFallback, maskCurves, kMaskResidualSpacing, sourceFid, partIndex);
         return strictFallback;
     }
@@ -5398,6 +5400,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     };
     std::vector<PathStatAccum> pathStats(5);
     // 重叠解决器输入: 建筑优先级与"更好的单体候选"(初始轮廓, 局部坐标)
+    const double maskPixelSize = std::max(maskStats.pixelSizeX, maskStats.pixelSizeY);
     std::unordered_map<long long, double> overlapPriorityByFid;
     std::unordered_map<long long, std::vector<pcl::PointXYZ>> overlapAlternateByFid;
     // 输出 FID → 该建筑的方向上下文(Difference 后方向检查用)
@@ -5510,7 +5513,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             auto result = RegularizeRingFromMaskOnly(
                 ring, static_cast<long long>(buildingId), &bestHypothesis,
                 &fallback, &path, ringIdx - 1,
-                rawRingForPart, &ringDirCtx);
+                rawRingForPart, &ringDirCtx, maskPixelSize);
             if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
             if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
             // 路径统计: 顶点数/短边数(<0.5m)/面积变化
