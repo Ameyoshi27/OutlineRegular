@@ -3102,7 +3102,34 @@ static std::string EvalCircleV2(
     }
     if (rmse > std::max(2.0 * pixelSize, 0.60)) return "circle_rmse";
     if (q90 > std::max(3.0 * pixelSize, 1.00)) return "circle_q90";
+    // ============ 弧模型竞争选择 (Arc vs Line Model Competition) ============
+    // 原则: 弧模型有3个参数(cx,cy,r), 直线只有2个(θ,d), 必须用信息准则
+    // 补偿复杂度差异. 只有弧的解释力**显著优于**直线时才接受弧.
+    //
+    // 三层竞争判据:
+    //   1. BIC(贝叶斯信息准则): BIC = n*ln(rmse²) + k*ln(n)
+    //      直线 k=2, 弧 k=3 → 弧需要额外 ln(n) 的证据
+    //   2. 绝对改善: line_rmse - arc_rmse >= 最小改善量
+    //      (防止 line_rmse=0.100, arc_rmse=0.049 这种微弱改善通过比值检查)
+    //   3. 两线竞争: 弧 vs 两段折线(拐角情形)
     if (lineRmse / std::max(rmse, 0.01) < 2.0) return "line_explains_better";
+
+    // BIC 模型竞争: 弧的 BIC 必须低于直线的 BIC
+    {
+        const double eps = 1e-12;
+        const double bicLine = n * std::log(std::max(lineRmse * lineRmse, eps)) + 2.0 * std::log(n);
+        const double bicArc = n * std::log(std::max(rmse * rmse, eps)) + 3.0 * std::log(n);
+        // 弧的 BIC 必须比直线低(负 margin 意味着弧赢得更多)
+        if (bicArc >= bicLine) return "bic_line_wins";
+    }
+
+    // 绝对改善量: 弧至少要比直线好 min_improvement 米
+    {
+        const double minImprovement = std::max(1.5 * pixelSize, 0.45);
+        if (lineRmse - rmse < minImprovement) return "insufficient_improvement";
+    }
+
+    // 两线竞争(拐角): 除非是强浅弧, 否则两段折线如果解释得差不多就拒绝弧
     const double lineImprovement = lineRmse / std::max(rmse, 0.01);
     const bool strongShallowArc = sweepDeg <= 70.0 && lineImprovement >= 2.5;
     if (std::isfinite(twoLineRmse) && !strongShallowArc &&
@@ -3111,6 +3138,12 @@ static std::string EvalCircleV2(
     }
     if (sweepDeg < 20.0 || sweepDeg > 240.0) return "sweep_out_of_range";
 
+    // 评分: 竞争余量 × 拟合质量 × 单调性 × 稳定性 × 长度
+    // 竞争余量 = BIC差值归一化(越大表示弧赢得越多)
+    const double eps2 = 1e-12;
+    const double bicLine2 = n * std::log(std::max(lineRmse * lineRmse, eps2)) + 2.0 * std::log(n);
+    const double bicArc2 = n * std::log(std::max(rmse * rmse, eps2)) + 3.0 * std::log(n);
+    const double bicMargin = std::max(0.0, (bicLine2 - bicArc2) / std::max(n, 1));
     const double improve = std::max(0.0, 1.0 - rmse / std::max(lineRmse, 0.01));
     const double rmseLimit = std::max(2.0 * pixelSize, 0.60);
     const double normalizedRmse = rmse / rmseLimit;
@@ -3125,7 +3158,8 @@ static std::string EvalCircleV2(
     out.sweepDeg = sweepDeg;
     out.supportCount = sourceVertexCount;
     out.score = std::sqrt(std::min(arcLen, 40.0)) * improve * fitQ *
-        angleStats.monotonicity * stability.score;
+        angleStats.monotonicity * stability.score *
+        (1.0 + bicMargin); // 竞争余量加成(1.0~2.0, BIC差大→加分)
     if (out.score < 1.80) return "weak_curve_evidence";
     return "";
 }
@@ -11568,6 +11602,9 @@ std::vector<MaskConicArc> DetectMaskConicArcs(
                   << " rmse=" << a.rmse
                   << " line_rmse=" << a.lineRmse
                   << " two_line_rmse=" << a.twoLineRmse
+                  << " improve_ratio=" << (a.lineRmse / std::max(a.rmse, 0.01))
+                  << " abs_improve=" << (a.lineRmse - a.rmse)
+                  << " sagitta=" << a.sagitta
                   << " score=" << a.score << std::endl;
     }
     return candidates;
