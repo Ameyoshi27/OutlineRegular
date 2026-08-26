@@ -1731,15 +1731,53 @@ constexpr int kNarrowNeckDebugRejectLogLimit = 24;
 void CopyFieldValues(OGRFeature* src, OGRFeature* dst);
 
 // 作用：计算 OGR 几何的长度(线)。
-double GeometryLength(OGRGeometry* geometry)
+double GeometryLength(const OGRGeometry* geometry)
 {
-    return geometry ? OGR_G_Length(OGRGeometry::ToHandle(geometry)) : 0.0;
+    if (!geometry || geometry->IsEmpty()) return 0.0;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    // 线性几何直接求长; 集合递归累加; 面走 Boundary 后再求;
+    // 点等非曲线类型不得调用 OGR_G_Length(会触发 non-curve 警告)
+    if (type == wkbLineString || type == wkbLinearRing) {
+        return OGR_G_Length(OGRGeometry::ToHandle(
+            const_cast<OGRGeometry*>(geometry)));
+    }
+    if (type == wkbMultiLineString || type == wkbGeometryCollection) {
+        const auto* collection = geometry->toGeometryCollection();
+        double length = 0.0;
+        for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+            length += GeometryLength(collection->getGeometryRef(i));
+        }
+        return length;
+    }
+    if (type == wkbPolygon || type == wkbTriangle || type == wkbMultiPolygon) {
+        // 周长: 先取 Boundary(线几何) 再递归
+        std::unique_ptr<OGRGeometry> boundary(geometry->Boundary());
+        return boundary ? GeometryLength(boundary.get()) : 0.0;
+    }
+    return 0.0;
 }
 
 // 作用：计算 OGR 几何的面积(面)。
 double GeometryArea(const OGRGeometry* geometry)
 {
-    return geometry ? OGR_G_Area(OGRGeometry::ToHandle(const_cast<OGRGeometry*>(geometry))) : 0.0;
+    if (!geometry || geometry->IsEmpty()) return 0.0;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbPolygon || type == wkbTriangle) {
+        return OGR_G_Area(OGRGeometry::ToHandle(
+            const_cast<OGRGeometry*>(geometry)));
+    }
+    if (type == wkbMultiPolygon || type == wkbGeometryCollection) {
+        const auto* collection = geometry->toGeometryCollection();
+        double area = 0.0;
+        for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+            area += GeometryArea(collection->getGeometryRef(i));
+        }
+        return area;
+    }
+    // Intersection/union may also contain line or point components. They do
+    // not contribute to area and must not call OGR_G_Area (which emits a
+    // misleading non-surface warning).
+    return 0.0;
 }
 
 // 作用：计算 OGR 几何的周长(边界长度)。
@@ -2722,7 +2760,7 @@ bool LineIntersection2D(
 }
 
 // 作用：把输出多边形转为组平差模型(边参数化 θ/d)。
-bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
+bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,    const Eigen::Vector3d& metadataOffset,
     GroupBuildingModel& model)
 {
     model = {};
@@ -2733,7 +2771,7 @@ bool BuildGroupModelFromGeometry(const OutlineFeatureRecord& feature,
     if (!polygon) return false;
 
     model.fid = feature.fid;
-    model.initialRing = ExtractExteriorRing(polygon, Eigen::Vector3d::Zero());
+    model.initialRing = ExtractExteriorRing(polygon, metadataOffset);
     RemoveClosingDuplicate(model.initialRing);
     if (model.initialRing.size() < 3) return false;
     model.ring = model.initialRing;
@@ -3467,11 +3505,81 @@ struct MaskOnlyOverlapStats {
     std::vector<long long> clippedFids;
 };
 
+// 保留几何中面积最大的合法面部件(MultiPolygon/集合拆解)
+std::unique_ptr<OGRGeometry> KeepLargestValidPolygonPart(
+    std::unique_ptr<OGRGeometry> geometry)
+{
+    if (!geometry) return nullptr;
+    const OGRwkbGeometryType type = wkbFlatten(geometry->getGeometryType());
+    if (type == wkbPolygon || type == wkbTriangle) {
+        return geometry->IsValid() ? std::move(geometry) : nullptr;
+    }
+    if (type != wkbMultiPolygon && type != wkbGeometryCollection) {
+        return nullptr;
+    }
+    const auto* collection = geometry->toGeometryCollection();
+    double bestArea = 0.0;
+    std::unique_ptr<OGRGeometry> best;
+    for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+        const OGRGeometry* part = collection->getGeometryRef(i);
+        if (!part || wkbFlatten(part->getGeometryType()) != wkbPolygon) continue;
+        if (!part->IsValid() || part->IsEmpty()) continue;
+        const double a = GeometryArea(part);
+        if (a > bestArea) {
+            bestArea = a;
+            best.reset(part->clone());
+        }
+    }
+    return best;
+}
+
+// 把环上偏离方向系统的 >=0.8m 边绕中点旋回最近合法方向(方案A简化版)
+std::vector<pcl::PointXYZ> SnapEdgesToDirectionSystems(
+    const std::vector<pcl::PointXYZ>& ring,
+    const outlineRegular::DirectionContextOut& dirCtx)
+{
+    if (ring.size() < 3) return {};
+    if (!dirCtx.valid || dirCtx.systemAngles.empty()) return ring;
+    std::vector<pcl::PointXYZ> out = ring;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const std::size_t j = (i + 1) % out.size();
+        const double len = std::hypot(out[j].x - out[i].x, out[j].y - out[i].y);
+        if (len < 0.8) continue;
+        const double ang = std::atan2(out[j].y - out[i].y, out[j].x - out[i].x);
+        // 折叠角空间最近合法角
+        double bestAng = dirCtx.systemAngles.front();
+        double bestDist = 1e9;
+        for (double a : dirCtx.systemAngles) {
+            // 折叠空间中 a 代表 a/a+90 两个真实方向; 取展开后最近者
+            for (int k = 0; k < 2; ++k) {
+                const double cand = a + k * M_PI / 2.0;
+                double d = std::abs(ang - cand);
+                while (d > M_PI) d = std::abs(d - 2.0 * M_PI);
+                d = std::min(d, M_PI - d);
+                if (d < bestDist) { bestDist = d; bestAng = cand; }
+            }
+        }
+        if (bestDist < 0.5 * M_PI / 180.0) continue;  // 已合法
+        if (bestDist > 45.0 * M_PI / 180.0) continue;  // 过远旋转会破坏几何
+        // 绕边中点旋转两端点
+        const double mx = 0.5 * (out[i].x + out[j].x);
+        const double my = 0.5 * (out[i].y + out[j].y);
+        const double d = std::cos(bestAng), e = std::sin(bestAng);
+        out[i].x = static_cast<float>(mx - d * len / 2.0);
+        out[i].y = static_cast<float>(my - e * len / 2.0);
+        out[j].x = static_cast<float>(mx + d * len / 2.0);
+        out[j].y = static_cast<float>(my + e * len / 2.0);
+    }
+    RemoveClosingDuplicate(out);
+    return out;
+}
+
 bool ResolveMaskOnlyOutputOverlaps(
     OGRLayer* layer,
     const Eigen::Vector3d& originOffset,
     const std::unordered_map<long long, double>& priorityByFid,
     const std::unordered_map<long long, std::vector<pcl::PointXYZ>>& alternateByFid,
+    const std::unordered_map<long long, outlineRegular::DirectionContextOut>& directionByFid,
     MaskOnlyOverlapStats& stats)
 {
     stats = {};
@@ -3569,47 +3677,11 @@ bool ResolveMaskOnlyOutputOverlaps(
     std::cout << "[MaskOnlyOverlap] conflict_pairs=" << stats.conflictPairs << std::endl;
     std::cout << "[MaskOnlyOverlap] groups=" << stats.groups << std::endl;
     if (conflicts.empty()) return true;
+    // ---- 阶段一(已删除): 换回初始轮廓的备用候选 ----
+    // 该通道会用未规则化轮廓替换规则化结果, 违反"初始轮廓不得
+    // 直出"约束; 备用候选必须是已过完整方向/拓扑/局部规则性检查
+    // 的规则化候选(当前无此类候选, candidate_swaps 恒为 0)。
 
-    // ---- 3. 阶段一: 更好的单体候选 ----
-    // 低优先级成员换回规则化前的原始轮廓(局部坐标 + 偏移),
-    // 仅当消除当前冲突且不与任何第三方产生新冲突时采纳。
-    {
-        std::vector<std::pair<std::size_t, std::size_t>> current;
-        collectConflicts(current);
-        for (const auto& pr : current) {
-            auto& fa = features[pr.first];
-            auto& fb = features[pr.second];
-            if (!fa.geometry || !fb.geometry) continue;
-            const bool aYields = priorityOf(fa) < priorityOf(fb);
-            OutlineFeatureRecord& loser = aYields ? fa : fb;
-            const OutlineFeatureRecord& winner = aYields ? fb : fa;
-            const auto altIt = alternateByFid.find(static_cast<long long>(loser.fid));
-            if (altIt == alternateByFid.end() || altIt->second.size() < 3) continue;
-            std::unique_ptr<OGRPolygon> altPoly(
-                MakePolygon(altIt->second, originOffset));
-            if (!altPoly || altPoly->IsEmpty() || !altPoly->IsValid()) continue;
-            if (strictOverlapArea(altPoly.get(), winner.geometry.get()) > kStrictOverlapArea) {
-                continue;
-            }
-            bool newConflict = false;
-            OGREnvelope altEnv;
-            altPoly->getEnvelope(&altEnv);
-            for (std::size_t k = 0; k < features.size() && !newConflict; ++k) {
-                if (k == pr.first || k == pr.second || !features[k].geometry) continue;
-                const auto& env = features[k].envelope;
-                if (altEnv.MaxX < env.MinX || env.MaxX < altEnv.MinX ||
-                    altEnv.MaxY < env.MinY || env.MaxY < altEnv.MinY) continue;
-                if (strictOverlapArea(altPoly.get(), features[k].geometry.get()) >
-                    kStrictOverlapArea) {
-                    newConflict = true;
-                }
-            }
-            if (newConflict) continue;
-            loser.geometry = std::move(altPoly);
-            refreshEnvelope(loser);
-            ++stats.candidateSwaps;
-        }
-    }
 
     // ---- 4. 阶段二: 带护栏的 Ceres 组平差 ----
     {
@@ -3639,19 +3711,33 @@ bool ResolveMaskOnlyOutputOverlaps(
                     break;
                 }
                 GroupBuildingModel model;
-                if (!BuildGroupModelFromGeometry(features[index], model)) {
+                if (!BuildGroupModelFromGeometry(features[index], originOffset, model)) {
                     groupOk = false;
                     break;
                 }
                 group.push_back(std::move(model));
             }
             if (!groupOk || group.size() < 2) continue;
+            // 局部坐标确认: 进入 pcl/Ceres 的坐标必须是测试区域尺度,
+            // 出现 3.84e7 量级说明 offset 丢失(float 分辨率仅 ~4m)
+            {
+                double maxAbsXY = 0.0;
+                for (const auto& g : group) {
+                    for (const auto& p : g.initialRing) {
+                        maxAbsXY = std::max(maxAbsXY,
+                            std::max(std::abs((double)p.x), std::abs((double)p.y)));
+                    }
+                }
+                std::cerr << "[MaskOnlyOverlapCeres] fid=" << group.front().fid
+                          << " local_coord=1 group_size=" << group.size()
+                          << " max_abs_xy=" << maxAbsXY << std::endl;
+            }
             OutputOverlapRepairStats ceresStats;
             if (!OptimizeCeresConflictGroup(group, ceresStats)) continue;
             for (std::size_t local = 0; local < group.size(); ++local) {
                 const std::size_t featureIndex = indices[local];
                 std::unique_ptr<OGRPolygon> polygon(
-                    MakePolygon(group[local].ring, Eigen::Vector3d::Zero()));
+                    MakePolygon(group[local].ring, originOffset));
                 if (!polygon || polygon->IsEmpty() || !polygon->IsValid()) continue;
                 features[featureIndex].geometry.reset(polygon.release());
                 refreshEnvelope(features[featureIndex]);
@@ -3711,7 +3797,10 @@ bool ResolveMaskOnlyOutputOverlaps(
                 continue;
             }
 
-            // 阶段四: Difference 裁剪(低优先级让位; 前后有效性检查)
+            // 阶段四: Difference 裁剪(低优先级让位; 前后有效性检查 +
+            // 方向完整性: 裁剪引入的固定建筑边可能不属于被裁建筑的
+            // 方向系统; 违规边旋回本建筑合法方向(方案A简化版),
+            // 2轮仍失败则删除低优先级残片
             if (!loser.geometry->IsValid()) {
                 std::unique_ptr<OGRGeometry> fixed(loser.geometry->Buffer(0.0));
                 if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
@@ -3728,29 +3817,63 @@ bool ResolveMaskOnlyOutputOverlaps(
                 loser.geometry->Difference(winner.geometry.get()));
             if (!clipped || clipped->IsEmpty()) {
                 loser.geometry.reset();
-            } else if (!clipped->IsValid()) {
-                std::unique_ptr<OGRGeometry> fixed(clipped->Buffer(0.0));
-                if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
-                    clipped = std::move(fixed);
-                } else {
-                    clipped.reset();
-                }
-            }
-            if (clipped) {
-                loser.geometry = std::move(clipped);
             } else {
-                loser.geometry.reset();
+                if (!clipped->IsValid()) {
+                    std::unique_ptr<OGRGeometry> fixed(clipped->Buffer(0.0));
+                    if (fixed && !fixed->IsEmpty() && fixed->IsValid()) {
+                        clipped = std::move(fixed);
+                    }
+                }
+                // 只保留面积最大的合法面部件(MultiPolygon 拆分)
+                clipped = KeepLargestValidPolygonPart(std::move(clipped));
+                // 方向完整性: >=0.8m 边须属于本建筑方向系统;
+                // 违规边绕中点旋回最近合法方向, 最多 2 轮
+                if (clipped) {
+                    const auto dirIt = directionByFid.find(
+                        static_cast<long long>(loser.fid));
+                    if (dirIt != directionByFid.end()) {
+                        for (int round = 0; round < 2 && clipped; ++round) {
+                            auto localRing = ExtractExteriorRing(
+                                clipped->toPolygon(), originOffset);
+                            if (localRing.size() < 3) break;
+                            const std::string viol =
+                                outlineRegular::CheckFallbackLocalRegularity(
+                                    localRing, dirIt->second, -1, 0, "clip");
+                            if (viol.empty()) break;
+                            std::cerr << "[MaskOnlyOverlap] clip_fix fid="
+                                      << loser.fid << " round=" << round
+                                      << " reason=" << viol << std::endl;
+                            auto fixedRing = SnapEdgesToDirectionSystems(
+                                localRing, dirIt->second);
+                            if (fixedRing.size() < 3) { clipped.reset(); break; }
+                            std::unique_ptr<OGRPolygon> fixedPoly(
+                                MakePolygon(fixedRing, originOffset));
+                            if (!fixedPoly || fixedPoly->IsEmpty() ||
+                                !fixedPoly->IsValid() ||
+                                strictOverlapArea(fixedPoly.get(),
+                                    winner.geometry.get()) > 0.05) {
+                                if (round == 1) clipped.reset();
+                                continue;
+                            }
+                            clipped = std::move(fixedPoly);
+                        }
+                    }
+                }
+                if (clipped) {
+                    loser.geometry = std::move(clipped);
+                } else {
+                    loser.geometry.reset();
+                }
             }
             refreshEnvelope(loser);
             ++stats.clipped;
             stats.clippedFids.push_back(static_cast<long long>(loser.fid));
-            // 裁剪后面积过小的残留删除
+            // 裁剪后面积地板: <15m² 或 bbox<20m² 的残片删除
             if (loser.geometry) {
                 const double bboxArea =
                     (loser.envelope.MaxX - loser.envelope.MinX) *
                     (loser.envelope.MaxY - loser.envelope.MinY);
-                if (loser.area < kMinOutputPolygonArea ||
-                    bboxArea < kMinOutputPolygonBBoxArea) {
+                if (loser.area < 15.0 || bboxArea < 20.0) {
                     loser.geometry.reset();
                     refreshEnvelope(loser);
                 }
@@ -3778,10 +3901,26 @@ bool ResolveMaskOnlyOutputOverlaps(
             ? target->SetGeometry(feature.geometry.get())
             : target->SetGeometry(nullptr);
         if (setGeometryErr == OGRERR_NONE) {
-            layer->SetFeature(target);
+            const OGRErr writeErr = layer->SetFeature(target);
+            if (writeErr != OGRERR_NONE) {
+                std::cerr << "[MaskOnlyOverlap] SetFeature failed fid="
+                          << feature.fid << " err=" << writeErr << std::endl;
+            }
+        } else {
+            std::cerr << "[MaskOnlyOverlap] SetGeometry failed fid="
+                      << feature.fid << " err=" << setGeometryErr << std::endl;
         }
         OGRFeature::DestroyFeature(target);
     }
+
+    // Shapefile 的 SetFeature 可能延迟写入 .shp/.shx；必须在最终审计前
+    // 强制落盘，否则同一 layer 的读缓存可能看到“已修复”、关闭后文件
+    // 却仍保留旧几何。
+    if (layer->SyncToDisk() != OGRERR_NONE) {
+        std::cerr << "[MaskOnlyOverlap] SyncToDisk failed after write-back"
+                  << std::endl;
+    }
+    layer->ResetReading();
 
     // ---- 8. 最终严格检查: 先有效性修复, 再绝对面积相交检测 ----
     {
@@ -4758,7 +4897,13 @@ bool MaskOnlyRingIsSimple(const std::vector<pcl::PointXYZ>& ring)
 
 enum class MaskOnlyFallback { Final = 0, Hypothesis, Initial };
 // 规则化最终路径(统计与日志用)
-enum class MaskOnlyPath { Topology = 0, Vdp, BestHypothesis, InitialRing };
+enum class MaskOnlyPath {
+    Topology = 0,
+    Vdp,
+    BestHypothesis, // diagnostic-only legacy value; never emitted
+    InitialRing,    // diagnostic-only legacy value; never emitted
+    StrictFallback
+};
 
 // Mask-only 规则化入口：轮廓点既是残差点云，
 // 也是方向证据，供原封不动的 regular_Contour 管线使用。
@@ -4768,21 +4913,33 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     std::vector<pcl::PointXYZ>* bestHypothesisOut,
     MaskOnlyFallback* fallbackLevel,
     MaskOnlyPath* pathOut = nullptr,
-    int partIndex = 0)
+    int partIndex = 0,
+    const std::vector<pcl::PointXYZ>* rawRing = nullptr,
+    outlineRegular::DirectionContextOut* dirCtxOut = nullptr)
 {
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
     if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
     if (ring.size() < 3) {
-        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
-        return ring;
+        std::cerr << "[RegularizationPath] fid=" << sourceFid
+                  << " failed_too_few_input_vertices" << std::endl;
+        return {};
     }
 
     auto residual = DensifyBoundary(ring, kMaskResidualSpacing);
     pcl::PointCloud<pcl::PointXYZ>::Ptr contourCloud(new pcl::PointCloud<pcl::PointXYZ>);
     contourCloud->points.assign(residual->begin(), residual->end());
     if (contourCloud->size() < 8) {
-        if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
-        return ring;
+        const auto strict = OrientedBoundingRectangle(ring, 0.0);
+        if (strict.size() >= 3) {
+            if (pathOut) *pathOut = MaskOnlyPath::StrictFallback;
+            std::cerr << "[RegularizationPath] fid=" << sourceFid
+                      << " strict_direction_fallback angle_deg=0 vertices="
+                      << strict.size() << std::endl;
+            return strict;
+        }
+        std::cerr << "[RegularizationPath] fid=" << sourceFid
+                  << " failed_insufficient_residual_points" << std::endl;
+        return {};
     }
 
     double contourDir = 0.0;
@@ -4818,7 +4975,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
         auto topoResult = regularizer.TopologyPreservingRegularize(
-            ring, kMaskResidualSpacing, topoFallback, &dirCtx, partIndex);
+            ring, kMaskResidualSpacing, topoFallback, &dirCtx, partIndex,
+            rawRing);
         if (!topoResult.empty()) {
             if (bestHypothesisOut) *bestHypothesisOut = topoResult;
             if (pathOut) *pathOut = MaskOnlyPath::Topology;
@@ -4833,6 +4991,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                       << " fallback to VDP pipeline" << std::endl;
         }
     }
+    // 方向上下文传出(通道内已填好, VDP 路径不再改动)
+    if (dirCtxOut) *dirCtxOut = dirCtx;
 
     // 无正射证据仲裁栅格楼梯上的曲线检测；
     // Mask-only 不得恢复伪曲线。
@@ -4886,6 +5046,9 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << " final_area=" << PolygonArea2D(result) << std::endl;
         return result;
     }
+    // The VDP hypothesis is diagnostic data and a source for the strict
+    // fallback only. It must never be emitted as a final mask-only building.
+    std::vector<pcl::PointXYZ> strictInput = bestHypothesis;
     if (bestHypothesis.size() >= 3) {
         const std::string hypReason =
             outlineRegular::CheckRingQuality(bestHypothesis, ring, dirCtx, 2.5, sourceFid, partIndex);
@@ -4911,34 +5074,48 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                           << (!cleanReason.empty() ? cleanReason : cleanLocal)
                           << ")" << std::endl;
             } else {
-                result = cleaned;
-                if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
-                if (pathOut) *pathOut = MaskOnlyPath::BestHypothesis;
-                std::cerr << "[RegularizationPath] fid=" << sourceFid
-                          << " best_hypothesis (cleaned "
+                strictInput = cleaned;
+                std::cerr << "[VDPUsableForStrictFallback] fid=" << sourceFid
+                          << " cleaned "
                           << bestHypothesis.size() << "->" << cleaned.size()
                           << " verts)" << std::endl;
-                return result;
             }
         } else {
-            result = bestHypothesis;
-            if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Hypothesis;
-            if (pathOut) *pathOut = MaskOnlyPath::BestHypothesis;
-            std::cerr << "[RegularizationPath] fid=" << sourceFid
-                      << " best_hypothesis" << std::endl;
-            std::cerr << "[TopologyFallbackToBestHypothesis] fid=" << sourceFid
-                      << " vertices=" << bestHypothesis.size() << std::endl;
-            return result;
+            std::cerr << "[VDPUsableForStrictFallback] fid=" << sourceFid
+                      << " best_vertices=" << bestHypothesis.size()
+                      << " (direct emission disabled)" << std::endl;
         }
     }
 
-    result = ring;
-    if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Initial;
-    if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
-    std::cerr << "[RegularizationPath] fid=" << sourceFid << " initial_ring" << std::endl;
-    std::cerr << "[TopologyFallbackToInitial] fid=" << sourceFid
-              << " vertices=" << ring.size() << std::endl;
-    return result;
+    // Never write the noisy initial ring as a final regularized building.
+    // Use the strongest known direction to build one last strict candidate;
+    // when no direction evidence exists, an axis-aligned OBR is still a
+    // regularized result and is preferable to exposing pixel stair steps.
+    const double fallbackAngle = dirCtx.valid ? dirCtx.primaryAngle : 0.0;
+    std::vector<pcl::PointXYZ> strictFallback;
+    if (strictInput.size() >= 3) {
+        regularizer.BuildStrictDirectionalFallback(
+            strictInput, fallbackAngle, strictFallback);
+    }
+    if (strictFallback.size() < 3) {
+        strictFallback = OrientedBoundingRectangle(ring, fallbackAngle);
+    }
+    RemoveClosingDuplicate(strictFallback);
+    if (strictFallback.size() >= 3) {
+        if (pathOut) *pathOut = MaskOnlyPath::StrictFallback;
+        std::cerr << "[RegularizationPath] fid=" << sourceFid
+                  << " strict_direction_fallback angle_deg="
+                  << fallbackAngle * 180.0 / M_PI
+                  << " vertices=" << strictFallback.size() << std::endl;
+        return strictFallback;
+    }
+
+    // This is an actual processing failure. Do not silently claim that the
+    // initial ring was regularized; the caller will omit the invalid result.
+    if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
+    std::cerr << "[RegularizationPath] fid=" << sourceFid
+              << " failed_no_regularized_candidate" << std::endl;
+    return {};
 }
 
 // 作用：Mask-only 模式主入口：TIF→初始轮廓→等弧长残差点→复用规则化→输出。
@@ -5099,6 +5276,62 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     const int initialCount = inLayer->GetFeatureCount(TRUE);
     std::cout << "[MaskOnly] initial feature count=" << initialCount << std::endl;
 
+    // ---- 原始(平滑前)轮廓加载: 按 FID 精确关联, 供双残差规则化 ----
+    // raw 是平滑前的同一图层副本，SmoothInitialOutlinesTopologyPreserving
+    // 只用 SetFeature 写回，因此 FID 在平滑前后保持稳定；id 可能因窄颈
+    // 切分而重复，不能作为几何残差的唯一关联键。
+    std::unordered_map<long long, std::vector<std::vector<pcl::PointXYZ>>> rawRingsByFid;
+    {
+        const std::filesystem::path rawPath = debugDir / "initial_building_outline_raw.shp";
+        if (std::filesystem::exists(rawPath)) {
+            GDALDataset* rawDataset = static_cast<GDALDataset*>(
+                GDALOpenEx(rawPath.string().c_str(), GDAL_OF_VECTOR,
+                           nullptr, nullptr, nullptr));
+            if (rawDataset) {
+                OGRLayer* rawLayer = rawDataset->GetLayer(0);
+                if (rawLayer) {
+                    rawLayer->ResetReading();
+                    long long rawRingCount = 0;
+                    while (OGRFeature* feature = rawLayer->GetNextFeature()) {
+                        OGRGeometry* geometry = feature->GetGeometryRef();
+                        const long long key = feature->GetFID();
+                        if (geometry && !geometry->IsEmpty()) {
+                            const OGRwkbGeometryType rawType =
+                                wkbFlatten(geometry->getGeometryType());
+                            std::vector<OGRPolygon*> rawParts;
+                            if (rawType == wkbPolygon) {
+                                rawParts.push_back(geometry->toPolygon());
+                            } else if (rawType == wkbMultiPolygon ||
+                                       rawType == wkbGeometryCollection) {
+                                auto* collection = geometry->toGeometryCollection();
+                                for (int i = 0; collection && i < collection->getNumGeometries(); ++i) {
+                                    if (wkbFlatten(collection->getGeometryRef(i)->getGeometryType()) == wkbPolygon) {
+                                        rawParts.push_back(collection->getGeometryRef(i)->toPolygon());
+                                    }
+                                }
+                            }
+                            for (OGRPolygon* part : rawParts) {
+                                auto rawRing = ExtractExteriorRing(part, originOffset);
+                                RemoveClosingDuplicate(rawRing);
+                                if (rawRing.size() >= 3) {
+                                    rawRingsByFid[key].push_back(std::move(rawRing));
+                                    ++rawRingCount;
+                                }
+                            }
+                        }
+                        OGRFeature::DestroyFeature(feature);
+                    }
+                    std::cout << "[MaskOnly] raw rings loaded=" << rawRingCount
+                              << " features=" << rawRingsByFid.size() << std::endl;
+                }
+                GDALClose(rawDataset);
+            }
+        } else {
+            std::cout << "[MaskOnly] raw outline missing; dual residual disabled"
+                      << std::endl;
+        }
+    }
+
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
     if (!driver) {
         std::cerr << "[MaskOnly] ESRI Shapefile driver unavailable." << std::endl;
@@ -5139,17 +5372,20 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
 
     RegularizationDebugCollector debugCollector;
-    // 各路径统计: topology / vdp / best_hypothesis / initial_ring
+    // Legacy best/initial slots remain for backward-compatible enum values;
+    // current mask-only output uses topology, vdp, or strict_fallback only.
     struct PathStatAccum {
         long long count = 0;
         double sumVerts = 0.0;
         long long sumShortEdges = 0;
         double sumAreaRatio = 0.0;
     };
-    std::vector<PathStatAccum> pathStats(4);
+    std::vector<PathStatAccum> pathStats(5);
     // 重叠解决器输入: 建筑优先级与"更好的单体候选"(初始轮廓, 局部坐标)
     std::unordered_map<long long, double> overlapPriorityByFid;
     std::unordered_map<long long, std::vector<pcl::PointXYZ>> overlapAlternateByFid;
+    // 输出 FID → 该建筑的方向上下文(Difference 后方向检查用)
+    std::unordered_map<long long, outlineRegular::DirectionContextOut> overlapDirectionByFid;
     long long total = 0;
     long long okCount = 0;
     long long emptyGeom = 0;
@@ -5196,6 +5432,12 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             }
         }
 
+        // 要素级重叠处理输入累积: 按 part 最大优先级 + 对应方向上下文,
+        // CreateFeature 成功后以真实输出 FID 写入映射(属性 id 与输出 FID
+        // 因 smallSkipped 等不再一致, 禁止再用 buildingId 当键)
+        double featurePriority = -1e9;
+        MaskOnlyPath featurePath = MaskOnlyPath::InitialRing;
+        outlineRegular::DirectionContextOut featureDirCtx;
         std::vector<std::unique_ptr<OGRPolygon>> outParts;
         int ringIdx = 0;
         for (OGRPolygon* part : parts) {
@@ -5208,12 +5450,51 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                 ++smallSkipped;
                 continue;
             }
+            const std::vector<pcl::PointXYZ>* rawRingForPart = nullptr;
+            const auto rawIt = rawRingsByFid.find(
+                static_cast<long long>(inFeature->GetFID()));
+            if (rawIt != rawRingsByFid.end() && !rawIt->second.empty()) {
+                // SimplifyPreserveTopology normally preserves part order. For
+                // defensive handling of reordered multipart geometries, choose
+                // the raw part with the largest bbox overlap with this smooth part.
+                double bestScore = -1.0;
+                for (const auto& rawCandidate : rawIt->second) {
+                    double sMinX = 1e18, sMinY = 1e18, sMaxX = -1e18, sMaxY = -1e18;
+                    double rMinX = 1e18, rMinY = 1e18, rMaxX = -1e18, rMaxY = -1e18;
+                    for (const auto& p : ring) {
+                        sMinX = std::min(sMinX, static_cast<double>(p.x));
+                        sMinY = std::min(sMinY, static_cast<double>(p.y));
+                        sMaxX = std::max(sMaxX, static_cast<double>(p.x));
+                        sMaxY = std::max(sMaxY, static_cast<double>(p.y));
+                    }
+                    for (const auto& p : rawCandidate) {
+                        rMinX = std::min(rMinX, static_cast<double>(p.x));
+                        rMinY = std::min(rMinY, static_cast<double>(p.y));
+                        rMaxX = std::max(rMaxX, static_cast<double>(p.x));
+                        rMaxY = std::max(rMaxY, static_cast<double>(p.y));
+                    }
+                    const double overlapW = std::max(
+                        0.0, std::min(sMaxX, rMaxX) - std::max(sMinX, rMinX));
+                    const double overlapH = std::max(
+                        0.0, std::min(sMaxY, rMaxY) - std::max(sMinY, rMinY));
+                    const double minBoxArea = std::max(1e-9, std::min(
+                        (sMaxX - sMinX) * (sMaxY - sMinY),
+                        (rMaxX - rMinX) * (rMaxY - rMinY)));
+                    const double score = overlapW * overlapH / minBoxArea;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        rawRingForPart = &rawCandidate;
+                    }
+                }
+            }
+            outlineRegular::DirectionContextOut ringDirCtx;
             std::vector<pcl::PointXYZ> bestHypothesis;
             MaskOnlyFallback fallback = MaskOnlyFallback::Final;
             MaskOnlyPath path = MaskOnlyPath::InitialRing;
             auto result = RegularizeRingFromMaskOnly(
                 ring, static_cast<long long>(buildingId), &bestHypothesis,
-                &fallback, &path, ringIdx - 1);
+                &fallback, &path, ringIdx - 1,
+                rawRingForPart, &ringDirCtx);
             if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
             if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
             // 路径统计: 顶点数/短边数(<0.5m)/面积变化
@@ -5240,19 +5521,17 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                     case MaskOnlyPath::Vdp: prio += 0.15; break;
                     case MaskOnlyPath::BestHypothesis: break;
                     case MaskOnlyPath::InitialRing: prio -= 0.25; break;
+                    case MaskOnlyPath::StrictFallback: prio += 0.05; break;
                 }
                 prio += 0.20 * std::min(1.0, std::abs(PolygonArea2D(result)) / 200.0);
                 // 小建筑矩形(≤6顶点的 VDP 矩形拟合): 提高优先级,
                 // 相交时邻居让位, 矩形只被裁掉超出部分
                 if (path == MaskOnlyPath::Vdp && result.size() <= 6) prio += 0.15;
-                const long long key = static_cast<long long>(buildingId);
-                const auto prev = overlapPriorityByFid.find(key);
-                if (prev == overlapPriorityByFid.end() || prev->second < prio) {
-                    overlapPriorityByFid[key] = prio;
-                }
-                // 单环要素记录初始轮廓作为备选候选
-                if (parts.size() == 1 && path != MaskOnlyPath::InitialRing) {
-                    overlapAlternateByFid[key] = ring;
+                // 要素级累积(取 part 最大优先级; 方向上下文随最高优先级 part)
+                if (prio > featurePriority) {
+                    featurePriority = prio;
+                    featurePath = path;
+                    featureDirCtx = ringDirCtx;
                 }
             }
 
@@ -5270,6 +5549,23 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             }
             if (!MaskOnlyRingIsSimple(result)) ++selfIntersect;
 
+            // 面积地板: <15m² 或 bbox<20m² 的残片不写出
+            {
+                const double partArea = std::abs(PolygonArea2D(result));
+                double bbMinX=1e18,bbMinY=1e18,bbMaxX=-1e18,bbMaxY=-1e18;
+                for (const auto& p : result) {
+                    bbMinX=std::min(bbMinX,(double)p.x); bbMaxX=std::max(bbMaxX,(double)p.x);
+                    bbMinY=std::min(bbMinY,(double)p.y); bbMaxY=std::max(bbMaxY,(double)p.y);
+                }
+                const double partBBox = (bbMaxX-bbMinX)*(bbMaxY-bbMinY);
+                if (partArea < 15.0 || partBBox < 20.0) {
+                    std::cerr << "[MaskOnlySizeFloor] fid=" << buildingId
+                              << " area=" << partArea << " bbox=" << partBBox
+                              << " dropped=1" << std::endl;
+                    ++smallSkipped;
+                    continue;
+                }
+            }
             std::unique_ptr<OGRPolygon> outPolygon(MakePolygon(result, originOffset));
             if (outPolygon) outParts.push_back(std::move(outPolygon));
         }
@@ -5293,8 +5589,24 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             outFeature->SetField(outAreaFieldIdx,
                 GeometryArea(outFeature->GetGeometryRef()));
         }
+        // CreateFeature 成功后以真实输出 FID 写入重叠处理映射
+        // (属性 id 与输出 FID 因 smallSkipped 等不再一致)
         if (outLayer->CreateFeature(outFeature) == OGRERR_NONE) {
             ++okCount;
+            if (featurePriority > -1e8) {
+                const GIntBig outFid = outFeature->GetFID();
+                overlapPriorityByFid[static_cast<long long>(outFid)] =
+                    featurePriority;
+                overlapDirectionByFid[static_cast<long long>(outFid)] =
+                    featureDirCtx;
+                const char* pathNames[] = { "topology", "vdp",
+                    "best_hypothesis", "initial_ring", "strict_fallback" };
+                std::cerr << "[MaskOnlyOverlapKey] output_fid=" << outFid
+                          << " building_id=" << buildingId
+                          << " priority=" << featurePriority
+                          << " path=" << pathNames[static_cast<int>(featurePath)]
+                          << std::endl;
+            }
         } else {
             std::cerr << "[MaskOnly] CreateFeature failed fid=" << buildingId << std::endl;
         }
@@ -5311,7 +5623,8 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
         MaskOnlyOverlapStats overlapStats;
         ResolveMaskOnlyOutputOverlaps(
             outLayer, originOffset,
-            overlapPriorityByFid, overlapAlternateByFid, overlapStats);
+            overlapPriorityByFid, overlapAlternateByFid,
+            overlapDirectionByFid, overlapStats);
         std::cout << "[MaskOnlyOverlap] summary buffer_repaired="
                   << overlapStats.bufferRepaired
                   << " candidate_swaps=" << overlapStats.candidateSwaps
@@ -5319,14 +5632,79 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                   << " translated=" << overlapStats.translatedCount
                   << " clipped=" << overlapStats.clipped << std::endl;
     }
+    // Shapefile 的同一 GDALDataset 可能继续返回写入前的要素缓存。
+    // 关闭并重新打开后再做一次最终修复，确保日志与磁盘文件一致。
     outDataset->FlushCache();
     GDALClose(outDataset);
+    outDataset = nullptr;
+    GDALDataset* reopenedOutput = static_cast<GDALDataset*>(GDALOpenEx(
+        outputVectorIn.c_str(), GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+        nullptr, nullptr, nullptr));
+    if (reopenedOutput) {
+        OGRLayer* reopenedLayer = reopenedOutput->GetLayer(0);
+        if (reopenedLayer) {
+            MaskOnlyOverlapStats finalOverlapStats;
+            ResolveMaskOnlyOutputOverlaps(
+                reopenedLayer, originOffset,
+                overlapPriorityByFid, overlapAlternateByFid,
+                overlapDirectionByFid,
+                finalOverlapStats);
+            std::cout << "[MaskOnlyOverlap] reopened_final unresolved="
+                      << finalOverlapStats.unresolved << std::endl;
+            // 最终审计: 面积地板复查 + area 字段与最终几何一致
+            {
+                reopenedLayer->ResetReading();
+                std::vector<GIntBig> toDelete;
+                while (OGRFeature* f = reopenedLayer->GetNextFeature()) {
+                    OGRGeometry* g = f->GetGeometryRef();
+                    if (!g || g->IsEmpty()) {
+                        toDelete.push_back(f->GetFID());
+                        OGRFeature::DestroyFeature(f);
+                        continue;
+                    }
+                    OGREnvelope env;
+                    g->getEnvelope(&env);
+                    const double a = GeometryArea(g);
+                    const double bboxA =
+                        (env.MaxX - env.MinX) * (env.MaxY - env.MinY);
+                    if (a < 15.0 || bboxA < 20.0) {
+                        std::cerr << "[MaskOnlySizeFloor] fid="
+                                  << f->GetFID() << " area=" << a
+                                  << " bbox=" << bboxA
+                                  << " dropped=1 stage=final_audit"
+                                  << std::endl;
+                        toDelete.push_back(f->GetFID());
+                    } else {
+                        const int areaIdx = f->GetFieldIndex("area");
+                        if (areaIdx >= 0) f->SetField(areaIdx, a);
+                        reopenedLayer->SetFeature(f);
+                    }
+                    OGRFeature::DestroyFeature(f);
+                }
+                for (GIntBig fid : toDelete) {
+                    reopenedLayer->DeleteFeature(fid);
+                }
+                if (!toDelete.empty()) {
+                    std::cout << "[MaskOnlySizeFloor] final_audit dropped="
+                              << toDelete.size() << std::endl;
+                }
+            }
+        }
+        reopenedOutput->FlushCache();
+        GDALClose(reopenedOutput);
+    } else {
+        std::cerr << "[MaskOnlyOverlap] failed to reopen output for final audit"
+                  << std::endl;
+    }
     GDALClose(inDataset);
 
     // 路径统计汇总
     {
-        const char* pathNames[4] = { "topology", "vdp", "best_hypothesis", "initial_ring" };
-        for (int p = 0; p < 4; ++p) {
+        const char* pathNames[5] = {
+            "topology", "vdp", "best_hypothesis", "initial_ring",
+            "strict_fallback"
+        };
+        for (int p = 0; p < 5; ++p) {
             const auto& st = pathStats[static_cast<std::size_t>(p)];
             if (st.count == 0) continue;
             std::cout << "[PathStats] path=" << pathNames[p]
@@ -5340,10 +5718,21 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
 
     const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";
     SaveDebugBestHypotheses(debugBestPath, debugCollector, srsClone, originOffset);
-    if (srsClone) srsClone->Release();
     std::cout << "[MaskOnly] best hypotheses saved: " << debugBestPath.string()
               << " (" << debugCollector.hypotheses.size() << " rings)" << std::endl;
     std::cout << "[MaskOnly] support LAS skipped: no OSGB source" << std::endl;
+
+    // 双残差调试点输出(参与 Ceres 的 raw/smooth 残差采样)
+    {
+        const std::filesystem::path rawDbgPath =
+            debugDir / "debug_mask_raw_residual_points.shp";
+        if (outlineRegular::SaveRawResidualDebugDump(
+                rawDbgPath.string(), originOffset, srsClone)) {
+            std::cout << "[MaskOnly] raw residual debug points saved: "
+                      << rawDbgPath.string() << std::endl;
+        }
+    }
+    if (srsClone) srsClone->Release();
 
     const double loopSec =
         std::chrono::duration<double>(loopEnd - loopStart).count();
@@ -5895,4 +6284,3 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
     std::cout << "Output: " << outputVector << std::endl;
     return ok > 0 ? 0 : 2;
 }
-

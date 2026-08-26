@@ -45,6 +45,9 @@
 #include <array>
 #include <algorithm>
 #include <numeric>
+#include <filesystem>
+#include <gdal_priv.h>
+#include <ogrsf_frmts.h>
 #include <ceres/ceres.h>
 #include <ceres/rotation.h> // 旋转矩阵函数
 #include <limits> // 无限值
@@ -3640,6 +3643,24 @@ constexpr double kDirDiagShortDiagMinLen = 0.8;    // m, 短斜边方向检查�
 constexpr double kDirDiagSupportRadius = 0.6;      // m, 支撑点计数半径
 constexpr double kDirDiagMultiGainMin = 0.20;      // 多方向判定: multi比single评分高多少
 constexpr double kDirDiagMultiFracMin = 0.22;      // 多方向判定: 次系统权重占比下限
+// 多方向必须由一个独立且足够大的次方向系统证明。仅凭评分增益或
+// 一簇短链会把栅格楼梯误判成多方向；这两个门槛比旧的 0.18/15m
+// 更保守，优先保证单方向建筑不会进入 AllowDiagonal。
+constexpr double kDirDiagRobustSecondaryFrac = 0.22;
+constexpr double kDirDiagRobustSecondaryConfidence = 0.22;
+constexpr int kDirDiagRobustSecondaryChains = 2;
+
+// ---- 双残差: 平滑轮廓定拓扑, 原始像素轮廓提供 Ceres 几何观测 ----
+// 总权比 raw:smooth = 70:30；逐点权重按实际关联点数归一化。
+constexpr bool kUseRawMaskBoundaryResiduals = true;
+constexpr double kRawResidualWeight = 0.70;     // raw 残差总权重占比
+constexpr double kSmoothResidualWeight = 0.30;  // smooth 残差总权重占比
+constexpr int kRawResidualMinPoints = 24;       // raw 采样点下限(低于则回退)
+constexpr int kRawResidualMaxPoints = 5000;     // raw 采样点上限(按弧长占比分配)
+constexpr double kRawResidualSpacingMin = 0.3;  // m, raw 采样间距下限
+constexpr double kRawResidualSpacingMax = 0.8;  // m, raw 采样间距上限
+constexpr bool kDumpRawResidualPoints = true;   // 调试点输出开关
+constexpr std::size_t kRawResidualDebugMaxPoints = 250000;
 
 struct DirectionSystemDiag {
     double angleRad = 0.0;        // 系统代表方向(折叠[0°,90°))
@@ -3719,7 +3740,10 @@ DirectionSystemBuild BuildDirectionSystems(
     DirectionSystemBuild build;
     const std::size_t n = chains.size();
 
-    // 逐链指标: 稳定性/连续性/支撑点数
+    // 逐链指标: 稳定性/连续性/支撑点数 + 稳定链总量立即累计
+    // (systemCredible 依赖 totalStableLength, 必须在候选验证前就绪;
+    //   此前该值在未归组核算阶段才计算, 初筛时≈0 导致多链系统
+    //   的长度门槛失效, 弱系统先被保留再靠 DirectionPrune 补救)
     build.chainInfo.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
         const auto& c = chains[i];
@@ -3730,6 +3754,10 @@ DirectionSystemBuild BuildDirectionSystems(
         info.continuity = chord / std::max(c.length, 1e-9);
         info.stable = c.length >= kDirDiagStableMinLength &&
                       c.rmse <= fitTolerance;
+        if (info.stable) {
+            build.totalStableLength += c.length;
+            build.totalStableWeight += c.weight;
+        }
         if (supportCloud && !supportCloud->empty()) {
             for (const auto& p : supportCloud->points) {
                 if (DirDiagPointToSegmentDistance(
@@ -4062,14 +4090,7 @@ DirectionSystemBuild BuildDirectionSystems(
             build.maxUnassignedLength =
                 std::max(build.maxUnassignedLength, c.length);
         }
-        build.totalStableLength = 0.0;
-        build.totalStableWeight = 0.0;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (build.chainInfo[i].stable) {
-                build.totalStableLength += chains[i].length;
-                build.totalStableWeight += chains[i].weight;
-            }
-        }
+        // 稳定链总量已在逐链指标阶段累计, 不重复
         build.unassignedLengthRatio =
             build.totalStableLength > 1e-9
                 ? build.unassignedLongLength / build.totalStableLength : 0.0;
@@ -4116,6 +4137,60 @@ DirectionSystemBuild BuildDirectionSystems(
                 ? sys.weight / build.totalStableWeight : 0.0;
         const double fitFactor = std::exp(-sys.meanRmse / std::max(fitTolerance, 0.01));
         sys.confidence = std::clamp(supportFrac * fitFactor, 0.0, 1.0);
+    }
+
+    // 系统置信度计算完成后再做一次“方向系统净化”。弱系统不能继续
+    // 参与拓扑候选，否则它们虽然各自方向合法，却会给单方向建筑制造
+    // 一组没有建筑意义的斜边。保留主系统和真正达到独立支持门槛的次系统，
+    // 同时重映射 chainInfo，保证后续格网吸附与 Ceres 使用同一套系统。
+    if (systems.size() >= 2 && build.totalStableLength > 1e-9) {
+        std::size_t primary = 0;
+        for (std::size_t s = 1; s < systems.size(); ++s) {
+            if (systems[s].weight > systems[primary].weight) primary = s;
+        }
+
+        std::vector<bool> keep(systems.size(), false);
+        keep[primary] = true;
+        for (std::size_t s = 0; s < systems.size(); ++s) {
+            if (s == primary) continue;
+            const double lengthFrac = systems[s].totalLength /
+                std::max(build.totalStableLength, 1e-9);
+            if (systems[s].chainCount >= kDirDiagRobustSecondaryChains &&
+                lengthFrac >= kDirDiagRobustSecondaryFrac &&
+                systems[s].confidence >= kDirDiagRobustSecondaryConfidence &&
+                systems[s].concentration >= 0.80) {
+                keep[s] = true;
+            }
+        }
+
+        std::vector<DirectionSystemDiag> filtered;
+        filtered.reserve(systems.size());
+        std::vector<int> remap(systems.size(), -1);
+        // 主系统固定放在 0 号位；后续单方向代码约定 systems.front()
+        // 就是唯一主方向。
+        remap[primary] = 0;
+        filtered.push_back(systems[primary]);
+        for (std::size_t s = 0; s < systems.size(); ++s) {
+            if (s == primary || !keep[s]) continue;
+            remap[s] = static_cast<int>(filtered.size());
+            filtered.push_back(systems[s]);
+        }
+        for (auto& info : build.chainInfo) {
+            if (info.system < 0) continue;
+            const auto old = static_cast<std::size_t>(info.system);
+            info.system = old < remap.size() ? remap[old] : -1;
+            if (info.system < 0 && !filtered.empty()) {
+                // 被删除的弱系统后续会按主方向处理；不要留下自由斜边。
+                info.system = 0;
+            }
+        }
+        if (filtered.size() != systems.size()) {
+            std::cerr << "[DirectionPrune] systems=" << systems.size()
+                      << " kept=" << filtered.size()
+                      << " primary_angle_deg="
+                      << filtered.front().angleRad * 180.0 / M_PI << std::endl;
+            systems.swap(filtered);
+        }
     }
 
     // 短链处置: 归组 / 受保护结构 / 自由边
@@ -4368,7 +4443,9 @@ std::string CheckPolygonQualityVsRing(
     for (const auto& p : poly) {
         if (distToRing(p) > maxVertexDisp) return "flying_vertex";
     }
-    // 方向误差: >3m 长边须贴近检测到的方向系统。
+    // 方向误差: 所有可见直线边(>=0.8m)都须贴近检测到的方向系统。
+    // 0.8m 以下通常是像素噪声或受保护的微小结构，不让更长的短斜边
+    // 通过质量闸门。
     // 多方向: 容差 12°(优化基准角允许在系统角附近小幅精化),
     //   合法角只有 systemAngles——未归组链不得自我合法化。
     // 单方向: 基准必须是检测到的主系统角 systemAngles.front()(8°),
@@ -4380,7 +4457,7 @@ std::string CheckPolygonQualityVsRing(
         const auto& p1 = poly[i];
         const auto& p2 = poly[(i + 1) % poly.size()];
         const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
-        if (len >= 3.0) {
+        if (len >= kDirDiagShortDiagMinLen) {
             longEdges.push_back({len, std::atan2(p2.y - p1.y, p2.x - p1.x)});
         }
     }
@@ -4448,7 +4525,19 @@ std::string CheckPolygonQualityVsRing(
     return "";
 }
 
-} // namespace
+// ---- 双残差调试点收集器(可选输出 debug_mask_raw_residual_points.shp) ----
+struct RawResidualDebugPoint {
+    long long fid = 0;
+    int part = 0;
+    pcl::PointXYZ pt{};
+    int src = 0;         // 0=smooth, 1=raw
+    double weight = 1.0;
+    int assocEdge = -1;  // 关联的候选边索引(-1=未关联)
+};
+static std::vector<RawResidualDebugPoint>& RawResidualDebugPoints() {
+    static std::vector<RawResidualDebugPoint> instance;
+    return instance;
+}
 
 
 // A second geometric direction is only credible when the support cloud has an
@@ -4552,6 +4641,22 @@ SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
     return result;
 }
 }
+
+// Close the outer file-local helper namespace.  The direction diagnostic
+// helpers above use a nested anonymous namespace, while the class member
+// implementations below must remain in the outlineRegular namespace.
+}
+
+bool outlineRegular::BuildStrictDirectionalFallback(
+    const std::vector<pcl::PointXYZ>& input,
+    double mainAngle,
+    std::vector<pcl::PointXYZ>& result) const
+{
+    result.clear();
+    if (input.size() < 3 || !std::isfinite(mainAngle)) return false;
+    return forceOrthogonalPolygonToAngle(input, mainAngle, result);
+}
+
 void outlineRegular::RunDirectionSystemDiagnostic(
     long long fid,
     const std::vector<pcl::PointXYZ>& ring,
@@ -5379,13 +5484,27 @@ void outlineRegular::regular_Contour()
                     best_hypothesis, relaxed_systems, model_tuning);
             const bool relaxedChainEvidence = chainMultiDirection;
             if ((relaxedGeometricEvidence || relaxedChainEvidence) && independentWallSecondary) {
-                direction_systems = std::move(relaxed_systems);
-                credible_multi_direction = true;
-                std::cerr << "[BuildingMode] relaxed multi-direction evidence accepted" << std::endl;
+                if (relaxed_systems.size() >= 2) {
+                    direction_systems = std::move(relaxed_systems);
+                    credible_multi_direction = true;
+                    std::cerr << "[BuildingMode] relaxed multi-direction evidence accepted" << std::endl;
+                } else {
+                    std::cerr << "[BuildingModeGuard] rejected_multi reason=less_than_two_systems"
+                              << " (relaxed systems=" << relaxed_systems.size() << ")"
+                              << std::endl;
+                }
             } else if ((relaxedGeometricEvidence || relaxedChainEvidence) && !independentWallSecondary) {
                 std::cerr << "[BuildingMode] relaxed multi-direction rejected: "
                              "geometry-only secondary direction" << std::endl;
             }
+        }
+        // 最终守卫: 多方向必须建立在 >=2 个方向系统之上,
+        // 单系统 AllowDiagonal 会输出无系统约束的自由斜边
+        if (credible_multi_direction && direction_systems.size() < 2) {
+            credible_multi_direction = false;
+            std::cerr << "[BuildingModeGuard] rejected_multi reason=less_than_two_systems"
+                      << " (final systems=" << direction_systems.size() << ")"
+                      << std::endl;
         }
 
         // 小轮廓(按最优假设面积判定，取代原先
@@ -7720,10 +7839,15 @@ void outlineRegular::optimizeWithHardConstraints(
             append_angle(angle, 8.0);
         }
 
-        const std::vector<double> polygon_angles = dominantLineAngles2D(
-            current_polygon, allow_diagonal_edges ? 4 : 1);
-        for (double angle : polygon_angles) {
-            append_angle(angle, allow_diagonal_edges ? 10.0 : 20.0);
+        // When the caller supplies a direction model, it is the complete
+        // legal direction set. Re-discovering angles from the already altered
+        // polygon reintroduces diagonal edges during Ceres.
+        if (base_line_angles.empty()) {
+            const std::vector<double> polygon_angles = dominantLineAngles2D(
+                current_polygon, allow_diagonal_edges ? 4 : 1);
+            for (double angle : polygon_angles) {
+                append_angle(angle, allow_diagonal_edges ? 10.0 : 20.0);
+            }
         }
 
         if (!allow_diagonal_edges && base_line_angles.size() > 1) {
@@ -7733,7 +7857,7 @@ void outlineRegular::optimizeWithHardConstraints(
             base_line_angles.resize(4);
         }
 
-        if (use_dlg_direction_) {
+        if (use_dlg_direction_ && preferred_line_angles.empty()) {
             const std::vector<double> dlg_angles = dominantLineAngles2D(dlg_polygon_, 3);
             std::vector<double> merged_angles;
             const double merge_tolerance = 20.0 * M_PI / 180.0;
@@ -7758,6 +7882,7 @@ void outlineRegular::optimizeWithHardConstraints(
             }
         }
         for (double building_angle : building_line_angles_) {
+            if (!preferred_line_angles.empty()) break;
             bool represented = false;
             for (double angle : base_line_angles) {
                 if (angleDistanceToOrthogonalSystem(angle, building_angle) < 5.0 * M_PI / 180.0) {
@@ -7826,16 +7951,13 @@ void outlineRegular::optimizeWithHardConstraints(
             while (a > M_PI) a -= 2 * M_PI;
             return a;
         };
-        // Strict buildings assign every edge to the nearest axis. Buildings
-        // with credible diagonal evidence keep edges outside the normal
-        // orthogonal tolerance as independent free directions.
-        double tolerance = allow_diagonal_edges
-            ? std::min(tuning.angle_tolerance, 15.0 * M_PI / 180.0)
-            : M_PI;
+        // Every edge must belong to one of the supplied direction systems.
+        // A multi-direction building may use several axes, but it may not
+        // create an unmodelled free-angle edge.
         std::vector<int> edge_base_index(n, -1);
 
         for (size_t i = 0; i < n; ++i) {
-            double best_error = tolerance;
+            double best_error = std::numeric_limits<double>::max();
             int best_type = -1;
             int best_base = -1;
             double best_offset = 0.0;
@@ -7874,16 +7996,26 @@ void outlineRegular::optimizeWithHardConstraints(
                 edge_base_index[i] = best_base;
             }
             else {
-                edges[i].type = -1; // 自由边
+                // This is only possible for a non-finite edge angle or an
+                // empty direction set. Keep the edge out of the solver's
+                // free-angle path; the caller will reject the result.
+                edges[i].type = 0;
+                edges[i].theta_offset = 0.0;
             }
         }
 
 
         // 5. 数据关联 (带拐角遮蔽优化)
+        const bool hasResidualWeightOverride = cloud &&
+            residual_weights_override_.size() == cloud->points.size();
+        const double minResidualWeight = hasResidualWeightOverride ? 1e-6 : 0.10;
         if (cloud && !cloud->empty()) {
             auto supportBaseWeight = [&](size_t pt_index) {
-                if (pt_index < support_weights_.size()) {
-                    return clampDouble(support_weights_[pt_index], 0.10, 1.0);
+                // 双残差模式: 逐点权重覆盖(70:30 总权比), 否则构造权重
+                const std::vector<double>& w = !hasResidualWeightOverride
+                    ? support_weights_ : residual_weights_override_;
+                if (pt_index < w.size()) {
+                    return clampDouble(w[pt_index], minResidualWeight, 1.0);
                 }
                 return 1.0;
             };
@@ -7977,9 +8109,10 @@ void outlineRegular::optimizeWithHardConstraints(
                     (2.0 * weight_sigma * weight_sigma));
                 const double boundary_weight = clampDouble(0.20 + 0.80 * distance_weight, 0.20, 1.0);
                 const double normal_weight = pt_index < edges[i].associated_weights.size()
-                    ? clampDouble(edges[i].associated_weights[pt_index], 0.10, 1.0)
+                    ? clampDouble(edges[i].associated_weights[pt_index], minResidualWeight, 1.0)
                     : 1.0;
-                const double support_weight = clampDouble(boundary_weight * normal_weight, 0.10, 1.0);
+                const double support_weight = clampDouble(
+                    boundary_weight * normal_weight, minResidualWeight, 1.0);
                 const double sqrt_weight = std::sqrt(support_weight);
                 support_weight_sum += support_weight;
                 support_weight_min = std::min(support_weight_min, support_weight);
@@ -9689,6 +9822,59 @@ std::string outlineRegular::CheckRingQuality(
 // 兜底局部规则性检查: 方向检查覆盖 0.8~3m 的短斜边, 加上尖刺与
 // 近共线锯齿。仅用于 VDP 结果/最优假设/直接输出的拓扑候选——
 // 这些结果没有受保护短边的显式标记, 不做任何豁免。
+// 保存双残差调试点(局部坐标 + originOffset)到点 Shapefile
+bool outlineRegular::SaveRawResidualDebugDump(
+    const std::string& shpPath,
+    const Eigen::Vector3d& originOffset,
+    OGRSpatialReference* spatialRef)
+{
+    auto& points = RawResidualDebugPoints();
+    // 清理旧文件族
+    for (const char* ext : {".shp", ".shx", ".dbf", ".prj", ".cpg"}) {
+        std::filesystem::path p = shpPath;
+        p.replace_extension(ext);
+        std::error_code ec;
+        std::filesystem::remove(p, ec);
+    }
+    if (points.empty()) return false;
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) return false;
+    GDALDataset* ds = driver->Create(
+        shpPath.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!ds) return false;
+    OGRLayer* layer = ds->CreateLayer(
+        "debug_mask_raw_residual_points", spatialRef, wkbPoint25D, nullptr);
+    if (!layer) { GDALClose(ds); return false; }
+    OGRFieldDefn fFid("fid", OFTInteger64);
+    OGRFieldDefn fPart("part", OFTInteger);
+    OGRFieldDefn fSrc("source", OFTInteger);  // 0=smooth 1=raw
+    OGRFieldDefn fW("weight", OFTReal);
+    OGRFieldDefn fAssoc("assoc_edge", OFTInteger);     // -1=未关联
+    layer->CreateField(&fFid);
+    layer->CreateField(&fPart);
+    layer->CreateField(&fSrc);
+    layer->CreateField(&fW);
+    layer->CreateField(&fAssoc);
+    for (const auto& p : points) {
+        OGRFeature* f = OGRFeature::CreateFeature(layer->GetLayerDefn());
+        f->SetField(0, p.fid);
+        f->SetField(1, p.part);
+        f->SetField(2, p.src);
+        f->SetField(3, p.weight);
+        f->SetField(4, p.assocEdge);
+        OGRPoint pt(p.pt.x + originOffset.x(),
+                    p.pt.y + originOffset.y(),
+                    p.pt.z + originOffset.z());
+        f->SetGeometry(&pt);
+        layer->CreateFeature(f);
+        OGRFeature::DestroyFeature(f);
+    }
+    ds->FlushCache();
+    GDALClose(ds);
+    points.clear();
+    return true;
+}
+
 std::string outlineRegular::CheckFallbackLocalRegularity(
     const std::vector<pcl::PointXYZ>& poly,
     const DirectionContextOut& dirContext,
@@ -9770,11 +9956,11 @@ std::string outlineRegular::CheckFallbackLocalRegularity(
     }
     const double irregularRatio =
         perimeter > 1e-9 ? irregularLength / perimeter : 0.0;
-    // 短斜边容忍度: ≤2 条且占比 ≤10%(个别锯齿边不否决整栋——
-    // 拓扑候选实测存在 2 条/6% 的合法候选被零容忍误杀);
-    // 尖刺零容忍(窄角尖刺是明确错误), 锯齿 ≥3 顶点才否决
+    // Direction evidence is a hard contract: no visible straight edge may
+    // remain outside the accepted direction systems. Curves are disabled in
+    // mask-only mode, so there is no curve exemption here.
     const bool accepted =
-        (shortDiagonal <= 2 && irregularRatio <= 0.10) &&
+        (shortDiagonal == 0 && irregularRatio <= 0.10) &&
         spike == 0 && zigzag < 3;
     std::string reason;
     if (!accepted) {
@@ -9862,7 +10048,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     double pixelSize,
     bool& usedFallback,
     DirectionContextOut* dirContext,
-    int partIndex)
+    int partIndex,
+    const std::vector<pcl::PointXYZ>* rawRing)
 {
     usedFallback = false;
     if (initialRing.size() < 6) {
@@ -10031,6 +10218,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                   << " unassigned_ratio=" << dirBuild.unassignedLengthRatio
                   << " rescued=" << dirBuild.rescuedLongChains
                   << " protected_short=" << dirBuild.shortProtected << std::endl;
+        std::cerr << "[DirectionTotals] fid=" << source_feature_id_
+                  << " part=" << partIndex
+                  << " stable_length=" << dirBuild.totalStableLength
+                  << " stable_weight=" << dirBuild.totalStableWeight << std::endl;
         std::cerr << "[DirectionModel] fid=" << source_feature_id_
                   << " part=" << partIndex
                   << " single_score=" << dirBuild.singleScore
@@ -10091,8 +10282,26 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 sys = 0;
                 chainSystem[i] = 0;
             } else if (sys < 0) {
-                continue;  // 自由边/受保护短链: 保留自身方向
+                // A protected/unassigned chain is still a building boundary;
+                // assign it to the nearest credible system instead of
+                // carrying a free-angle edge into the candidate.
+                double bestDist = std::numeric_limits<double>::max();
+                int bestSys = -1;
+                for (std::size_t s = 0; s < dirBuild.systems.size(); ++s) {
+                    const double d = foldedAngleDistance90(
+                        topoChains[i].angleRad,
+                        dirBuild.systems[s].angleRad);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        bestSys = static_cast<int>(s);
+                    }
+                }
+                if (bestSys >= 0) {
+                    sys = bestSys;
+                    chainSystem[i] = bestSys;
+                }
             }
+            if (sys < 0) continue;
             const double pa = dirBuild.systems[static_cast<std::size_t>(sys)].angleRad;
             const double n1x = -std::sin(pa), n1y = std::cos(pa);
             const double n2x = std::cos(pa), n2y = std::sin(pa);
@@ -10265,12 +10474,35 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         }
     }
 
+    std::vector<double> systemAngles;
+    for (const auto& s : dirBuild.systems) systemAngles.push_back(s.angleRad);
+
+    // Remove duplicate vertices without losing the direction context. The
+    // candidate is small, so rebuild the assignment from the resulting edge
+    // angles; every edge is then fixed to one supplied system before Ceres.
+    removeDuplicatePoints2D(topologyPolygon, 0.05f);
+    std::vector<int> fixedEdgeAssignments(topologyPolygon.size(), -1);
+    for (std::size_t i = 0; i < topologyPolygon.size(); ++i) {
+        const auto& a = topologyPolygon[i];
+        const auto& b = topologyPolygon[(i + 1) % topologyPolygon.size()];
+        const double edgeAngle = std::atan2(b.y - a.y, b.x - a.x);
+        double best = std::numeric_limits<double>::max();
+        int bestSystem = -1;
+        for (std::size_t s = 0; s < systemAngles.size(); ++s) {
+            const double d = foldedAngleDistance90(
+                edgeAngle, systemAngles[s]);
+            if (d < best) {
+                best = d;
+                bestSystem = static_cast<int>(s);
+            }
+        }
+        fixedEdgeAssignments[i] = bestSystem;
+    }
+
     // ---- 3.5 质量检查器(转发到共享实现, 候选与 Ceres 结果共用; ----
     //      VDP 备用结果经 CheckRingQuality 走同一标准)
     // 合法方向只有系统角: 单方向验收基准=主系统角(8°),
     // 多方向=全部系统角(12°); 未归组链角度不再进入验收集合
-    std::vector<double> systemAngles;
-    for (const auto& s : dirBuild.systems) systemAngles.push_back(s.angleRad);
     auto qualityCheck = [&](const std::vector<pcl::PointXYZ>& poly,
                             double maxVertexDisp) -> std::string {
         return CheckPolygonQualityVsRing(
@@ -10280,7 +10512,6 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     };
 
     // ---- 4. 候选拓扑质量验证(不合格→VDP, 不直接输出) ----
-    removeDuplicatePoints2D(topologyPolygon, 0.05f);
     const std::string candidateReason = qualityCheck(topologyPolygon, 2.5);
     if (!candidateReason.empty()) {
         usedFallback = true;
@@ -10291,28 +10522,207 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         return {};
     }
 
-    // ---- 5. 残差采样: 原始轮廓稠密采样 ----
-    // 用原始环的等弧长采样作为 Ceres 数据项, 不用简化后的链端点直线
-    // 替代全部残差——楼梯/凹凸的真实几何都参与平差; 拐角噪声由求解器
-    // 数据关联的中段遮蔽(只取每条边中间 90% 的点)处理。
-    pcl::PointCloud<pcl::PointXYZ>::Ptr residualCloud(new pcl::PointCloud<pcl::PointXYZ>);
-    {
-        const double step = std::clamp(pixelSize, 0.3, 0.8);
+    // raw 采样点到 smooth 环边界的距离(门控用)
+    auto distToRingPt = [&](const pcl::PointXYZ& pt) {
+        double best = std::numeric_limits<double>::max();
         for (std::size_t i = 0; i < initialRing.size(); ++i) {
             const auto& a = initialRing[i];
             const auto& b = initialRing[(i + 1) % initialRing.size()];
+            const double dx = b.x - a.x;
+            const double dy = b.y - a.y;
+            const double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-12) continue;
+            double t2 = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+            t2 = std::clamp(t2, 0.0, 1.0);
+            const double d = std::hypot(pt.x - a.x - t2 * dx, pt.y - a.y - t2 * dy);
+            best = std::min(best, d);
+        }
+        return best;
+    };
+    // ---- 5. 残差采样: 双轮廓(smooth 定拓扑 + raw 像素轮廓提供几何观测) ----
+    // smooth 采样: 拓扑/方向来源自身的等弧长重采样(拐角噪声由求解器
+    //   数据关联的中段遮蔽处理);
+    // raw 采样(可选): 平滑前原始像素轮廓的等弧长采样——真实边界位置,
+    //   通过可靠性门控后才参与; raw 不进入方向检测, 不影响候选顶点。
+    pcl::PointCloud<pcl::PointXYZ>::Ptr residualCloud(
+        new pcl::PointCloud<pcl::PointXYZ>);
+    std::vector<double> residualWeights;
+    std::vector<pcl::PointXYZ> smoothSamples;
+    std::vector<pcl::PointXYZ> rawSamples;
+    std::vector<int> smoothAssociations;
+    std::vector<int> rawAssociations;
+    bool rawAccepted = false;
+    double rawAreaCached = 0.0;
+    std::string rawRejectReason;
+
+    auto sampleBoundary = [&](const std::vector<pcl::PointXYZ>& ring,
+                              double step,
+                              std::size_t maxPoints) {
+        std::vector<pcl::PointXYZ> samples;
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            const auto& a = ring[i];
+            const auto& b = ring[(i + 1) % ring.size()];
             const double len = std::hypot(b.x - a.x, b.y - a.y);
-            const int steps = std::max(1, static_cast<int>(std::ceil(len / step)));
-            for (int s2 = 0; s2 < steps; ++s2) {
-                const double t = static_cast<double>(s2) / steps;
+            const int count = std::max(1, static_cast<int>(std::ceil(len / step)));
+            for (int k = 0; k < count; ++k) {
+                const double t = static_cast<double>(k) / count;
                 pcl::PointXYZ pt;
                 pt.x = static_cast<float>(a.x + t * (b.x - a.x));
                 pt.y = static_cast<float>(a.y + t * (b.y - a.y));
                 pt.z = zVal;
-                residualCloud->push_back(pt);
+                samples.push_back(pt);
             }
         }
+        if (maxPoints > 0 && samples.size() > maxPoints) {
+            std::vector<pcl::PointXYZ> reduced;
+            reduced.reserve(maxPoints);
+            for (std::size_t i = 0; i < maxPoints; ++i) {
+                reduced.push_back(samples[
+                    i * (samples.size() - 1) / (maxPoints - 1)]);
+            }
+            samples.swap(reduced);
+        }
+        return samples;
+    };
+
+    const double smoothStep = std::clamp(pixelSize, 0.3, 0.8);
+    smoothSamples = sampleBoundary(initialRing, smoothStep, 0);
+    const double assocMaxDist = std::max(3.0 * pixelSize, 1.2);
+    auto associateEdge = [&](const pcl::PointXYZ& pt) {
+        int bestEdge = -1;
+        double bestDist = assocMaxDist;
+        for (std::size_t e = 0; e < topologyPolygon.size(); ++e) {
+            const auto& p1 = topologyPolygon[e];
+            const auto& p2 = topologyPolygon[(e + 1) % topologyPolygon.size()];
+            const double dx = p2.x - p1.x;
+            const double dy = p2.y - p1.y;
+            const double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-12) continue;
+            const double t = ((pt.x - p1.x) * dx +
+                              (pt.y - p1.y) * dy) / lenSq;
+            if (t <= 0.05 || t >= 0.95) continue;
+            const double d = std::hypot(
+                pt.x - p1.x - t * dx, pt.y - p1.y - t * dy);
+            if (d < bestDist) {
+                bestDist = d;
+                bestEdge = static_cast<int>(e);
+            }
+        }
+        return bestEdge;
+    };
+
+    // raw 必须与当前 smooth 部件面积和位置一致。raw 点先完成有限边段
+    // 关联，未关联点不会进入 Ceres。
+    if (kUseRawMaskBoundaryResiduals && rawRing && rawRing->size() >= 3) {
+        rawAreaCached = std::abs(polygonArea2D(*rawRing));
+        const double smoothArea = std::abs(polygonArea2D(initialRing));
+        const double areaRatio = rawAreaCached / std::max(smoothArea, 1e-6);
+        if (areaRatio < 0.60 || areaRatio > 1.60) {
+            rawRejectReason = "area_ratio=" + std::to_string(areaRatio);
+        } else {
+            const double rawStep = std::clamp(
+                std::max(pixelSize, kRawResidualSpacingMin),
+                kRawResidualSpacingMin, kRawResidualSpacingMax);
+            rawSamples = sampleBoundary(
+                *rawRing, rawStep,
+                static_cast<std::size_t>(kRawResidualMaxPoints));
+            if (rawSamples.size() < static_cast<std::size_t>(kRawResidualMinPoints)) {
+                rawRejectReason = "too_few_points=" +
+                    std::to_string(rawSamples.size());
+            } else {
+                std::vector<double> dists;
+                dists.reserve(rawSamples.size());
+                for (const auto& pt : rawSamples) {
+                    dists.push_back(distToRingPt(pt));
+                }
+                std::sort(dists.begin(), dists.end());
+                const double median = dists[dists.size() / 2];
+                const double q90 = dists[static_cast<std::size_t>(
+                    0.9 * static_cast<double>(dists.size() - 1))];
+                const double medianGate = std::max(1.5 * pixelSize, 0.6);
+                const double q90Gate = std::max(3.0 * pixelSize, 1.5);
+                if (median > medianGate || q90 > q90Gate) {
+                    rawRejectReason = "distance median=" +
+                        std::to_string(median) + " q90=" + std::to_string(q90);
+                } else {
+                    smoothAssociations.reserve(smoothSamples.size());
+                    rawAssociations.reserve(rawSamples.size());
+                    for (const auto& pt : smoothSamples) {
+                        smoothAssociations.push_back(associateEdge(pt));
+                    }
+                    for (const auto& pt : rawSamples) {
+                        rawAssociations.push_back(associateEdge(pt));
+                    }
+                    const std::size_t associatedRaw = static_cast<std::size_t>(
+                        std::count_if(rawAssociations.begin(), rawAssociations.end(),
+                                      [](int edge) { return edge >= 0; }));
+                    const std::size_t associatedSmooth = static_cast<std::size_t>(
+                        std::count_if(smoothAssociations.begin(), smoothAssociations.end(),
+                                      [](int edge) { return edge >= 0; }));
+                    if (associatedRaw < static_cast<std::size_t>(kRawResidualMinPoints)) {
+                        rawRejectReason = "too_few_associated=" +
+                            std::to_string(associatedRaw);
+                    } else if (associatedSmooth < 6) {
+                        rawRejectReason = "too_few_smooth_associated=" +
+                            std::to_string(associatedSmooth);
+                    } else {
+                        rawAccepted = true;
+                        const double rawUnit = kRawResidualWeight / associatedRaw;
+                        const double smoothUnit =
+                            kSmoothResidualWeight / associatedSmooth;
+                        const double unitScale = 1.0 / std::max(rawUnit, smoothUnit);
+                        const double rawPointWeight = rawUnit * unitScale;
+                        const double smoothPointWeight = smoothUnit * unitScale;
+                        for (std::size_t i = 0; i < smoothSamples.size(); ++i) {
+                            if (smoothAssociations[i] < 0) continue;
+                            residualCloud->push_back(smoothSamples[i]);
+                            residualWeights.push_back(smoothPointWeight);
+                        }
+                        for (std::size_t i = 0; i < rawSamples.size(); ++i) {
+                            if (rawAssociations[i] < 0) continue;
+                            residualCloud->push_back(rawSamples[i]);
+                            residualWeights.push_back(rawPointWeight);
+                        }
+                        std::cerr << "[RawResidual] fid=" << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " raw_samples=" << rawSamples.size()
+                                  << " raw_associated=" << associatedRaw
+                                  << " smooth_associated=" << associatedSmooth
+                                  << " source=fid"
+                                  << " median_to_smooth=" << median
+                                  << " q90_to_smooth=" << q90
+                                  << " accepted=1" << std::endl;
+                        std::cerr << "[DualResidual] fid=" << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " raw_target=" << kRawResidualWeight
+                                  << " smooth_target=" << kSmoothResidualWeight
+                                  << " raw_total_weight="
+                                  << rawPointWeight * associatedRaw
+                                  << " smooth_total_weight="
+                                  << smoothPointWeight * associatedSmooth
+                                  << " raw_share=" << kRawResidualWeight
+                                  << " rejected_raw="
+                                  << (rawSamples.size() - associatedRaw)
+                                  << std::endl;
+                    }
+                }
+            }
+        }
+        if (!rawAccepted) {
+            std::cerr << "[RawResidual] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " raw_samples=" << rawSamples.size()
+                      << " smooth_samples=" << smoothSamples.size()
+                      << " source=fid accepted=0 reason="
+                      << rawRejectReason << std::endl;
+        }
     }
+
+    if (!rawAccepted) {
+        for (const auto& pt : smoothSamples) residualCloud->push_back(pt);
+        residualWeights.clear();
+    }
+    setResidualWeights(residualWeights);
     if (residualCloud->size() < 6) {
         usedFallback = true;
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
@@ -10320,7 +10730,42 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         return {};
     }
     std::cerr << "[DenseResidual] fid=" << source_feature_id_
-              << " residual_points=" << residualCloud->size() << std::endl;
+              << " residual_points=" << residualCloud->size()
+              << " raw=" << (rawAccepted ? 1 : 0) << std::endl;
+
+    if (rawAccepted && kDumpRawResidualPoints) {
+        auto& debugPoints = RawResidualDebugPoints();
+        auto appendDebug = [&](const pcl::PointXYZ& pt, int src,
+                               double weight, int edge) {
+            if (debugPoints.size() >= kRawResidualDebugMaxPoints) return;
+            RawResidualDebugPoint dbg;
+            dbg.fid = source_feature_id_;
+            dbg.part = partIndex;
+            dbg.pt = pt;
+            dbg.src = src;
+            dbg.weight = edge >= 0 ? weight : 0.0;
+            dbg.assocEdge = edge;
+            debugPoints.push_back(dbg);
+        };
+        const std::size_t smoothCount = static_cast<std::size_t>(
+            std::count_if(smoothAssociations.begin(), smoothAssociations.end(),
+                          [](int edge) { return edge >= 0; }));
+        const std::size_t rawCount = static_cast<std::size_t>(
+            std::count_if(rawAssociations.begin(), rawAssociations.end(),
+                          [](int edge) { return edge >= 0; }));
+        const double rawUnit = kRawResidualWeight / std::max<std::size_t>(rawCount, 1);
+        const double smoothUnit =
+            kSmoothResidualWeight / std::max<std::size_t>(smoothCount, 1);
+        const double unitScale = 1.0 / std::max(rawUnit, smoothUnit);
+        for (std::size_t i = 0; i < smoothSamples.size(); ++i) {
+            appendDebug(smoothSamples[i], 0, smoothUnit * unitScale,
+                        smoothAssociations[i]);
+        }
+        for (std::size_t i = 0; i < rawSamples.size(); ++i) {
+            appendDebug(rawSamples[i], 1, rawUnit * unitScale,
+                        rawAssociations[i]);
+        }
+    }
 
     // ---- 6. Ceres 平差(方向系统角度作为 preferred) ----
     std::vector<double> preferredAngles;
@@ -10337,7 +10782,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     // preserve_topology=true：顶点数固定为链数，禁止删点式预处理
     optimizeWithHardConstraints(
         topologyPolygon, residualCloud, isMultiDirection, preferredAngles,
-        nullptr, true);
+        &fixedEdgeAssignments, true);
     std::vector<pcl::PointXYZ> ceresResult = best_hypothesis;
 
     // ---- 7. Ceres 结果验收 ----
@@ -10387,6 +10832,64 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         std::cerr << "[TopologyAccept] fid=" << source_feature_id_
                   << " source=candidate vertices=" << topologyPolygon.size() << std::endl;
         return topologyPolygon;
+    }
+    // 双轮廓质量对比: 结果边界采样到 raw/smooth 边界的 mean/q90
+    if (rawAccepted && rawRing) {
+        auto distToSegments = [&](const pcl::PointXYZ& pt,
+                                  const std::vector<const std::vector<pcl::PointXYZ>*>& rings) {
+            double best = std::numeric_limits<double>::max();
+            for (const auto* ringPtr : rings) {
+                const auto& seg = *ringPtr;
+                for (std::size_t i = 0; i < seg.size(); ++i) {
+                    const auto& a = seg[i];
+                    const auto& b = seg[(i + 1) % seg.size()];
+                    const double dx = b.x - a.x;
+                    const double dy = b.y - a.y;
+                    const double lenSq = dx * dx + dy * dy;
+                    if (lenSq < 1e-12) continue;
+                    double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+                    t = std::clamp(t, 0.0, 1.0);
+                    const double d = std::hypot(
+                        pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+                    best = std::min(best, d);
+                }
+            }
+            return best;
+        };
+        std::vector<const std::vector<pcl::PointXYZ>*> refRings = {rawRing};
+        std::vector<const std::vector<pcl::PointXYZ>*> smoothRef = {&initialRing};
+        std::vector<double> rawDists, smoothDists;
+        for (std::size_t i = 0; i < ceresResult.size(); ++i) {
+            const auto& p1 = ceresResult[i];
+            const auto& p2 = ceresResult[(i + 1) % ceresResult.size()];
+            const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+            const int steps = std::max(1, static_cast<int>(len / 0.5));
+            for (int k = 0; k < steps; ++k) {
+                pcl::PointXYZ pt;
+                const double t = static_cast<double>(k) / steps;
+                pt.x = static_cast<float>(p1.x + t * (p2.x - p1.x));
+                pt.y = static_cast<float>(p1.y + t * (p2.y - p1.y));
+                rawDists.push_back(distToSegments(pt, refRings));
+                smoothDists.push_back(distToSegments(pt, smoothRef));
+            }
+        }
+        auto statsOf = [](std::vector<double>& v) {
+            std::sort(v.begin(), v.end());
+            return std::make_pair(
+                v.empty() ? 0.0 : v[v.size() / 2],
+                v.empty() ? 0.0 : v[static_cast<std::size_t>(v.size() * 0.9)]);
+        };
+        const auto rs = statsOf(rawDists);
+        const auto ss = statsOf(smoothDists);
+        const double resultArea = std::abs(polygonArea2D(ceresResult));
+        std::cerr << "[DualQuality] fid=" << source_feature_id_
+                  << " part=" << partIndex
+                  << " raw_median=" << rs.first << " raw_q90=" << rs.second
+                  << " smooth_median=" << ss.first << " smooth_q90=" << ss.second
+                  << " area_ratio_raw=" << (resultArea / std::max(rawAreaCached, 1e-6))
+                  << " area_ratio_smooth="
+                  << (resultArea / std::max(std::abs(polygonArea2D(initialRing)), 1e-6))
+                  << std::endl;
     }
     std::cerr << "[TopologyAccept] fid=" << source_feature_id_
               << " source=ceres vertices=" << ceresResult.size()

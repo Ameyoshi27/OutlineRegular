@@ -31,6 +31,8 @@
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Shape_regularization/regularize_contours.h>
 
+class OGRSpatialReference;
+
 //using namespace std;
 //using Kernel_r = CGAL::Exact_predicates_inexact_constructions_kernel;
 //using FT = typename Kernel_r::FT;
@@ -136,12 +138,30 @@ public:
 	};
 	// 拓扑保持规则化主通道：从边链出发(非VDP假设)，稠密残差+线参数Ceres。
 	// partIndex 为环序号(诊断日志标识, 不依赖输出 Shapefile FID)。
+	// rawRing: 与当前部件匹配的平滑前原始像素轮廓环(局部坐标)——
+	// 拓扑/方向仍来自 initialRing, raw 只提供 Ceres 几何残差。
 	std::vector<pcl::PointXYZ> TopologyPreservingRegularize(
 		const std::vector<pcl::PointXYZ>& initialRing,
 		double pixelSize,
 		bool& usedFallback,
 		DirectionContextOut* dirContext = nullptr,
-		int partIndex = 0);
+		int partIndex = 0,
+		const std::vector<pcl::PointXYZ>* rawRing = nullptr);
+	// Last-resort output that still obeys one explicitly selected orthogonal
+	// direction. It is used instead of writing an unregularized ring.
+	bool BuildStrictDirectionalFallback(
+		const std::vector<pcl::PointXYZ>& input,
+		double mainAngle,
+		std::vector<pcl::PointXYZ>& result) const;
+	// 覆盖残差点权重(双残差按 70:30 总权比); 空则用构造时的权重
+	void setResidualWeights(const std::vector<double>& w) {
+		residual_weights_override_ = w;
+	}
+	// 保存双残差调试点(局部坐标 + originOffset)到点 Shapefile
+	static bool SaveRawResidualDebugDump(
+		const std::string& shpPath,
+		const Eigen::Vector3d& originOffset,
+		OGRSpatialReference* spatialRef = nullptr);
 	// 备用结果(VDP等)的质量检查，与拓扑通道同一标准。
 	// 返回空串=通过，否则返回原因。
 	static std::string CheckRingQuality(
@@ -199,6 +219,8 @@ public:
 	double GraphZ;//当前规则化底图的z值
 	pcl::PointCloud<pcl::PointXYZ>::Ptr ransac_inner_cloud;//一个图中所有线段的ransac拟合内点组成的点云，用于垂直优化过程中计算距离误差
 	std::vector<double> support_weights_;
+	// 双残差模式的逐点权重覆盖(空=用 support_weights_)
+	std::vector<double> residual_weights_override_;
 
 	vector<pcl::PointXYZ> original_points;//纠正前的点
 	pcl::PointCloud<pcl::PointXYZ>::Ptr regularzed_points;//纠正后的点
