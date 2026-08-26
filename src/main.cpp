@@ -196,7 +196,7 @@ const int kNarrowNeckMaxCutsPerFeature = 12;
 // Experimental Mask-only branch. It is isolated from the OSGB pipeline and
 // falls back to the existing VDP path whenever topology checks fail.
 constexpr bool kUseTopologyPreservingResidualRegularization = true;
-constexpr bool kMaskCurveDetectionDebugOnly = false;
+constexpr bool kMaskCurveDetectionDebugOnly = true; // 禁用弧检测+恢复, 后续优化后重开
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -4985,9 +4985,11 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
         // ---- Mask-only 局部圆弧检测(所有路径共用) ----
     // 检测在平滑环上确定区间; rawRing 可用时提供拟合支撑;
     // 恢复在各路径的直线候选通过质量检查后执行
-    const auto maskCurves = DetectMaskConicArcs(
-        ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
-        maskPixelSize > 0.0 ? maskPixelSize : 0.3, sourceFid, partIndex);
+    // 弧检测暂停(效果不佳, 后续优化后重开)
+    // const auto maskCurves = DetectMaskConicArcs(
+    // ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
+    // maskPixelSize > 0.0 ? maskPixelSize : 0.3, sourceFid, partIndex);
+    std::vector<MaskConicArc> maskCurves; // 弧暂停: 空占位
 
         if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
