@@ -1,0 +1,75 @@
+// =============================================================
+// DirectionDetector.h
+// 统一主方向检测模块: 在平滑初始轮廓上一次性检测方向系统,
+// 结果作为"真值"传给后续所有简化/平差路径。
+//
+// 设计原则:
+// - 每个建筑环只检测一次, 输出包含所有方向系统
+// - 后续 Ceres 中 θ_base 固定为检测结果, 不再优化
+// - 不设自由边: 每条边必须归入平行或垂直于某个系统
+// =============================================================
+#pragma once
+
+#include <pcl/point_types.h>
+#include <vector>
+#include <string>
+#include <cmath>
+
+// 检测结果: 一个方向系统
+struct DetectedDirectionSystem {
+    double angleRad = 0.0;          // 折叠角 [0, π/2)
+    int chainCount = 0;             // 归入的稳定链数
+    double totalLength = 0.0;       // 稳定链总长(m)
+    double weight = 0.0;            // 加权支持(长度×拟合质量)
+    double meanRmse = 0.0;          // 平均拟合残差
+    double concentration = 0.0;     // 圆集中度(四倍角合向量长度)
+    double extent = 0.0;            // 空间覆盖(bbox对角线)
+    double confidence = 0.0;        // 综合置信度 [0,1]
+};
+
+// 检测结果: 整体
+struct DetectedDirectionResult {
+    bool valid = false;              // 是否有可信方向
+    bool multiDirection = false;    // 是否多方向
+    double primaryAngle = 0.0;      // 主方向折叠角
+    std::vector<DetectedDirectionSystem> systems;
+    // 诊断
+    int totalChains = 0;
+    int stableChains = 0;
+    double totalStableLength = 0.0;
+    double concentration = 0.0;     // 主系统集中度
+    std::string rejectReason;       // 无效时的原因
+
+    // 便捷: 所有系统角度
+    std::vector<double> systemAngles() const {
+        std::vector<double> angles;
+        for (const auto& s : systems) angles.push_back(s.angleRad);
+        return angles;
+    }
+};
+
+// =============================================================
+// 主检测函数
+// 输入:
+//   smoothRing - 平滑后的初始轮廓环(局部坐标)
+//   rawRing    - 原始像素轮廓(可选, 为空则只用平滑环)
+//   pixelSize  - TIF 真实像素尺寸(m)
+//   fid, partIdx - 日志标识
+// 输出:
+//   DetectedDirectionResult
+// =============================================================
+DetectedDirectionResult DetectBuildingDirection(
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>& rawRing,
+    double pixelSize,
+    long long fid = -1,
+    int partIdx = 0);
+
+// =============================================================
+// 辅助: 边到最近方向系统的分配
+// 返回: 系统索引(平行或垂直都算), -1 表示无法分配
+// =============================================================
+int AssignEdgeToDirectionSystem(
+    double edgeAngle,
+    const std::vector<double>& systemAngles,
+    double maxAssignDeg = 20.0);

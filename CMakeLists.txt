@@ -57,6 +57,8 @@ add_executable(outlineRegularTool
     src/PathDialogs.h
     src/MaskVectorizer.cpp
     src/MaskVectorizer.h
+    src/DirectionDetector.cpp
+    src/DirectionDetector.h
     src/outlineRegular.cpp
     src/outlineRegular.h
     src/modularFunction.cpp

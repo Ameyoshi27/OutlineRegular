@@ -29,6 +29,7 @@
  * 以及 CGAL 轮廓规则化封装等。
  * ==================================================================== */
 #include "outlineRegular.h"
+#include "DirectionDetector.h"
 #include <pcl/io/vtk_io.h>
 #include <pcl/common/angles.h>
 #include <pcl/common/distances.h>
@@ -8560,7 +8561,11 @@ void outlineRegular::optimizeWithHardConstraints(
         std::vector<double> initial_base_thetas = base_thetas;
         for (size_t k = 0; k < base_thetas.size(); ++k) {
             problem.AddParameterBlock(&base_thetas[k], 1);
-            problem.AddResidualBlock(ParameterRegularizer::Create(initial_base_thetas[k], 0.5), nullptr, &base_thetas[k]);
+            // θ_base 视为检测真值: 高权重锚定, 数据点不能随意旋转方向
+            // (旧值0.5被几百个数据点覆盖, 导致方向漂移)
+            problem.AddResidualBlock(
+                ParameterRegularizer::Create(initial_base_thetas[k], 50.0),
+                nullptr, &base_thetas[k]);
         }
 
         std::vector<double> initial_thetas(n);
@@ -10538,7 +10543,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     bool& usedFallback,
     DirectionContextOut* dirContext,
     int partIndex,
-    const std::vector<pcl::PointXYZ>* rawRing)
+    const std::vector<pcl::PointXYZ>* rawRing,
+    const void* detectedDirection)
 {
     usedFallback = false;
     if (initialRing.size() < 6) {
@@ -10665,11 +10671,70 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     }
 
     // ---- 2. 方向系统判定(两阶段聚类+加权KDE, 单次调用统一用于
-    //      方向决策/格网吸附/DirectionContextOut/日志) ----
-    // mask-only 无 OSGB 墙面证据(supportCloud 传空); 判定综合:
-    // 支持链总长度(权重占比)/拟合残差(conf 内 fitFactor)/
-    // 模型改善幅度(评分增益)/空间范围(systems.extent)。
-    const auto dirBuild = BuildDirectionSystems(allChains, fitTolerance, nullptr);
+    // ---- 2. 方向系统判定(统一检测传入 或 内部检测) ----
+    // 如果外部传入了统一检测结果(DetectedDirectionResult), 直接使用,
+    // 不再调用 BuildDirectionSystems —— 方向是真值, 后续不再修改
+    DirectionSystemBuild dirBuild;
+    const bool hasExternalDirection = detectedDirection != nullptr;
+    if (hasExternalDirection) {
+        const auto* ext = static_cast<const DetectedDirectionResult*>(detectedDirection);
+        if (ext->valid && !ext->systems.empty()) {
+            // 用外部检测结果填充 dirBuild
+            for (const auto& sys : ext->systems) {
+                DirectionSystemDiag ds;
+                ds.angleRad = sys.angleRad;
+                ds.chainCount = sys.chainCount;
+                ds.totalLength = sys.totalLength;
+                ds.weight = sys.weight;
+                ds.meanRmse = sys.meanRmse;
+                ds.concentration = sys.concentration;
+                ds.confidence = sys.confidence;
+                dirBuild.systems.push_back(ds);
+            }
+            dirBuild.directionCertain = true;
+            dirBuild.multiDirection = ext->multiDirection;
+            dirBuild.totalStableLength = ext->totalStableLength;
+            // 链的归组: 就近分配
+            const double assignTol = 16.0 * M_PI / 180.0;
+            for (std::size_t i = 0; i < allChains.size(); ++i) {
+                if (!allChains[i].isShort) {
+                    int best = -1;
+                    double bestD = assignTol;
+                    for (std::size_t s = 0; s < dirBuild.systems.size(); ++s) {
+                        const double d = foldedAngleDistance90(
+                            allChains[i].angleRad, dirBuild.systems[s].angleRad);
+                        if (d < bestD) { bestD = d; best = (int)s; }
+                    }
+                    // 外部检测: 所有链必须归组(无自由边)
+                    if (best < 0 && dirBuild.systems.size() > 0) {
+                        // 强制归入最近的系统
+                        best = 0;
+                        bestD = 1e9;
+                        for (std::size_t s = 0; s < dirBuild.systems.size(); ++s) {
+                            const double d = foldedAngleDistance90(
+                                allChains[i].angleRad, dirBuild.systems[s].angleRad);
+                            if (d < bestD) { bestD = d; best = (int)s; }
+                        }
+                    }
+                    dirBuild.chainInfo.resize(allChains.size());
+                    dirBuild.chainInfo[i].system = best;
+                    dirBuild.chainInfo[i].stable = !allChains[i].isShort;
+                }
+            }
+            dirBuild.chainInfo.resize(allChains.size());
+            for (std::size_t i = 0; i < allChains.size(); ++i) {
+                dirBuild.chainInfo[i].stable = !allChains[i].isShort;
+            }
+            std::cerr << "[DirectionApply] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " source=external(unified)" << std::endl;
+        } else {
+            // 外部检测不可信 → 退回内部检测
+            dirBuild = BuildDirectionSystems(allChains, fitTolerance, nullptr);
+        }
+    } else {
+        dirBuild = BuildDirectionSystems(allChains, fitTolerance, nullptr);
+    }
     const bool isMultiDirection = dirBuild.directionCertain && dirBuild.multiDirection;
 
     // 统一诊断/应用日志(与实际使用的 DirectionSystemBuild 同源,

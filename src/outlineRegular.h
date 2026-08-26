@@ -168,13 +168,16 @@ public:
 	// partIndex 为环序号(诊断日志标识, 不依赖输出 Shapefile FID)。
 	// rawRing: 与当前部件匹配的平滑前原始像素轮廓环(局部坐标)——
 	// 拓扑/方向仍来自 initialRing, raw 只提供 Ceres 几何残差。
+	// 前向声明(在 DirectionDetector.h 中定义)
+
 	std::vector<pcl::PointXYZ> TopologyPreservingRegularize(
 		const std::vector<pcl::PointXYZ>& initialRing,
 		double pixelSize,
 		bool& usedFallback,
 		DirectionContextOut* dirContext = nullptr,
 		int partIndex = 0,
-		const std::vector<pcl::PointXYZ>* rawRing = nullptr);
+		const std::vector<pcl::PointXYZ>* rawRing = nullptr,
+		const void* detectedDirection = nullptr); // DetectedDirectionResult* (void* 避免头文件依赖)
 	// Last-resort output that still obeys one explicitly selected orthogonal
 	// direction. It is used instead of writing an unregularized ring.
 	bool BuildStrictDirectionalFallback(
