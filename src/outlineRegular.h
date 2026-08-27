@@ -178,12 +178,17 @@ public:
 		int partIndex = 0,
 		const std::vector<pcl::PointXYZ>* rawRing = nullptr,
 		const void* detectedDirection = nullptr); // DetectedDirectionResult* (void* 避免头文件依赖)
-	// Last-resort output that still obeys one explicitly selected orthogonal
-	// direction. It is used instead of writing an unregularized ring.
-	bool BuildStrictDirectionalFallback(
-		const std::vector<pcl::PointXYZ>& input,
-		double mainAngle,
-		std::vector<pcl::PointXYZ>& result) const;
+		// Last-resort output that still obeys one explicitly selected orthogonal
+		// direction. It is used instead of writing an unregularized ring.
+		// 多方向骨架: 仅 multiDirection=true 且 systemAngles>=2(生效系统,
+		// 已门控)时启用; 构造后按 initialRing 全量验收, 失败退单方向。
+		bool BuildStrictDirectionalFallback(
+			const std::vector<pcl::PointXYZ>& input,
+			const std::vector<pcl::PointXYZ>& initialRing,
+			double mainAngle,
+			std::vector<pcl::PointXYZ>& result,
+			const std::vector<double>* systemAngles = nullptr,
+			bool multiDirection = false) const;
 	// Mask-only 局部圆弧检测(在平滑环上搜索, raw提供支撑)
 	struct MaskConicArc;
 	static std::vector<MaskConicArc> DetectMaskConicArcs(
@@ -228,6 +233,12 @@ public:
 		const std::vector<pcl::PointXYZ>& poly);
 	void setSupportDirectionHint(double angle, double peakRatio, std::size_t pairCount);
 	void setSourceFeatureId(long long fid) { source_feature_id_ = fid; }
+	// 统一方向注入(Mask-only): regular_Contour(VDP) 不再执行
+	// 链证据/系统检测/墙证据的旧方向判定, 单/多方向与系统角
+	// 全部以此为准(生效系统: multiDirection ? 全部 : 仅主系统)。
+	// 未注入时(OSGB 原流程)保留旧检测逻辑。
+	void setUnifiedDirection(const void* detectedDirection); // DetectedDirectionResult*
+	bool hasUnifiedDirection() const { return has_unified_direction_; }
 // Mask-only 模式关闭曲线恢复：无正射证据仲裁时，
 // 曲线检测器会把栅格楼梯拟合成伪曲线。
 	void setCurveRestorationEnabled(bool enabled) { curve_restoration_enabled_ = enabled; }
@@ -342,6 +353,13 @@ private:
 	std::size_t support_direction_pair_count_ = 0;
 	long long source_feature_id_ = -1;   // for [HypothesisRepair] logging only
 	bool curve_restoration_enabled_ = true;
+	// 统一方向上下文(Mask-only): 非拥有指针语义, 存扁平副本避免
+	// 头文件依赖。regular_Contour 消费后由 clearUnifiedDirection
+	// 或析构重置。
+	bool has_unified_direction_ = false;
+	bool unified_multi_direction_ = false;
+	std::size_t unified_candidate_system_count_ = 0;
+	std::vector<double> unified_system_angles_; // 生效系统角(已按 multi 门控)
 
 	double computeAdaptiveLambda(double resolution, const std::vector<pcl::PointXYZ>& points);
 

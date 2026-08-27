@@ -1,6 +1,19 @@
 // =============================================================
 // DirectionDetector.cpp
 // Unified building direction detector for topology, VDP and fallback paths.
+//
+// 核心估计器: 边链化 + 长度加权圆环 KDE + 峰检测(众数)。
+// 设计动机(替代早期贪心种子聚类 + 圆均值):
+// - 链化恢复空间连续性: 平滑环上斜墙是方向渐变的短边串,
+//   逐边投票会在角度空间被摊薄, 而精确对齐栅格轴的楼梯边
+//   高度集中, 密度峰被伪方向占据。以链为单位投票(链角=端点
+//   向量)恢复墙体的真实长度话语权;
+// - 峰位置=众数, 不被归组进来的异质边拉偏(均值污染);
+// - 软密度贡献替代硬归组, 弥散证据不再触发整体拒绝;
+// - 短链以 len^1.5 降权参与而非被排除, 第二方向的结构
+//   证据不再丢失;
+// - 锯齿伪方向在密度上是低而宽的隆起, 被 prominence 准入
+//   自然过滤, 不依赖链数/份额组合阈值。
 // =============================================================
 #include "DirectionDetector.h"
 
@@ -11,16 +24,24 @@
 
 namespace {
 
-constexpr double kSystemMinSeparationDeg = 20.0;
-constexpr double kAssignDeg = 16.0;
-constexpr double kLongRescueDeg = 20.0;
-constexpr double kMergeDeg = 14.0;
-constexpr int kMaxCandidates = 7;
+// ---- 核心参数(物理意义明确, 不随数据集漂移) ----
+constexpr double kKdeBandwidthDeg = 5.0;       // 墙体方向自然散布量级
+constexpr double kLenExponent = 1.5;           // 长边主导, 短边保留贡献
+constexpr double kPeakProminenceRatio = 0.12;  // 次峰至少高出鞍部 12% 主峰高度
+constexpr double kMinPeakSeparationDeg = 10.0; // 更近的方向在像素尺度不可分
 constexpr int kMaxFinalSystems = 5;
-constexpr double kSystemMinChainFrac = 0.15;
-constexpr double kSeedMinLength = 3.0;
-constexpr double kCertaintyConf = 0.15;
-constexpr double kUnassignedHighRatio = 0.10;
+// ---- 候选峰 → 生效方向的判据 ----
+// weightShare: len^指数权重对长边超线性放大, 短而真实的墙体在权重上吃亏
+// lengthShare: 候选系统之间的实际墙长占比, 物理支撑的直接度量
+// minPhysicalLength: 低于该墙长的方向不约束规则化(绝对量 + 周长比例)
+// 不使用 chainCount(累计的是链内原始边数, 语义不是独立链数)
+constexpr double kActiveSystemMinWeightShare = 0.12;
+constexpr double kActiveSystemMinLengthShare = 0.18;
+constexpr double kActiveSystemMinLengthMeters = 6.0;
+constexpr double kActiveSystemMinPerimeterShare = 0.08;
+constexpr double kChainMergeTurnDeg = 25.0;    // 链内相邻边最大转向
+
+constexpr int kKdeBins = 360;                  // 折叠空间 [0°,90°), 0.25°/格
 
 double foldedAngle90(double angle) {
     angle = std::fmod(angle, M_PI / 2.0);
@@ -34,153 +55,130 @@ double foldedDistance90(double a, double b) {
     return std::min(difference, period - difference);
 }
 
-double circularMean90(const std::vector<double>& angles,
-                      const std::vector<double>& weights) {
-    if (angles.empty()) return 0.0;
-    double x = 0.0;
-    double y = 0.0;
-    double total = 0.0;
-    for (std::size_t i = 0; i < angles.size(); ++i) {
-        const double weight = i < weights.size() ? weights[i] : 1.0;
-        x += weight * std::cos(4.0 * angles[i]);
-        y += weight * std::sin(4.0 * angles[i]);
-        total += weight;
-    }
-    if (total <= 1e-9 || x * x + y * y <= 1e-12 * total * total) {
-        return angles.front();
-    }
-    return foldedAngle90(0.25 * std::atan2(y, x));
-}
-
-double pointSegmentDistance2D(const pcl::PointXYZ& point,
-                              const pcl::PointXYZ& first,
-                              const pcl::PointXYZ& last) {
-    const double dx = last.x - first.x;
-    const double dy = last.y - first.y;
-    const double lengthSquared = dx * dx + dy * dy;
-    if (lengthSquared <= 1e-12) {
-        return std::hypot(point.x - first.x, point.y - first.y);
-    }
-    const double t = std::clamp(
-        ((point.x - first.x) * dx + (point.y - first.y) * dy) / lengthSquared,
-        0.0, 1.0);
-    return std::hypot(point.x - first.x - t * dx, point.y - first.y - t * dy);
-}
-
-std::vector<pcl::PointXYZ> simplifyOpenPolylineDP(
-    const std::vector<pcl::PointXYZ>& points, double tolerance) {
-    if (points.size() < 3) return points;
-    std::vector<bool> keep(points.size(), false);
-    keep.front() = true;
-    keep.back() = true;
-    std::vector<std::pair<std::size_t, std::size_t>> pending;
-    pending.emplace_back(0, points.size() - 1);
-    while (!pending.empty()) {
-        const auto [first, last] = pending.back();
-        pending.pop_back();
-        double maxDistance = 0.0;
-        std::size_t split = first;
-        for (std::size_t i = first + 1; i < last; ++i) {
-            const double distance = pointSegmentDistance2D(
-                points[i], points[first], points[last]);
-            if (distance > maxDistance) {
-                maxDistance = distance;
-                split = i;
-            }
-        }
-        if (maxDistance > tolerance) {
-            keep[split] = true;
-            pending.emplace_back(first, split);
-            pending.emplace_back(split, last);
-        }
-    }
-    std::vector<pcl::PointXYZ> simplified;
-    simplified.reserve(points.size());
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        if (keep[i]) simplified.push_back(points[i]);
-    }
-    return simplified;
-}
-
-std::vector<pcl::PointXYZ> simplifyClosedRingDP(
-    const std::vector<pcl::PointXYZ>& ring, double tolerance) {
-    if (ring.size() < 4) return ring;
-
-    std::size_t anchor = 1;
-    double maxDistanceSquared = 0.0;
-    for (std::size_t i = 1; i < ring.size(); ++i) {
-        const double dx = ring[i].x - ring.front().x;
-        const double dy = ring[i].y - ring.front().y;
-        const double distanceSquared = dx * dx + dy * dy;
-        if (distanceSquared > maxDistanceSquared) {
-            maxDistanceSquared = distanceSquared;
-            anchor = i;
-        }
-    }
-    if (maxDistanceSquared <= 1e-12) return ring;
-
-    std::vector<pcl::PointXYZ> firstPath(ring.begin(), ring.begin() + anchor + 1);
-    std::vector<pcl::PointXYZ> secondPath;
-    secondPath.reserve(ring.size() - anchor + 1);
-    secondPath.insert(secondPath.end(), ring.begin() + anchor, ring.end());
-    secondPath.push_back(ring.front());
-
-    firstPath = simplifyOpenPolylineDP(firstPath, tolerance);
-    secondPath = simplifyOpenPolylineDP(secondPath, tolerance);
-
-    std::vector<pcl::PointXYZ> simplified = firstPath;
-    if (secondPath.size() > 2) {
-        simplified.insert(simplified.end(), secondPath.begin() + 1,
-                          secondPath.end() - 1);
-    }
-    return simplified.size() >= 3 ? simplified : ring;
+double wrappedTurn(double a, double b) {
+    double turn = std::abs(a - b);
+    if (turn > M_PI) turn = 2.0 * M_PI - turn;
+    return turn;
 }
 
 struct DetChain {
-    double angleRad = 0.0;
+    double angleRad = 0.0;  // 折叠角 [0, π/2)
     double length = 0.0;
-    double weight = 0.0;
-    bool stable = false;
+    double weight = 0.0;    // length^kLenExponent
+    int edgeCount = 0;
 };
 
-struct SystemStats {
-    double angleRad = 0.0;
-    double length = 0.0;
-    double weight = 0.0;
-    double concentration = 0.0;
-    int chainCount = 0;
-};
-
-std::vector<SystemStats> summarizeSystems(
-    const std::vector<DetChain>& chains,
-    const std::vector<int>& assignment,
-    std::vector<double>& systemAngles) {
-    std::vector<SystemStats> stats(systemAngles.size());
-    for (std::size_t s = 0; s < systemAngles.size(); ++s) {
-        std::vector<double> angles;
-        std::vector<double> weights;
-        for (std::size_t i = 0; i < chains.size(); ++i) {
-            if (!chains[i].stable || assignment[i] != static_cast<int>(s)) continue;
-            angles.push_back(chains[i].angleRad);
-            weights.push_back(chains[i].weight);
-            stats[s].length += chains[i].length;
-            stats[s].weight += chains[i].weight;
-            ++stats[s].chainCount;
-        }
-        stats[s].angleRad = systemAngles[s];
-        if (angles.empty()) continue;
-        stats[s].angleRad = circularMean90(angles, weights);
-        systemAngles[s] = stats[s].angleRad;
-        double x = 0.0;
-        double y = 0.0;
-        for (std::size_t i = 0; i < angles.size(); ++i) {
-            x += weights[i] * std::cos(4.0 * angles[i]);
-            y += weights[i] * std::sin(4.0 * angles[i]);
-        }
-        stats[s].concentration = stats[s].weight > 1e-9
-            ? std::hypot(x, y) / stats[s].weight : 0.0;
+// ---- 边链化: 空间连续且转向平缓的边合并成链, 链角=端点向量 ----
+std::vector<DetChain> buildChainsFromRing(
+    const std::vector<pcl::PointXYZ>& ring, double pixelSize) {
+    struct RingEdge {
+        double dirRad = 0.0;   // 有向角 [-π, π)
+        double length = 0.0;
+        std::size_t from = 0;
+        std::size_t to = 0;
+    };
+    std::vector<RingEdge> edgeList;
+    edgeList.reserve(ring.size());
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& first = ring[i];
+        const auto& last = ring[(i + 1) % ring.size()];
+        const double length = std::hypot(last.x - first.x, last.y - first.y);
+        if (length < 1e-6) continue;
+        RingEdge edge;
+        edge.dirRad = std::atan2(last.y - first.y, last.x - first.x);
+        edge.length = length;
+        edge.from = i;
+        edge.to = (i + 1) % ring.size();
+        edgeList.push_back(edge);
     }
-    return stats;
+    if (edgeList.empty()) return {};
+
+    // 环遍历起点选在转向最大处, 避免一条链被首尾切断
+    std::size_t startEdge = 0;
+    double maxTurn = -1.0;
+    for (std::size_t i = 0; i < edgeList.size(); ++i) {
+        const std::size_t j = (i + 1) % edgeList.size();
+        const double turn = wrappedTurn(edgeList[j].dirRad, edgeList[i].dirRad);
+        if (turn > maxTurn) {
+            maxTurn = turn;
+            startEdge = j;
+        }
+    }
+
+    const double mergeTurn = kChainMergeTurnDeg * M_PI / 180.0;
+    const double minChainLength = std::max(1.0, 2.0 * pixelSize);
+    std::vector<DetChain> chains;
+    std::size_t chainFromVertex = 0;
+    double chainDir = 0.0;
+    double chainLen = 0.0;
+    int chainEdges = 0;
+    const auto closeChain = [&](std::size_t endVertex) {
+        if (chainEdges == 0) return;
+        const auto& a = ring[chainFromVertex];
+        const auto& b = ring[endVertex];
+        const double spanX = b.x - a.x;
+        const double spanY = b.y - a.y;
+        if (std::hypot(spanX, spanY) > 1e-6 && chainLen >= minChainLength) {
+            DetChain chain;
+            chain.angleRad = foldedAngle90(std::atan2(spanY, spanX));
+            chain.length = chainLen;
+            chain.weight = std::pow(chainLen, kLenExponent);
+            chain.edgeCount = chainEdges;
+            chains.push_back(chain);
+        }
+        chainEdges = 0;
+    };
+
+    for (std::size_t step = 0; step < edgeList.size(); ++step) {
+        const std::size_t idx = (startEdge + step) % edgeList.size();
+        const auto& edge = edgeList[idx];
+        if (chainEdges == 0) {
+            chainFromVertex = edge.from;
+            chainDir = edge.dirRad;
+            chainLen = edge.length;
+            chainEdges = 1;
+            continue;
+        }
+        if (wrappedTurn(edge.dirRad, chainDir) < mergeTurn) {
+            chainDir = std::atan2(
+                std::sin(chainDir) * chainLen + std::sin(edge.dirRad) * edge.length,
+                std::cos(chainDir) * chainLen + std::cos(edge.dirRad) * edge.length);
+            chainLen += edge.length;
+            ++chainEdges;
+        } else {
+            closeChain(edge.from);  // 链终点 = 上一边终点 = 新边起点
+            chainFromVertex = edge.from;
+            chainDir = edge.dirRad;
+            chainLen = edge.length;
+            chainEdges = 1;
+        }
+    }
+    // 收尾: 最后一条链的终点 = 第一条链的起点
+    if (chainEdges > 0) {
+        closeChain(edgeList[startEdge].from);
+    }
+    return chains;
+}
+
+// 环形域上格点 idx 的 prominence: 两侧各走到第一个更高格点,
+// 每侧取路径最低点, prominence = h - max(两侧最低点)。
+// 全局最高峰两侧绕一整圈, 退化为 h - 全局最小。
+double circularProminence(const std::vector<double>& density,
+                          std::size_t idx) {
+    const std::size_t n = density.size();
+    const double height = density[idx];
+    double pathMin[2] = {height, height};
+    int side = 0;
+    for (int direction : {-1, 1}) {
+        for (std::size_t step = 1; step < n; ++step) {
+            const std::size_t j =
+                (idx + n + direction * static_cast<int>(step)) % n;
+            pathMin[side] = std::min(pathMin[side], density[j]);
+            if (density[j] > height) break;
+        }
+        ++side;
+    }
+    return height - std::max(pathMin[0], pathMin[1]);
 }
 
 } // namespace
@@ -198,208 +196,218 @@ DetectedDirectionResult DetectBuildingDirection(
         return result;
     }
 
-    const double dpTolerance = std::max(2.0 * pixelSize, 0.5);
-    const std::vector<pcl::PointXYZ> simplified =
-        simplifyClosedRingDP(smoothRing, dpTolerance);
-    const std::vector<pcl::PointXYZ>& workingRing =
-        simplified.size() >= 3 ? simplified : smoothRing;
-
-    std::vector<DetChain> chains;
-    chains.reserve(workingRing.size());
-    double totalPerimeter = 0.0;
-    for (std::size_t i = 0; i < workingRing.size(); ++i) {
-        const auto& first = workingRing[i];
-        const auto& last = workingRing[(i + 1) % workingRing.size()];
-        const double length = std::hypot(last.x - first.x, last.y - first.y);
-        if (length < 0.1) continue;
-        chains.push_back({
-            foldedAngle90(std::atan2(last.y - first.y, last.x - first.x)),
-            length, length, false});
-        totalPerimeter += length;
-    }
+    // ---- 链化: 恢复墙体的空间连续性 ----
+    const std::vector<DetChain> chains =
+        buildChainsFromRing(smoothRing, pixelSize);
     if (chains.empty()) {
         result.rejectReason = "no_valid_edges";
         return result;
     }
-
-    const double stableMinLength = std::max(0.5, 0.02 * totalPerimeter);
-    for (auto& chain : chains) chain.stable = chain.length >= stableMinLength;
-    if (std::none_of(chains.begin(), chains.end(),
-                     [](const DetChain& chain) { return chain.stable; })) {
-        for (auto& chain : chains) chain.stable = true;
-    }
-
-    result.totalChains = static_cast<int>(chains.size());
+    double totalPerimeter = 0.0;
+    double totalWeight = 0.0;
+    int totalEdges = 0;
     for (const auto& chain : chains) {
-        if (chain.stable) {
-            ++result.stableChains;
-            result.totalStableLength += chain.length;
+        totalPerimeter += chain.length;
+        totalWeight += chain.weight;
+        totalEdges += chain.edgeCount;
+    }
+    result.totalChains = totalEdges;
+    result.stableChains = static_cast<int>(chains.size());
+    result.totalStableLength = totalPerimeter;
+
+    // ---- 变带宽长度加权圆环 KDE(样本=链) ----
+    // 每条链的方向不确定度由像素分辨率与链长决定:
+    // σ_i = 2·atan(pixelSize/len), 长边是窄而可靠的方向证据,
+    // 短边是宽而模糊的证据。统一带宽会把长边的窄峰摊薄,
+    // 让精确对齐栅格轴的边(测量偏差系统性地小)虚假占优。
+    const double binStep = (M_PI / 2.0) / kKdeBins;
+    const double sigmaMin = 2.0 * M_PI / 180.0;
+    const double sigmaMax = 12.0 * M_PI / 180.0;
+    const int maxCutoffBins =
+        static_cast<int>(4.0 * sigmaMax / binStep) + 1;
+
+    std::vector<double> density(kKdeBins, 0.0);
+    for (const auto& chain : chains) {
+        const double sigma = std::clamp(
+            2.0 * std::atan2(pixelSize, chain.length), sigmaMin, sigmaMax);
+        const double invTwoSigmaSq = 1.0 / (2.0 * sigma * sigma);
+        const int cutoffBins = std::min(
+            maxCutoffBins, static_cast<int>(4.0 * sigma / binStep) + 1);
+        const int center = static_cast<int>(chain.angleRad / binStep);
+        for (int offset = -cutoffBins; offset <= cutoffBins; ++offset) {
+            const int bin = ((center + offset) % kKdeBins + kKdeBins) % kKdeBins;
+            const double delta = offset * binStep;
+            density[bin] += chain.weight * std::exp(-delta * delta * invTwoSigmaSq);
         }
     }
-
-    std::vector<std::size_t> sortedStable;
-    for (std::size_t i = 0; i < chains.size(); ++i) {
-        if (chains[i].stable) sortedStable.push_back(i);
-    }
-    std::sort(sortedStable.begin(), sortedStable.end(),
-              [&](std::size_t a, std::size_t b) {
-                  return chains[a].weight > chains[b].weight;
-              });
-
-    const double minSeparation = kSystemMinSeparationDeg * M_PI / 180.0;
-    std::vector<double> systemAngles;
-    for (std::size_t index : sortedStable) {
-        if (static_cast<int>(systemAngles.size()) >= kMaxCandidates) break;
-        const double candidate = chains[index].angleRad;
-        const bool nearExisting = std::any_of(
-            systemAngles.begin(), systemAngles.end(), [&](double angle) {
-                return foldedDistance90(candidate, angle) < minSeparation;
-            });
-        if (!nearExisting) systemAngles.push_back(candidate);
-    }
-    if (systemAngles.empty()) {
-        result.rejectReason = "no_seeds";
-        return result;
+    if (totalWeight > 1e-9) {
+        for (auto& value : density) value /= totalWeight;
     }
 
-    std::vector<int> assignment(chains.size(), -1);
-    auto assignStable = [&]() {
-        std::fill(assignment.begin(), assignment.end(), -1);
-        if (systemAngles.empty()) return;
-        const double assignLimit = kAssignDeg * M_PI / 180.0;
-        const double rescueLimit = kLongRescueDeg * M_PI / 180.0;
-        for (std::size_t i = 0; i < chains.size(); ++i) {
-            if (!chains[i].stable) continue;
-            std::size_t nearest = 0;
-            double distance = foldedDistance90(chains[i].angleRad, systemAngles[0]);
-            for (std::size_t s = 1; s < systemAngles.size(); ++s) {
-                const double candidate = foldedDistance90(
-                    chains[i].angleRad, systemAngles[s]);
-                if (candidate < distance) {
-                    nearest = s;
-                    distance = candidate;
-                }
-            }
-            if (distance <= assignLimit ||
-                (chains[i].length >= kSeedMinLength && distance <= rescueLimit)) {
-                assignment[i] = static_cast<int>(nearest);
-            }
-        }
+    // ---- 峰检测: 局部极大 → prominence 准入 → 间隔过滤 ----
+    struct Peak {
+        std::size_t bin = 0;
+        double height = 0.0;
+        double prominence = 0.0;
+        double angleRad = 0.0;  // 抛物线插值后的峰位置
     };
-
-    std::vector<SystemStats> stats;
-    for (int iteration = 0; iteration < 3; ++iteration) {
-        assignStable();
-        stats = summarizeSystems(chains, assignment, systemAngles);
-        std::vector<double> keptAngles;
-        for (const auto& system : stats) {
-            const bool credible = system.chainCount >= 2
-                ? system.length >= kSystemMinChainFrac * result.totalStableLength
-                : system.length >= std::max(
-                    5.0 * kSeedMinLength, 0.10 * totalPerimeter);
-            if (credible) keptAngles.push_back(system.angleRad);
-        }
-        if (keptAngles.size() == systemAngles.size()) break;
-        systemAngles.swap(keptAngles);
-        if (systemAngles.empty()) {
-            result.rejectReason = "no_credible_systems";
-            return result;
+    std::vector<Peak> peaks;
+    for (std::size_t b = 0; b < kKdeBins; ++b) {
+        const double prev = density[(b + kKdeBins - 1) % kKdeBins];
+        const double next = density[(b + 1) % kKdeBins];
+        if (density[b] > prev && density[b] >= next && density[b] > 1e-12) {
+            Peak peak;
+            peak.bin = b;
+            peak.height = density[b];
+            peaks.push_back(peak);
         }
     }
-
-    for (;;) {
-        assignStable();
-        stats = summarizeSystems(chains, assignment, systemAngles);
-        if (systemAngles.size() < 2) break;
-        std::size_t first = 0;
-        std::size_t second = 1;
-        double nearestDistance = std::numeric_limits<double>::max();
-        for (std::size_t i = 0; i < systemAngles.size(); ++i) {
-            for (std::size_t j = i + 1; j < systemAngles.size(); ++j) {
-                const double distance = foldedDistance90(
-                    systemAngles[i], systemAngles[j]);
-                if (distance < nearestDistance) {
-                    nearestDistance = distance;
-                    first = i;
-                    second = j;
-                }
-            }
-        }
-        if (nearestDistance >= kMergeDeg * M_PI / 180.0) break;
-        const std::size_t remove = stats[first].weight < stats[second].weight
-            ? first : second;
-        systemAngles.erase(systemAngles.begin() + remove);
+    if (peaks.empty()) {
+        const auto maxIt = std::max_element(density.begin(), density.end());
+        Peak peak;
+        peak.bin = static_cast<std::size_t>(maxIt - density.begin());
+        peak.height = *maxIt;
+        peaks.push_back(peak);
     }
-
-    assignStable();
-    stats = summarizeSystems(chains, assignment, systemAngles);
-    std::sort(stats.begin(), stats.end(), [](const SystemStats& a,
-                                             const SystemStats& b) {
-        return a.weight > b.weight;
+    std::sort(peaks.begin(), peaks.end(), [](const Peak& a, const Peak& b) {
+        return a.height > b.height;
     });
 
-    double totalWeight = 0.0;
-    double unassignedLength = 0.0;
-    double unassignedWeight = 0.0;
-    for (std::size_t i = 0; i < chains.size(); ++i) {
-        if (!chains[i].stable) continue;
-        totalWeight += chains[i].weight;
-        if (assignment[i] < 0 && chains[i].length >= kSeedMinLength) {
-            unassignedLength += chains[i].length;
-            unassignedWeight += chains[i].weight;
+    if (fid >= 0) {  // 密度诊断: 前 6 个局部极大(角度/高度)
+        std::cerr << "[DirectionKde] fid=" << fid << " part=" << partIdx
+                  << " chains=" << chains.size();
+        for (std::size_t i = 0; i < peaks.size() && i < 6; ++i) {
+            std::cerr << " max" << i << "="
+                      << peaks[i].bin * binStep * 180.0 / M_PI
+                      << "deg/h=" << peaks[i].height;
         }
+        std::cerr << std::endl;
     }
 
-    for (std::size_t i = 0; i < stats.size() &&
-                            static_cast<int>(i) < kMaxFinalSystems; ++i) {
+    const double mainHeight = peaks.front().height;
+    const double minSeparation = kMinPeakSeparationDeg * M_PI / 180.0;
+    std::vector<Peak> accepted;
+    for (auto& peak : peaks) {
+        if (static_cast<int>(accepted.size()) >= kMaxFinalSystems) break;
+        peak.prominence = circularProminence(density, peak.bin);
+        if (!accepted.empty() &&
+            peak.prominence < kPeakProminenceRatio * mainHeight) {
+            continue;
+        }
+        // 抛物线插值细化峰位置
+        const double left = density[(peak.bin + kKdeBins - 1) % kKdeBins];
+        const double right = density[(peak.bin + 1) % kKdeBins];
+        const double center = density[peak.bin];
+        const double denom = left - 2.0 * center + right;
+        const double shift = std::abs(denom) > 1e-15
+            ? 0.5 * (left - right) / denom : 0.0;
+        peak.angleRad = foldedAngle90(
+            (static_cast<double>(peak.bin) + std::clamp(shift, -1.0, 1.0))
+            * binStep);
+        bool tooClose = false;
+        for (const auto& kept : accepted) {
+            if (foldedDistance90(peak.angleRad, kept.angleRad) < minSeparation) {
+                tooClose = true;
+                break;
+            }
+        }
+        if (!tooClose) accepted.push_back(peak);
+    }
+
+    // ---- 每峰统计: ±1 统计窗口内的链(软归属的统计近似) ----
+    const double statWindow = kKdeBandwidthDeg * M_PI / 180.0;
+    for (const auto& peak : accepted) {
         DetectedDirectionSystem system;
-        system.angleRad = stats[i].angleRad;
-        system.chainCount = stats[i].chainCount;
-        system.totalLength = stats[i].length;
-        system.weight = stats[i].weight;
-        system.concentration = stats[i].concentration;
-        const double share = totalWeight > 1e-9 ? system.weight / totalWeight : 0.0;
+        system.angleRad = peak.angleRad;
+        system.prominence = mainHeight > 1e-12
+            ? peak.prominence / mainHeight : 0.0;
+        double x4 = 0.0, y4 = 0.0;
+        for (const auto& chain : chains) {
+            if (foldedDistance90(chain.angleRad, peak.angleRad) > statWindow) continue;
+            system.totalLength += chain.length;
+            system.weight += chain.weight;
+            system.avgEdgeLen += chain.length;
+            system.chainCount += chain.edgeCount;
+            x4 += chain.weight * std::cos(4.0 * chain.angleRad);
+            y4 += chain.weight * std::sin(4.0 * chain.angleRad);
+        }
+        if (system.chainCount > 0) {
+            system.avgEdgeLen /= system.chainCount;
+        }
+        system.concentration = system.weight > 1e-9
+            ? std::hypot(x4, y4) / system.weight : 0.0;
+        const double share = totalWeight > 1e-9
+            ? system.weight / totalWeight : 0.0;
         system.confidence = std::min(1.0, share * system.concentration);
         result.systems.push_back(system);
     }
-    if (result.systems.empty()) {
-        result.rejectReason = "no_credible_systems";
-        return result;
+
+    // ---- 候选峰 → 生效方向: 逐峰独立裁决 ----
+    // 主峰恒生效; 其余峰需足够物理墙长 且(权重份额或墙长份额达标)。
+    // multiDirection 是派生状态(active 数量), 不再由固定 systems[1]
+    // 的权重份额决定, 也不因 multi=true 放行全部弱候选。
+    double candidateLengthSum = 0.0;
+    for (const auto& system : result.systems) {
+        candidateLengthSum += system.totalLength;
+    }
+    const double minPhysicalLength = std::max(
+        kActiveSystemMinLengthMeters,
+        kActiveSystemMinPerimeterShare * totalPerimeter);
+    int activeCount = 0;
+    for (std::size_t i = 0; i < result.systems.size(); ++i) {
+        DetectedDirectionSystem& system = result.systems[i];
+        const double weightShare = totalWeight > 1e-9
+            ? system.weight / totalWeight : 0.0;
+        const double lengthShare = candidateLengthSum > 1e-9
+            ? system.totalLength / candidateLengthSum : 0.0;
+        const char* reason = "insufficient_support";
+        if (i == 0) {
+            system.active = true;
+            reason = "primary";
+        } else {
+            const bool enoughLength =
+                system.totalLength >= minPhysicalLength;
+            const bool enoughSupport =
+                weightShare >= kActiveSystemMinWeightShare ||
+                lengthShare >= kActiveSystemMinLengthShare;
+            system.active = enoughLength && enoughSupport;
+            if (system.active) {
+                reason = weightShare >= kActiveSystemMinWeightShare
+                    ? "accepted_weight" : "accepted_length";
+            }
+        }
+        if (system.active) ++activeCount;
+        if (fid >= 0) {
+            std::cerr << "[DirectionActivation] fid=" << fid
+                      << " part=" << partIdx
+                      << " rank=" << (i + 1)
+                      << " angle_deg=" << system.angleRad * 180.0 / M_PI
+                      << " weight_share=" << weightShare
+                      << " length_share=" << lengthShare
+                      << " total_length=" << system.totalLength
+                      << " min_length=" << minPhysicalLength
+                      << " active=" << (system.active ? 1 : 0)
+                      << " reason=" << reason << std::endl;
+        }
     }
 
+    result.valid = true;
     result.primaryAngle = result.systems.front().angleRad;
     result.concentration = result.systems.front().concentration;
-    if (result.systems.size() >= 2) {
-        const auto& second = result.systems[1];
-        const double share = totalWeight > 1e-9 ? second.weight / totalWeight : 0.0;
-        result.multiDirection = share >= 0.20 && second.chainCount >= 2;
-    }
-
-    const double unassignedLengthRatio = result.totalStableLength > 1e-9
-        ? unassignedLength / result.totalStableLength : 0.0;
-    const double unassignedWeightRatio = totalWeight > 1e-9
-        ? unassignedWeight / totalWeight : 0.0;
-    if (result.systems.front().confidence < kCertaintyConf) {
-        result.rejectReason = "low_confidence";
-    } else if (unassignedLengthRatio > kUnassignedHighRatio ||
-               unassignedWeightRatio > kUnassignedHighRatio) {
-        result.rejectReason = "unassigned_long_chain";
-    } else {
-        result.valid = true;
-    }
+    result.multiDirection = activeCount >= 2;
 
     if (fid >= 0) {
         std::cerr << "[DirectionDetect] fid=" << fid << " part=" << partIdx
                   << " valid=" << (result.valid ? 1 : 0)
-                  << " systems=" << result.systems.size()
+                  << " candidate_systems=" << result.systems.size()
+                  << " active_systems=" << activeCount
                   << " multi=" << (result.multiDirection ? 1 : 0)
                   << " primary_deg=" << result.primaryAngle * 180.0 / M_PI
-                  << " stable=" << result.stableChains
-                  << " stable_len=" << result.totalStableLength
-                  << " dp_vertices=" << workingRing.size()
-                  << " dp_tolerance=" << dpTolerance
-                  << " stable_min_len=" << stableMinLength
-                  << " unassigned_ratio=" << unassignedLengthRatio;
+                  << " chains=" << chains.size()
+                  << " perimeter=" << totalPerimeter
+                  << " vertices=" << smoothRing.size()
+                  << " bandwidth_deg=" << kKdeBandwidthDeg
+                  << " prom_cut=" << kPeakProminenceRatio;
         if (!result.valid) std::cerr << " reject=" << result.rejectReason;
         std::cerr << std::endl;
         for (std::size_t i = 0; i < result.systems.size(); ++i) {
@@ -407,9 +415,11 @@ DetectedDirectionResult DetectBuildingDirection(
             std::cerr << "[DirectionDetect] fid=" << fid
                       << " system=" << i
                       << " angle_deg=" << system.angleRad * 180.0 / M_PI
-                      << " chains=" << system.chainCount
+                      << " edges=" << system.chainCount
                       << " length=" << system.totalLength
+                      << " avg_edge=" << system.avgEdgeLen
                       << " concentration=" << system.concentration
+                      << " prom=" << system.prominence
                       << " confidence=" << system.confidence << std::endl;
         }
     }

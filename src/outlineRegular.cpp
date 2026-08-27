@@ -2540,6 +2540,117 @@ bool forceOrthogonalPolygon(const std::vector<pcl::PointXYZ>& input,
     return forceOrthogonalPolygonToAngle(input, dominant.front(), result);
 }
 
+// ===== forceMultiDirectionPolygon =====
+// 多方向直线重排: forceOrthogonalPolygonToAngle 的泛化。
+// 就近吸附边(与某方向系统差 ≤25°)成为约束线(过边中点), 角点 =
+// 相邻吸附线的交点; 误差过大的过渡斜边保持自由方向, 仅连接相邻
+// 角点, 避免大角度旋转导致交点飞移/自交。用于 StrictFallback
+// 保留检测出的第二主方向结构。
+bool forceMultiDirectionPolygon(
+    const std::vector<pcl::PointXYZ>& input,
+    const std::vector<double>& systemAngles,
+    std::vector<pcl::PointXYZ>& result,
+    std::string& rejectReason)
+{
+    result.clear();
+    rejectReason.clear();
+    if (input.size() < 4 || systemAngles.empty()) {
+        rejectReason = "bad_input";
+        return false;
+    }
+
+    // 每条边的目标线方向(无向)与误差: 就近系统展开到 {θ_s, θ_s+90°}
+    constexpr double kSnapMaxErrRad = 25.0 * M_PI / 180.0;
+    const std::size_t n = input.size();
+    std::vector<double> psi(n, 0.0);
+    std::vector<bool> snapped(n, false);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = input[i];
+        const auto& b = input[(i + 1) % n];
+        const double angle = std::atan2(b.y - a.y, b.x - a.x);
+        double bestError = std::numeric_limits<double>::max();
+        for (double system : systemAngles) {
+            for (int k = 0; k < 2; ++k) {
+                const double candidate = system + k * M_PI / 2.0;
+                const double error = undirectedAngleDifference(angle, candidate);
+                if (error < bestError) {
+                    bestError = error;
+                    psi[i] = candidate;
+                }
+            }
+        }
+        snapped[i] = bestError <= kSnapMaxErrRad;
+    }
+
+    // 角点 = 两条相邻吸附边(方向切换)的交点; 同向连续边之间无角
+    std::vector<std::size_t> corners;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t prev = (i + n - 1) % n;
+        if (snapped[prev] && snapped[i] &&
+            undirectedAngleDifference(psi[prev], psi[i]) > 1e-6) {
+            corners.push_back(i);
+        }
+    }
+    if (corners.size() < 4) {
+        rejectReason = "too_few_corners=" + std::to_string(corners.size());
+        return false;
+    }
+
+    // 吸附边的约束线: 过边中点。
+    // psi 是边方向, 线方程 n·x=d 的法向 n = (-sinψ, cosψ) ——
+    // 不能把 (cosψ, sinψ) 当法向, 那样约束线会垂直于目标边方向,
+    // 重排结果系统性错误(此前 9 例全部自交的根源)。
+    std::vector<Eigen::Vector3d> lines(n);
+    auto buildLine = [&](std::size_t i) {
+        const auto& a = input[i];
+        const auto& b = input[(i + 1) % n];
+        const double nx = -std::sin(psi[i]);
+        const double ny = std::cos(psi[i]);
+        const double d = 0.5 * ((a.x + b.x) * nx + (a.y + b.y) * ny);
+        lines[i] = Eigen::Vector3d(nx, ny, -d);
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+        if (snapped[i]) buildLine(i);
+    }
+
+    // 角点位置 = 进入边约束线 ∩ 离开边约束线
+    result.reserve(corners.size());
+    for (std::size_t c = 0; c < corners.size(); ++c) {
+        const std::size_t i = corners[c];
+        const std::size_t prev = (i + n - 1) % n;
+        const double det = lines[prev].x() * lines[i].y() -
+            lines[i].x() * lines[prev].y();
+        if (std::abs(det) < 1e-6) {
+            rejectReason = "near_parallel";
+            result.clear();
+            return false;
+        }
+        const double previousD = -lines[prev].z();
+        const double currentD = -lines[i].z();
+        const double x = (previousD * lines[i].y() -
+            currentD * lines[prev].y()) / det;
+        const double y = (lines[prev].x() * currentD -
+            lines[i].x() * previousD) / det;
+        result.emplace_back(static_cast<float>(x), static_cast<float>(y), input[0].z);
+    }
+    removeDuplicatePoints2D(result, 0.05f);
+    if (result.size() < 4 || !isSimplePolygon2D(result)) {
+        rejectReason = result.size() < 4 ? "too_few_result" : "self_intersect";
+        result.clear();
+        return false;
+    }
+    // 面积保持检查: 重排漂移过大时退回单方向版本
+    const double areaIn = std::abs(polygonArea2D(input));
+    const double areaOut = std::abs(polygonArea2D(result));
+    if (areaIn > 1e-6 &&
+        (areaOut / areaIn < 0.65 || areaOut / areaIn > 1.45)) {
+        rejectReason = "area_ratio=" + std::to_string(areaOut / areaIn);
+        result.clear();
+        return false;
+    }
+    return true;
+}
+
 bool isStrictOrthogonalToMainAngle(
     const std::vector<pcl::PointXYZ>& polygon,
     double main_angle,
@@ -5173,12 +5284,52 @@ SupportDirectionPeaks2D estimateSupportDirectionPeaks2D(
 
 bool outlineRegular::BuildStrictDirectionalFallback(
     const std::vector<pcl::PointXYZ>& input,
+    const std::vector<pcl::PointXYZ>& initialRing,
     double mainAngle,
-    std::vector<pcl::PointXYZ>& result) const
+    std::vector<pcl::PointXYZ>& result,
+    const std::vector<double>* systemAngles,
+    bool multiDirection) const
 {
     result.clear();
     if (input.size() < 3 || !std::isfinite(mainAngle)) return false;
-    return forceOrthogonalPolygonToAngle(input, mainAngle, result);
+    // 多方向骨架: 仅 multiDirection=true 且 >=2 生效系统时启用;
+    // 构造成功后还要通过与拓扑通道同一标准的全量验收
+    // (自交/面积/质心/墙贴合/方向归属), 失败退回单方向版本。
+    if (systemAngles && systemAngles->size() >= 2 && multiDirection) {
+        std::vector<pcl::PointXYZ> multi;
+        std::string rejectReason;
+        if (forceMultiDirectionPolygon(input, *systemAngles, multi, rejectReason)) {
+            const std::string quality = CheckPolygonQualityVsRing(
+                multi, initialRing, /*hasDirection=*/true, true,
+                *systemAngles, 2.5, source_feature_id_, 0);
+            if (quality.empty()) {
+                std::cerr << "[MultiStrict] fid=" << source_feature_id_
+                          << " accepted=1 vertices=" << multi.size()
+                          << std::endl;
+                result = std::move(multi);
+                return true;
+            }
+            std::cerr << "[MultiStrict] fid=" << source_feature_id_
+                      << " accepted=0 reject=quality_" << quality << std::endl;
+        } else {
+            std::cerr << "[MultiStrict] fid=" << source_feature_id_
+                      << " accepted=0 reject=" << rejectReason << std::endl;
+        }
+    }
+    if (!forceOrthogonalPolygonToAngle(input, mainAngle, result)) return false;
+    const std::vector<double> singleSystem = {mainAngle};
+    const std::string quality = CheckPolygonQualityVsRing(
+        result, initialRing, /*hasDirection=*/true, false,
+        singleSystem, 2.5, source_feature_id_, 0);
+    if (!quality.empty()) {
+        std::cerr << "[SingleStrict] fid=" << source_feature_id_
+                  << " accepted=0 reject=quality_" << quality << std::endl;
+        result.clear();
+        return false;
+    }
+    std::cerr << "[SingleStrict] fid=" << source_feature_id_
+              << " accepted=1 vertices=" << result.size() << std::endl;
+    return true;
 }
 
 void outlineRegular::RunDirectionSystemDiagnostic(
@@ -5366,6 +5517,29 @@ void outlineRegular::setSupportDirectionHint(
     support_direction_hint_ = foldedLineAngle90(angle);
     support_direction_peak_ratio_ = peakRatio;
     support_direction_pair_count_ = pairCount;
+}
+
+void outlineRegular::setUnifiedDirection(const void* detectedDirection)
+{
+    has_unified_direction_ = false;
+    unified_multi_direction_ = false;
+    unified_candidate_system_count_ = 0;
+    unified_system_angles_.clear();
+    if (!detectedDirection) return;
+    const auto* ext =
+        static_cast<const DetectedDirectionResult*>(detectedDirection);
+    if (!ext->valid || ext->systems.empty()) return;
+    unified_candidate_system_count_ = ext->systems.size();
+    // 生效系统: 只保存 active 系统(已逐峰裁决), 主峰恒在
+    for (const auto& system : ext->systems) {
+        if (!system.active) continue;
+        unified_system_angles_.push_back(system.angleRad);
+    }
+    if (unified_system_angles_.empty()) {
+        unified_system_angles_.push_back(ext->systems.front().angleRad);
+    }
+    unified_multi_direction_ = ext->multiDirection;
+    has_unified_direction_ = true;
 }
 
 // ===== PointToLineDistanceCost =====
@@ -5937,12 +6111,33 @@ void outlineRegular::regular_Contour()
             resolution, polygonArea2D(best_hypothesis));
 
         // ===== 多方向证据前置 =====
-        // 在尝试单方向正则化之前，先在最优假设上检测方向系统证据：
-        // 若存在可信的第二方向系统（斜翼、L 形翼等），直接进入多方向
-        // 分支，避免"单方向宽松放行"掩盖斜翼被强行正交化的系统性形变
-        // (实测案例：IoU=0.69 / mean=4.1m / q90=11.7m 被 relaxed 通道放行)。
-        // 检测不到多方向证据的建筑仍走原 SingleFirst 路径，行为不变。
-
+        // 统一方向注入(Mask-only): 禁止二次判定。单/多方向与系统角
+        // 全部来自统一检测(DetectBuildingDirection), 生效系统已按
+        // multiDirection 门控(false 只留主系统)。小轮廓强制单方向等
+        // 本地重判一并跳过。未注入时(OSGB 原流程)保留下方旧检测逻辑。
+        std::vector<DirectionSystem> direction_systems;
+        bool credible_multi_direction = false;
+        // 统一方向模式下不做小轮廓强制重判
+        bool forceSingleDirection = false;
+        if (hasUnifiedDirection()) {
+            for (double angle : unified_system_angles_) {
+                DirectionSystem system;
+                system.angle = angle;
+                system.weight = 1.0;
+                system.length = 1.0;
+                direction_systems.push_back(system);
+            }
+            credible_multi_direction =
+                unified_multi_direction_ && direction_systems.size() >= 2;
+            std::cerr << "[BuildingModeInput] fid=" << source_feature_id_
+                << " direction_source=external_unified"
+                << " candidate_systems=" << unified_candidate_system_count_
+                << " active_systems=" << direction_systems.size()
+                << " multi=" << (credible_multi_direction ? 1 : 0)
+                << std::endl;
+        } else {
+        std::cerr << "[BuildingModeInput] fid=" << source_feature_id_
+            << " direction_source=internal_legacy" << std::endl;
         // ---- 边链方向证据(split-and-merge + KDE 多峰) ----
         const DirectionEvidence2D chainEvidence =
             EstimateDirectionEvidence(original_points, resolution, fitting_cloud);
@@ -5962,7 +6157,7 @@ void outlineRegular::regular_Contour()
                 << " strong=" << (peak.strong ? 1 : 0) << std::endl;
         }
 
-        std::vector<DirectionSystem> direction_systems =
+        direction_systems =
             detectDirectionSystems(best_hypothesis, fitting_cloud, model_tuning);
         const SupportDirectionPeaks2D supportPeaks =
             estimateSupportDirectionPeaks2D(fitting_cloud);
@@ -6037,7 +6232,7 @@ void outlineRegular::regular_Contour()
         // 斜边。
         const double smallBuildingHypothesisArea =
             polygonArea2D(fallback_hypothesis);
-        const bool forceSingleDirection =
+        forceSingleDirection =
             smallBuildingHypothesisArea > 0.0 &&
             smallBuildingHypothesisArea < kSmallBuildingSingleDirectionArea;
         if (forceSingleDirection && credible_multi_direction) {
@@ -6046,6 +6241,7 @@ void outlineRegular::regular_Contour()
                       << " -> force single direction" << std::endl;
             credible_multi_direction = false;
         }
+        } // direction_source=internal_legacy 结束
 
         // 优先尝试单一正交方向。掩膜轮廓常含
         // 楼梯或短斜边伪影，容易让次方向
@@ -6057,12 +6253,20 @@ void outlineRegular::regular_Contour()
         if (!credible_multi_direction)
         {
             auto _single_t0 = std::chrono::steady_clock::now();
-            std::vector<double> single_line_angles = hausdorffMbrLineAngles2D(
-                fallback_hypothesis, resolution, 1);
-            if (single_line_angles.empty()) {
-                single_line_angles = dominantLineAngles2D(fallback_hypothesis, 1);
-            }
-            if (!single_line_angles.empty()) {
+            std::vector<double> single_line_angles;
+            if (hasUnifiedDirection()) {
+                single_line_angles.push_back(unified_system_angles_.front());
+                std::cerr << "[DirectionDecision] fid=" << source_feature_id_
+                          << " source=external_unified selected_deg="
+                          << single_line_angles.front() * 180.0 / M_PI
+                          << std::endl;
+            } else {
+                single_line_angles = hausdorffMbrLineAngles2D(
+                    fallback_hypothesis, resolution, 1);
+                if (single_line_angles.empty()) {
+                    single_line_angles = dominantLineAngles2D(fallback_hypothesis, 1);
+                }
+                if (!single_line_angles.empty()) {
                 double wallAngle = 0.0;
                 double wallPeakRatio = 0.0;
                 std::size_t wallPairCount = 0;
@@ -6146,6 +6350,7 @@ void outlineRegular::regular_Contour()
                           << " pca_fallback=" << (pcaFallback ? 1 : 0)
                           << " selected_deg=" << single_line_angles.front() * 180.0 / M_PI
                           << " corrected=" << (corrected ? 1 : 0) << std::endl;
+                }
             }
             single_first_line_angles = single_line_angles;
             if (!single_line_angles.empty() && fallback_hypothesis.size() >= 4) {
@@ -10713,14 +10918,29 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     if (hasExternalDirection) {
         const auto* ext = static_cast<const DetectedDirectionResult*>(detectedDirection);
         if (ext->valid && !ext->systems.empty()) {
-            // 用外部检测结果填充 dirBuild
+            // 生效方向语义: 只复制 active 系统(主峰恒 active, 其余峰
+            // 经逐峰墙长/权重裁决)。multiDirection=true 不会顺带激活
+            // 弱候选; 单一 active 即单方向。
             for (const auto& sys : ext->systems) {
+                if (!sys.active) continue;
                 DirectionSystemDiag ds;
                 ds.angleRad = sys.angleRad;
                 ds.chainCount = sys.chainCount;
                 ds.totalLength = sys.totalLength;
                 ds.weight = sys.weight;
                 ds.meanRmse = sys.meanRmse;
+                ds.concentration = sys.concentration;
+                ds.confidence = sys.confidence;
+                dirBuild.systems.push_back(ds);
+            }
+            if (dirBuild.systems.empty()) {
+                // 防御: 无 active 时退回主系统
+                const auto& sys = ext->systems.front();
+                DirectionSystemDiag ds;
+                ds.angleRad = sys.angleRad;
+                ds.chainCount = sys.chainCount;
+                ds.totalLength = sys.totalLength;
+                ds.weight = sys.weight;
                 ds.concentration = sys.concentration;
                 ds.confidence = sys.confidence;
                 dirBuild.systems.push_back(ds);
@@ -10962,39 +11182,11 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     //       原始角点分别投影并夹取到两链线段上, 插入一对顶点——
     //       台阶 jog/凹凸/窄颈的拓扑结构因此保留。
     std::vector<pcl::PointXYZ> topologyPolygon;
-    topologyPolygon.reserve(topoChains.size());
+    topologyPolygon.reserve(topoChains.size() + 4);
+    // 生效方向系统角(候选边归属/桥接转接共用; 已按 multiDirection 门控)
+    std::vector<double> systemAngles;
+    for (const auto& s : dirBuild.systems) systemAngles.push_back(s.angleRad);
     const float zVal = initialRing[0].z;
-    // 点到直线(法向式 n·x = off)的投影
-    auto projectOntoLine = [](const pcl::PointXYZ& p,
-                              double nx, double ny, double off) {
-        const double t = nx * p.x + ny * p.y - off;
-        pcl::PointXYZ q;
-        q.x = static_cast<float>(p.x - t * nx);
-        q.y = static_cast<float>(p.y - t * ny);
-        return q;
-    };
-    // 投影并夹取到链的有限范围: 沿吸附线的方向参数化
-    // (用原始弦方向夹取会把投影点拉离格网线——吸附旋转后的线方向
-    // 与弦方向可差 25°, 连接边随之偏斜; 必须沿吸附线本身夹取)
-    auto projectClampedToChain = [&](const pcl::PointXYZ& p,
-                                     const DirectionChain& c) {
-        // 吸附线: n·x = off, 方向 d = (-ny, nx)
-        const double dx = -c.normalY, dy = c.normalX;
-        // 线上坐标: t = d·x (线本身过 n*off 点)
-        auto lineCoord = [&](const pcl::PointXYZ& q) {
-            return dx * q.x + dy * q.y;
-        };
-        const double tSp = lineCoord(c.startPoint);
-        const double tEp = lineCoord(c.endPoint);
-        const double tMin = std::min(tSp, tEp);
-        const double tMax = std::max(tSp, tEp);
-        pcl::PointXYZ q = projectOntoLine(p, c.normalX, c.normalY, c.lineOffset);
-        const double t = std::clamp(lineCoord(q), tMin, tMax);
-        // 沿吸附线重建: 基点 n*off + 方向 d * t
-        q.x = static_cast<float>(c.normalX * c.lineOffset + dx * t);
-        q.y = static_cast<float>(c.normalY * c.lineOffset + dy * t);
-        return q;
-    };
     // 点在链线段方向上的参数(0=起点, len=终点)
     auto segParam = [&](const pcl::PointXYZ& p, const DirectionChain& c) {
         const double vx = c.endPoint.x - c.startPoint.x;
@@ -11009,6 +11201,14 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         const auto& chainB = topoChains[(c + 1) % topoChains.size()];
         // 原始角点 = 链A终点 = 链B起点(共享环顶点)
         const pcl::PointXYZ rawCorner = chainA.endPoint;
+        const double lenA = std::hypot(
+            chainA.endPoint.x - chainA.startPoint.x,
+            chainA.endPoint.y - chainA.startPoint.y);
+        const double lenB = std::hypot(
+            chainB.endPoint.x - chainB.startPoint.x,
+            chainB.endPoint.y - chainB.startPoint.y);
+        const double transitionShiftLimit = std::clamp(
+            0.5 * std::max(lenA, lenB), 2.5, 4.0);
 
         pcl::PointXYZ vertex = rawCorner;
         vertex.z = zVal;
@@ -11027,20 +11227,17 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 isect.z = zVal;
                 const double shift = std::hypot(
                     isect.x - rawCorner.x, isect.y - rawCorner.y);
-                const double lenA = std::hypot(
-                    chainA.endPoint.x - chainA.startPoint.x,
-                    chainA.endPoint.y - chainA.startPoint.y);
-                const double lenB = std::hypot(
-                    chainB.endPoint.x - chainB.startPoint.x,
-                    chainB.endPoint.y - chainB.startPoint.y);
                 const double marginA = std::max(1.0, 0.5 * lenA);
                 const double marginB = std::max(1.0, 0.5 * lenB);
                 const double tA = segParam(isect, chainA);
                 const double tB = segParam(isect, chainB);
                 // 有限边段交点的全部条件: 数值有效 + 近角点 + 参数在
-                // 两链有限范围内(含适度外延, 允许墙线自然延伸到角点)
+                // 两链有限范围内(含适度外延, 允许墙线自然延伸到角点)。
+                // 垂直链对的交点是唯一的合法角点(active 方向的任何
+                // 桥接线都平行于其中一条链), shift 放宽到与桥接一致,
+                // 吸附偏差交给 Ceres 拉回。
                 if (std::isfinite(isect.x) && std::isfinite(isect.y) &&
-                    shift <= 1.0 &&
+                    shift <= transitionShiftLimit &&
                     tA >= -marginA && tA <= lenA + marginA &&
                     tB >= -marginB && tB <= lenB + marginB) {
                     vertex = isect;
@@ -11051,19 +11248,89 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         if (useIntersection) {
             topologyPolygon.push_back(vertex);
         } else {
-            // 近平行链或交点越界: 原始角点投影对(夹取到链线段),
-            // 连接边短且贴近格网, 不产生远距离飞点
-            pcl::PointXYZ pa = projectClampedToChain(rawCorner, chainA);
-            pcl::PointXYZ pb = projectClampedToChain(rawCorner, chainB);
-            pa.z = zVal;
-            pb.z = zVal;
-            topologyPolygon.push_back(pa);
-            topologyPolygon.push_back(pb);
+            // 桥接构造: 近平行链或交点越界时, 从 active 方向展开集
+            // {θs, θs+90°} 中选一条过原角点的桥接线, 分别与两链的
+            // 吸附线求交。转接的两条新边因此都来自 active 方向,
+            // 不产生自由斜边(旧投影点对的连接边方向任意, 是
+            // Ceres 前 direction_violation 的主要来源)。
+            bool bridged = false;
+            bool bridgeSingleVertex = false;  // 两链同线: 交点重合, 单顶点转接
+            double bestCost = std::numeric_limits<double>::max();
+            pcl::PointXYZ bestPa, bestPb;
+            // 位移预算随相邻物理链尺度增长，但封顶4m；桥接边长度不能
+            // 超过两端位移预算之和。最终仍由Ceres后完整质量检查裁决。
+            const double bridgeGapLimit = 2.0 * transitionShiftLimit;
+            for (double baseAngle : systemAngles) {
+                for (int k = 0; k < 2; ++k) {
+                    const double psi = baseAngle + k * M_PI / 2.0;
+                    // 桥接线: 方向 (cosψ, sinψ), 法向 (-sinψ, cosψ)
+                    const double bnx = -std::sin(psi);
+                    const double bny = std::cos(psi);
+                    const double boff = bnx * rawCorner.x + bny * rawCorner.y;
+                    auto intersectBridge = [&](const DirectionChain& ch,
+                                               pcl::PointXYZ& out) {
+                        const double det = bnx * ch.normalY - ch.normalX * bny;
+                        if (std::abs(det) < 0.05) return false;  // 与链近平行
+                        out.x = static_cast<float>(
+                            (boff * ch.normalY - bny * ch.lineOffset) / det);
+                        out.y = static_cast<float>(
+                            (bnx * ch.lineOffset - boff * ch.normalX) / det);
+                        out.z = zVal;
+                        return std::isfinite(out.x) && std::isfinite(out.y);
+                    };
+                    pcl::PointXYZ pa, pb;
+                    if (!intersectBridge(chainA, pa)) continue;
+                    if (!intersectBridge(chainB, pb)) continue;
+                    const double shiftA = std::hypot(
+                        pa.x - rawCorner.x, pa.y - rawCorner.y);
+                    const double shiftB = std::hypot(
+                        pb.x - rawCorner.x, pb.y - rawCorner.y);
+                    if (shiftA > transitionShiftLimit ||
+                        shiftB > transitionShiftLimit) continue;
+                    const double gap = std::hypot(pa.x - pb.x, pa.y - pb.y);
+                    if (gap > bridgeGapLimit) continue;
+                    const double cost = shiftA + shiftB + gap;
+                    if (cost < bestCost) {
+                        bestCost = cost;
+                        bestPa = pa;
+                        bestPb = pb;
+                        bridgeSingleVertex = gap < 0.05;
+                        bridged = true;
+                    }
+                }
+            }
+            if (bridged) {
+                // 同线链的交点重合: 单顶点即可; 否则插入桥接点对,
+                // 连接边方向 = 桥接方向(active 方向)
+                topologyPolygon.push_back(bestPa);
+                if (!bridgeSingleVertex) topologyPolygon.push_back(bestPb);
+            } else {
+                // 无法构造合法转接: 不静默生成斜边, 候选作废
+                std::cerr << "[TopologyTransition] fid=" << source_feature_id_
+                          << " part=" << partIndex
+                          << " chain=" << c
+                          << " stage=candidate_transition"
+                          << " transition_construction_failed"
+                          << " systems=" << systemAngles.size()
+                          << " corner=" << rawCorner.x << "," << rawCorner.y
+                          << " chainA_norm="
+                          << std::atan2(chainA.normalY, chainA.normalX) * 180.0 / M_PI
+                          << " chainA_off=" << chainA.lineOffset
+                          << " chainA_len=" << std::hypot(
+                                 chainA.endPoint.x - chainA.startPoint.x,
+                                 chainA.endPoint.y - chainA.startPoint.y)
+                          << " chainB_norm="
+                          << std::atan2(chainB.normalY, chainB.normalX) * 180.0 / M_PI
+                          << " chainB_off=" << chainB.lineOffset
+                          << " chainB_len=" << std::hypot(
+                                 chainB.endPoint.x - chainB.startPoint.x,
+                                 chainB.endPoint.y - chainB.startPoint.y)
+                          << std::endl;
+                usedFallback = true;
+                return {};
+            }
         }
     }
-
-    std::vector<double> systemAngles;
-    for (const auto& s : dirBuild.systems) systemAngles.push_back(s.angleRad);
 
     // Remove duplicate vertices without losing the direction context. The
     // candidate is small, so rebuild the assignment from the resulting edge
@@ -11099,14 +11366,93 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
             source_feature_id_, partIndex);
     };
 
-    // ---- 4. 候选拓扑质量验证(不合格→VDP, 不直接输出) ----
-    const std::string candidateReason = qualityCheck(topologyPolygon, 2.5);
+    // ---- 4. 候选预检(Ceres 前: 只查结构性缺陷) ----
+    // wall_deviation/centroid_shift/方向合法性/顶点位移放到 Ceres 之后
+    // (qualityCheck)——Ceres 正是把候选推回墙体/方向的能力, 预检阶段
+    // 按最终标准拒候选会把可修复的候选挡在优化之外。
+    // 桥接构造已保证每条转接边归属 active 方向, 预检不再需要方向检查。
+    auto candidatePrecheck = [&](const std::vector<pcl::PointXYZ>& poly)
+                             -> std::string {
+        if (poly.size() < 3) return "too_few_vertices";
+        for (const auto& p : poly) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y)) return "non_finite";
+        }
+        if (!isSimplePolygon2D(poly)) return "self_intersecting";
+        int shortRun = 0;
+        double ringDiagPre = 1.0;
+        {
+            double mnX = 1e18, mnY = 1e18, mxX = -1e18, mxY = -1e18;
+            for (const auto& p : initialRing) {
+                mnX = std::min(mnX, (double)p.x); mxX = std::max(mxX, (double)p.x);
+                mnY = std::min(mnY, (double)p.y); mxY = std::max(mxY, (double)p.y);
+            }
+            ringDiagPre = std::hypot(mxX - mnX, mxY - mnY);
+        }
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const double len = std::hypot(
+                poly[(i + 1) % poly.size()].x - poly[i].x,
+                poly[(i + 1) % poly.size()].y - poly[i].y);
+            if (len < 0.02) return "zero_length_edge";
+            if (len < 0.15) {
+                if (++shortRun >= 3) return "short_edge_run";
+            } else {
+                shortRun = 0;
+            }
+            if (len > 1.1 * ringDiagPre) return "abnormal_long_edge";
+        }
+        const double ratioPre = std::abs(polygonArea2D(poly)) /
+            std::max(std::abs(polygonArea2D(initialRing)), 1e-6);
+        if (ratioPre < 0.50 || ratioPre > 1.80) {
+            return "area_ratio=" + std::to_string(ratioPre);
+        }
+        return "";
+    };
+    // 候选诊断: 拒绝时输出边明细(索引/长度/角度/最近系统角误差)
+    auto dumpCandidateEdges = [&](const std::vector<pcl::PointXYZ>& poly) {
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const auto& a = poly[i];
+            const auto& b = poly[(i + 1) % poly.size()];
+            const double len = std::hypot(b.x - a.x, b.y - a.y);
+            if (len < 0.30) continue;  // 诊断聚焦可见边
+            const double ang = std::atan2(b.y - a.y, b.x - a.x);
+            double bestErr = 1e9, bestAng = 0.0;
+            for (double s : systemAngles) {
+                double d = std::abs(ang - s);
+                d = std::fmod(d, M_PI / 2.0);
+                d = std::min(d, M_PI / 2.0 - d);
+                if (d < bestErr) { bestErr = d; bestAng = s; }
+            }
+            pcl::PointXYZ mid;
+            mid.x = 0.5f * (a.x + b.x);
+            mid.y = 0.5f * (a.y + b.y);
+            double midDist = 1e9;
+            for (std::size_t j = 0; j < initialRing.size(); ++j) {
+                const auto& p = initialRing[j];
+                const auto& q = initialRing[(j + 1) % initialRing.size()];
+                const double dx = q.x - p.x, dy = q.y - p.y;
+                const double ls = dx * dx + dy * dy;
+                if (ls < 1e-12) continue;
+                double t = ((mid.x - p.x) * dx + (mid.y - p.y) * dy) / ls;
+                t = std::clamp(t, 0.0, 1.0);
+                midDist = std::min(midDist,
+                    std::hypot(mid.x - p.x - t * dx, mid.y - p.y - t * dy));
+            }
+            std::cerr << "[TopologyCandidateDiag] fid=" << source_feature_id_
+                      << " edge=" << i << " len=" << len
+                      << " ang_deg=" << ang * 180.0 / M_PI
+                      << " nearest_sys_deg=" << bestAng * 180.0 / M_PI
+                      << " sys_err_deg=" << bestErr * 180.0 / M_PI
+                      << " mid_to_ring=" << midDist << std::endl;
+        }
+    };
+    const std::string candidateReason = candidatePrecheck(topologyPolygon);
     if (!candidateReason.empty()) {
         usedFallback = true;
         std::cerr << "[TopologyCandidateReject] fid=" << source_feature_id_
-                  << " reason=" << candidateReason << std::endl;
+                  << " stage=precheck reason=" << candidateReason << std::endl;
+        dumpCandidateEdges(topologyPolygon);
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
-                  << " reason=candidate_quality" << std::endl;
+                  << " reason=candidate_precheck" << std::endl;
         return {};
     }
 
@@ -11380,6 +11726,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     removeDuplicatePoints2D(ceresResult, 0.05f);
     // 候选直接输出前的局部规则性闸门(短斜边/尖刺/锯齿)
     auto candidateUsable = [&]() {
+        const std::string qualityReason = qualityCheck(topologyPolygon, 2.5);
+        if (!qualityReason.empty()) return qualityReason;
         outlineRegular::DirectionContextOut ctx;
         ctx.valid = true;
         ctx.completeEvidence = true;

@@ -16,15 +16,20 @@
 #include <cmath>
 
 // 检测结果: 一个方向系统
+// 候选(active=false)只表示"方向迹象"; active=true 表示具有足够
+// 物理墙长或统计权重, 允许约束规则化。主峰恒 active。
 struct DetectedDirectionSystem {
     double angleRad = 0.0;          // 折叠角 [0, π/2)
     int chainCount = 0;             // 归入的稳定链数
     double totalLength = 0.0;       // 稳定链总长(m)
-    double weight = 0.0;            // 加权支持(长度×拟合质量)
+    double weight = 0.0;            // 加权支持(长度^指数)
     double meanRmse = 0.0;          // 平均拟合残差
     double concentration = 0.0;     // 圆集中度(四倍角合向量长度)
     double extent = 0.0;            // 空间覆盖(bbox对角线)
     double confidence = 0.0;        // 综合置信度 [0,1]
+    double prominence = 0.0;        // KDE 峰显著度(相对主峰高度 [0,1])
+    double avgEdgeLen = 0.0;        // 系统内平均边长(m), 诊断锯齿伪系统
+    bool active = false;            // 生效方向(下游只消费 active 系统)
 };
 
 // 检测结果: 整体

@@ -1112,6 +1112,16 @@ struct RegularizationDebugCollector {
     PointCloudT::Ptr support{new PointCloudT};
 };
 
+// 主方向调试记录: 一个环一条(几何由质心+跨度+各系统角度重建)。
+// 供 QGIS 检视误判方向; 用户旋转线段后可从几何反算修正角度。
+struct DebugDirectionRecord {
+    long long sourceFid = -1;
+    int ringIndex = 0;
+    double cx = 0.0, cy = 0.0;  // 环质心(局部坐标)
+    double halfSpan = 0.0;       // 方向线段半径(m), 取 bbox 对角线一半
+    DetectedDirectionResult detected;
+};
+
 double BoundingBoxArea2D(const std::vector<pcl::PointXYZ>& ring);
 double PolygonArea2D(const std::vector<pcl::PointXYZ>& ring);
 std::vector<pcl::PointXYZ> OrientedBoundingRectangle(
@@ -4843,6 +4853,95 @@ if (!RemoveShapefileFamily(outputPath)) return false;
     return true;
 }
 
+// 作用：把每环检测到的方向系统写出为 debug_direction_systems.shp。
+// 每个方向系统一条过环质心的线段(方向=系统折叠角), QGIS 中按 rank
+// 字段分类着色即可区分第几主方向。检测失败的环也输出一条 1m 水平
+// 短线并携带 reject 原因, 便于在属性表中定位。
+bool SaveDebugDirectionSystems(
+    const std::filesystem::path& outputPath,
+    const std::vector<DebugDirectionRecord>& records,
+    OGRSpatialReference* spatialRef,
+    const Eigen::Vector3d& metadataOffset)
+{
+    if (!RemoveShapefileFamily(outputPath)) return false;
+    if (records.empty()) return true;
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) return false;
+
+    GDALDataset* dataset = driver->Create(outputPath.string().c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->CreateLayer("debug_direction_systems", spatialRef, wkbLineString25D, nullptr);
+    if (!layer) {
+        GDALClose(dataset);
+        return false;
+    }
+    OGRFieldDefn fidField("src_fid", OFTInteger64);
+    OGRFieldDefn ringField("ring_id", OFTInteger);
+    OGRFieldDefn rankField("rank", OFTInteger);
+    OGRFieldDefn angleField("angle_deg", OFTReal);
+    OGRFieldDefn weightField("weight", OFTReal);
+    OGRFieldDefn confField("conf", OFTReal);
+    OGRFieldDefn chainsField("chains", OFTInteger);
+    OGRFieldDefn lenField("len_m", OFTReal);
+    OGRFieldDefn multiField("multi_dir", OFTInteger);
+    OGRFieldDefn activeField("active", OFTInteger);
+    OGRFieldDefn validField("valid", OFTInteger);
+    OGRFieldDefn rejectField("reject", OFTString);
+    layer->CreateField(&fidField);
+    layer->CreateField(&ringField);
+    layer->CreateField(&rankField);
+    layer->CreateField(&angleField);
+    layer->CreateField(&weightField);
+    layer->CreateField(&confField);
+    layer->CreateField(&chainsField);
+    layer->CreateField(&lenField);
+    layer->CreateField(&multiField);
+    layer->CreateField(&activeField);
+    layer->CreateField(&validField);
+    layer->CreateField(&rejectField);
+    OGRFeatureDefn* defn = layer->GetLayerDefn();
+
+    for (const auto& record : records) {
+        const bool ok = record.detected.valid && !record.detected.systems.empty();
+        // 失败环: 1m 水平短线占位, 属性表可见即可
+        const int sysCount = ok ? static_cast<int>(record.detected.systems.size()) : 1;
+        for (int s = 0; s < sysCount; ++s) {
+            const double angle = ok ? record.detected.systems[s].angleRad : 0.0;
+            const double half = ok ? record.halfSpan : 1.0;
+            const double dx = std::cos(angle) * half;
+            const double dy = std::sin(angle) * half;
+            OGRLineString line;
+            line.addPoint(record.cx - dx + metadataOffset.x(),
+                          record.cy - dy + metadataOffset.y(),
+                          metadataOffset.z());
+            line.addPoint(record.cx + dx + metadataOffset.x(),
+                          record.cy + dy + metadataOffset.y(),
+                          metadataOffset.z());
+            OGRFeature* feature = OGRFeature::CreateFeature(defn);
+            feature->SetField("src_fid", static_cast<GIntBig>(record.sourceFid));
+            feature->SetField("ring_id", record.ringIndex);
+            feature->SetField("rank", s + 1);
+            feature->SetField("angle_deg", angle * 180.0 / M_PI);
+            if (ok) {
+                const auto& sys = record.detected.systems[s];
+                feature->SetField("weight", sys.weight);
+                feature->SetField("conf", sys.confidence);
+                feature->SetField("chains", sys.chainCount);
+                feature->SetField("len_m", sys.totalLength);
+                feature->SetField("active", sys.active ? 1 : 0);
+            }
+            feature->SetField("multi_dir", record.detected.multiDirection ? 1 : 0);
+            feature->SetField("valid", record.detected.valid ? 1 : 0);
+            feature->SetField("reject", record.detected.rejectReason.c_str());
+            feature->SetGeometry(&line);
+            layer->CreateFeature(feature);
+            OGRFeature::DestroyFeature(feature);
+        }
+    }
+    GDALClose(dataset);
+    return true;
+}
+
 // 作用：把调试支撑点云保存为 LAS。
 bool SaveDebugSupportLas(
     const std::filesystem::path& outputPath,
@@ -4919,7 +5018,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     int partIndex = 0,
     const std::vector<pcl::PointXYZ>* rawRing = nullptr,
     outlineRegular::DirectionContextOut* dirCtxOut = nullptr,
-    double maskPixelSize = 0.5)
+    double maskPixelSize = 0.5,
+    DetectedDirectionResult* detectedDirOut = nullptr)
 {
     if (fallbackLevel) *fallbackLevel = MaskOnlyFallback::Final;
     if (pathOut) *pathOut = MaskOnlyPath::InitialRing;
@@ -4981,6 +5081,7 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     const auto detectedDir = DetectBuildingDirection(
         ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
         maskPixelSize > 0.0 ? maskPixelSize : 0.3, sourceFid, partIndex);
+    if (detectedDirOut) *detectedDirOut = detectedDir;
 
         // ---- Mask-only 局部圆弧检测(所有路径共用) ----
     // 检测在平滑环上确定区间; rawRing 可用时提供拟合支撑;
@@ -5019,6 +5120,8 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // 无正射证据仲裁栅格楼梯上的曲线检测；
     // Mask-only 不得恢复伪曲线。
     regularizer.setCurveRestorationEnabled(false);
+    // 统一方向注入: VDP 不再二次判定单/多方向与系统角
+    regularizer.setUnifiedDirection(&detectedDir);
     regularizer.regular_Contour();
 
     std::vector<pcl::PointXYZ> bestHypothesis;
@@ -5117,13 +5220,39 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // when no direction evidence exists, an axis-aligned OBR is still a
     // regularized result and is preferable to exposing pixel stair steps.
     const double fallbackAngle = dirCtx.valid ? dirCtx.primaryAngle : 0.0;
+    // 多方向骨架: 仅统一检测 multiDirection=true 且存在 >=2 个 active
+    // 生效系统时启用; 只收 active 系统, 弱候选峰不放行
+    std::vector<double> fallbackSystems;
+    if (detectedDir.valid && detectedDir.multiDirection) {
+        for (const auto& system : detectedDir.systems) {
+            if (!system.active) continue;
+            fallbackSystems.push_back(system.angleRad);
+        }
+        if (fallbackSystems.size() < 2) fallbackSystems.clear();
+    }
     std::vector<pcl::PointXYZ> strictFallback;
     if (strictInput.size() >= 3) {
         regularizer.BuildStrictDirectionalFallback(
-            strictInput, fallbackAngle, strictFallback);
+            strictInput, ring, fallbackAngle, strictFallback,
+            fallbackSystems.empty() ? nullptr : &fallbackSystems,
+            detectedDir.valid && detectedDir.multiDirection);
     }
     if (strictFallback.size() < 3) {
         strictFallback = OrientedBoundingRectangle(ring, fallbackAngle);
+        const std::string obrReason = outlineRegular::CheckRingQuality(
+            strictFallback, ring, dirCtx, 2.5, sourceFid, partIndex);
+        if (!obrReason.empty()) {
+            // OBR 是最后兜底: 矩形近似对 L 形/复合建筑天然超
+            // area_ratio/centroid 限(实测 16/16 全拒, 建筑整体丢失)。
+            // 次优几何仍优于丢弃, 验收降级为警告诊断。
+            std::cerr << "[StrictOBR] fid=" << sourceFid
+                      << " accepted=downgraded_quality reject=" << obrReason
+                      << std::endl;
+        } else {
+            std::cerr << "[StrictOBR] fid=" << sourceFid
+                      << " accepted=1 vertices=" << strictFallback.size()
+                      << std::endl;
+        }
     }
     RemoveClosingDuplicate(strictFallback);
     if (strictFallback.size() >= 3) {
@@ -5400,6 +5529,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     OGRFeatureDefn* outDefn = outLayer->GetLayerDefn();
 
     RegularizationDebugCollector debugCollector;
+    std::vector<DebugDirectionRecord> directionDebugRecords;
     // Legacy best/initial slots remain for backward-compatible enum values;
     // current mask-only output uses topology, vdp, or strict_fallback only.
     struct PathStatAccum {
@@ -5520,10 +5650,44 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             std::vector<pcl::PointXYZ> bestHypothesis;
             MaskOnlyFallback fallback = MaskOnlyFallback::Final;
             MaskOnlyPath path = MaskOnlyPath::InitialRing;
+            DetectedDirectionResult ringDetectedDir;
             auto result = RegularizeRingFromMaskOnly(
                 ring, static_cast<long long>(buildingId), &bestHypothesis,
                 &fallback, &path, ringIdx - 1,
-                rawRingForPart, &ringDirCtx, maskPixelSize);
+                rawRingForPart, &ringDirCtx, maskPixelSize, &ringDetectedDir);
+            // 主方向调试: 质心用 shoelace 公式, 线段半径取 bbox 对角线一半
+            {
+                DebugDirectionRecord dirRec;
+                dirRec.sourceFid = static_cast<long long>(buildingId);
+                dirRec.ringIndex = ringIdx - 1;
+                double area2 = 0.0, cxAcc = 0.0, cyAcc = 0.0;
+                double bbMinX = 1e18, bbMinY = 1e18, bbMaxX = -1e18, bbMaxY = -1e18;
+                for (std::size_t i = 0; i < ring.size(); ++i) {
+                    const auto& a = ring[i];
+                    const auto& b = ring[(i + 1) % ring.size()];
+                    const double cross = static_cast<double>(a.x) * b.y
+                                       - static_cast<double>(b.x) * a.y;
+                    area2 += cross;
+                    cxAcc += (a.x + b.x) * cross;
+                    cyAcc += (a.y + b.y) * cross;
+                    bbMinX = std::min(bbMinX, static_cast<double>(a.x));
+                    bbMinY = std::min(bbMinY, static_cast<double>(a.y));
+                    bbMaxX = std::max(bbMaxX, static_cast<double>(a.x));
+                    bbMaxY = std::max(bbMaxY, static_cast<double>(a.y));
+                }
+                if (std::abs(area2) > 1e-9) {
+                    dirRec.cx = cxAcc / (3.0 * area2);
+                    dirRec.cy = cyAcc / (3.0 * area2);
+                } else {
+                    for (const auto& p : ring) {
+                        dirRec.cx += p.x / ring.size();
+                        dirRec.cy += p.y / ring.size();
+                    }
+                }
+                dirRec.halfSpan = 0.55 * std::hypot(bbMaxX - bbMinX, bbMaxY - bbMinY);
+                dirRec.detected = ringDetectedDir;
+                directionDebugRecords.push_back(std::move(dirRec));
+            }
             if (fallback == MaskOnlyFallback::Hypothesis) ++fallbackHypothesis;
             if (fallback == MaskOnlyFallback::Initial) ++fallbackInitial;
             // 路径统计: 顶点数/短边数(<0.5m)/面积变化
@@ -5759,6 +5923,17 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                 rawDbgPath.string(), originOffset, srsClone)) {
             std::cout << "[MaskOnly] raw residual debug points saved: "
                       << rawDbgPath.string() << std::endl;
+        }
+    }
+    // 主方向调试线输出: 每个方向系统一条过质心的线段, QGIS 按 rank 分类着色
+    {
+        const std::filesystem::path dirDbgPath =
+            debugDir / "debug_direction_systems.shp";
+        if (SaveDebugDirectionSystems(
+                dirDbgPath, directionDebugRecords, srsClone, originOffset)) {
+            std::cout << "[MaskOnly] direction debug lines saved: "
+                      << dirDbgPath.string()
+                      << " (" << directionDebugRecords.size() << " rings)" << std::endl;
         }
     }
     if (srsClone) srsClone->Release();
