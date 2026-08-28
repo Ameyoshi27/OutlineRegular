@@ -186,6 +186,9 @@ public:
 		// 构造阶段失败(precheck 之前): 链数不足/方向不确定/转接失败等
 		std::string constructionReason;
 		std::size_t failedTransitionChain = static_cast<std::size_t>(-1);
+		// 转接内部最具体拒绝原因(angle/shift/wall_fit/zero_length/
+		// no_valid_s/no_missing_cap)
+		std::string failedTransitionReason;
 	};
 	// 单次拓扑构造实现: strictGeometry=true 启用共线合并全区间校验
 	// 与桥接整段贴合校验(仅重试二使用)。失败信息经 failureOut 传出。

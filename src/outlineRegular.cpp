@@ -10787,6 +10787,9 @@ namespace {
     int gTriggerTransition = 0;
     int gOrthogonalDoglegAccepted = 0;
     int gParallelUCapAccepted = 0;
+    int gMissingCapRestored = 0;
+    int gAlternateDirAttempted = 0;
+    int gAlternateDirAccepted = 0;
 }
 
 // 拓扑保持规则化主通道 wrapper: 首次正常构造; 失败后按失败类型
@@ -10802,6 +10805,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     const void* detectedDirection)
 {
     TopologyPassFailure failure;
+    TopologyPassFailure strictFailure;
     // 失败原因格式化: construction > precheck > ceres > candidateQuality
     auto formatFailure = [](const TopologyPassFailure& f) {
         if (!f.constructionReason.empty()) return f.constructionReason;
@@ -10901,7 +10905,6 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
             if (std::string(trigger) == "wall_deviation") ++gTriggerWall;
             else if (std::string(trigger) == "flying_vertex") ++gTriggerFlying;
             else ++gTriggerTransition;
-            TopologyPassFailure strictFailure;
             std::vector<pcl::PointXYZ> third = TopologyPreservingRegularizeImpl(
                 initialRing, pixelSize, usedFallback, dirContext, partIndex,
                 rawRing, detectedDirection, true, &strictFailure);
@@ -10911,8 +10914,125 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                       << " mode=strict_geometry accepted=" << (accepted ? 1 : 0)
                       << " reason="
                       << (accepted ? "ok" : formatFailure(strictFailure))
+                      << (strictFailure.failedTransitionChain !=
+                              static_cast<std::size_t>(-1)
+                              ? " chain=" + std::to_string(
+                                    strictFailure.failedTransitionChain)
+                              : "")
+                      << (strictFailure.failedTransitionReason.empty()
+                              ? "" : " detail=" +
+                                    strictFailure.failedTransitionReason)
                       << std::endl;
             if (accepted) return third;
+        }
+    }
+
+    // ---- 重试三: alternate_direction 替代方向 ----
+    // 场景: 主方向选择错误导致转接系统性 wall_fit(KDE 双峰势均或
+    // PCA 主轴与主峰分歧)。仅在单 active 方向 + 首次转接失败 +
+    // strict 重试后仍因 wall_fit 失败时, 用 KDE 未生效次峰(高度比
+    // ≥0.75)或可靠 PCA 主轴(轴比≥4)重试, 与主峰角差限定 8°~25°。
+    // 每栋最多两次方向候选, 全部质量门不变。
+    if (detectedDirection && strictFailure.constructionReason ==
+                                 "transition_construction_failed" &&
+        !strictFailure.failedTransitionReason.empty()) {
+        const auto* ext =
+            static_cast<const DetectedDirectionResult*>(detectedDirection);
+        int activeCount = 0;
+        for (const auto& s : ext->systems) {
+            if (s.active) ++activeCount;
+        }
+        if (ext->valid && activeCount == 1 &&
+            failure.constructionReason == "transition_construction_failed") {
+            const double minDelta = 8.0 * M_PI / 180.0;
+            const double maxDelta = 25.0 * M_PI / 180.0;
+            auto deltaTo = [&](double angle) {
+                return foldedAngleDistance90(angle, ext->primaryAngle);
+            };
+            // KDE 未生效次峰: height 最高且达 0.75 主峰高度
+            const DetectedDirectionSystem* secondPeak = nullptr;
+            for (const auto& s : ext->systems) {
+                if (s.active || s.height < 0.75) continue;
+                const double d = deltaTo(s.angleRad);
+                if (d < minDelta || d > maxDelta) continue;
+                if (s.totalLength < 6.0) continue;  // 长直链支持
+                if (!secondPeak || s.height > secondPeak->height) {
+                    secondPeak = &s;
+                }
+            }
+            const bool pcaCandidate = ext->pcaValid &&
+                ext->pcaAxisRatio >= 4.0 && ext->pcaAnisotropy >= 0.5 &&
+                deltaTo(ext->pcaAngleRad) >= minDelta &&
+                deltaTo(ext->pcaAngleRad) <= maxDelta;
+            // 佐证: 次峰与 PCA 相差 ≤6° 时合并为加权均值
+            struct DirCandidate {
+                double angle;
+                const char* evidence;
+            };
+            std::vector<DirCandidate> dirCandidates;
+            if (secondPeak && pcaCandidate) {
+                const double gap = foldedAngleDistance90(
+                    secondPeak->angleRad, ext->pcaAngleRad);
+                if (gap <= 6.0 * M_PI / 180.0) {
+                    // 折叠空间均值: 两角相差≤6°, 算术均值再折叠即可
+                    double mean = 0.5 *
+                        (secondPeak->angleRad + ext->pcaAngleRad);
+                    mean = std::fmod(std::fmod(mean, M_PI / 2.0) + M_PI / 2.0,
+                                     M_PI / 2.0);
+                    dirCandidates.push_back({mean, "corroborated"});
+                } else {
+                    dirCandidates.push_back(
+                        {secondPeak->angleRad, "kde"});
+                    dirCandidates.push_back(
+                        {ext->pcaAngleRad, "pca"});
+                }
+            } else if (secondPeak) {
+                dirCandidates.push_back({secondPeak->angleRad, "kde"});
+            } else if (pcaCandidate) {
+                dirCandidates.push_back({ext->pcaAngleRad, "pca"});
+            }
+            int dirRetryCount = 0;  // 每栋最多 2 次方向重试
+            for (const auto& cand : dirCandidates) {
+                if (dirRetryCount >= 2) break;
+                ++dirRetryCount;
+                std::cerr << "[TopologyRetry] fid=" << source_feature_id_
+                          << " part=" << partIndex
+                          << " mode=alternate_direction"
+                          << " trigger=transition_wall_fit"
+                          << " old_deg=" << ext->primaryAngle * 180.0 / M_PI
+                          << " kde_second_deg="
+                          << (secondPeak
+                              ? secondPeak->angleRad * 180.0 / M_PI : -1.0)
+                          << " pca_deg="
+                          << (ext->pcaValid
+                              ? ext->pcaAngleRad * 180.0 / M_PI : -1.0)
+                          << " retry_deg=" << cand.angle * 180.0 / M_PI
+                          << " evidence=" << cand.evidence << std::endl;
+                ++gAlternateDirAttempted;
+                DetectedDirectionResult retryDir = *ext;
+                retryDir.primaryAngle = cand.angle;
+                for (auto& s : retryDir.systems) {
+                    if (s.active) {
+                        s.angleRad = cand.angle;
+                        break;
+                    }
+                }
+                TopologyPassFailure altFailure;
+                std::vector<pcl::PointXYZ> altResult =
+                    TopologyPreservingRegularizeImpl(
+                        initialRing, pixelSize, usedFallback, dirContext,
+                        partIndex, rawRing, &retryDir, false, &altFailure);
+                const bool accepted = !altResult.empty();
+                if (accepted) ++gAlternateDirAccepted;
+                std::cerr << "[TopologyRetryResult] fid="
+                          << source_feature_id_
+                          << " mode=alternate_direction accepted="
+                          << (accepted ? 1 : 0)
+                          << " reason="
+                          << (accepted ? "ok" : formatFailure(altFailure))
+                          << std::endl;
+                if (accepted) return altResult;
+            }
         }
     }
     return {};
@@ -10930,6 +11050,9 @@ void outlineRegular::PrintTopologyRetrySummary()
               << " trigger_transition=" << gTriggerTransition
               << " orthogonal_dogleg_accepted=" << gOrthogonalDoglegAccepted
               << " parallel_u_cap_accepted=" << gParallelUCapAccepted
+              << " missing_cap_restored=" << gMissingCapRestored
+              << " alternate_direction_attempted=" << gAlternateDirAttempted
+              << " alternate_direction_accepted=" << gAlternateDirAccepted
               << " original_topology_changed=0"
               << std::endl;
 }
@@ -11476,6 +11599,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
             bool bridgeSingleVertex = false;  // 两链同线: 交点重合, 单顶点转接
             bool bridgeDogleg = false;        // 两段正交桥: pa→rawCorner→pb
             bool bridgeUCap = false;          // 平行链 U 形封口: pA→qA→qB→pB
+            bool bridgeUCapDegenerateA = false;  // pA==qA(左段退化)
+            bool bridgeUCapDegenerateB = false;  // qB==pB(右段退化)
             double bestCost = std::numeric_limits<double>::max();
             pcl::PointXYZ bestPa, bestPb, bestQA, bestQB;
             // 位移预算随相邻物理链尺度增长，但封顶4m；桥接边长度不能
@@ -11634,6 +11759,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                         }
                     }
                     if (doglegReject) {
+                        if (failureOut &&
+                            failureOut->failedTransitionReason.empty()) {
+                            failureOut->failedTransitionReason = doglegReject;
+                        }
                         std::cerr << "[TopologyBridgeGuard] fid="
                                   << source_feature_id_
                                   << " part=" << partIndex
@@ -11646,6 +11775,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                   << " reason=" << doglegReject << std::endl;
                     }
                 } else if (doglegReject) {
+                    if (failureOut &&
+                        failureOut->failedTransitionReason.empty()) {
+                        failureOut->failedTransitionReason = doglegReject;
+                    }
                     std::cerr << "[TopologyBridgeGuard] fid="
                               << source_feature_id_
                               << " part=" << partIndex
@@ -11668,6 +11801,160 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                 const double kParallelDotMin =
                     std::cos(3.0 * M_PI / 180.0);
                 if (normalDotU >= kParallelDotMin) {
+                    // ---- MissingCap: 优先恢复被吞掉的原始 U 形底边 ----
+                    // 两链之间的原始环区间可能存在被链提取/run吸收合并
+                    // 的封口底边(累计跨度垂直于主方向)。恢复原始边优先
+                    // 于合成 U-cap。索引相邻(共享角点)时说明底边在更早
+                    // 阶段被吞, 扩大窗口到角点前后各 8 顶点。
+                    {
+                        const std::size_t endA = chainA.endIndexOriginal;
+                        const std::size_t startB = chainB.startIndexOriginal;
+                        const std::size_t ringN0 = initialRing.size();
+                        const std::size_t nextA = (endA + 1) % ringN0;
+                        std::size_t from = nextA;
+                        std::size_t to = startB;
+                        // 共享角点(startB == endA): 底边在链提取/run吸收
+                        // 阶段被吞, 角点前后扩窗各 8 顶点找垂直累计跨度
+                        bool spanSharedCorner = (startB == endA);
+                        if (spanSharedCorner) {
+                            from = (endA + ringN0 - 8) % ringN0;
+                            to = (startB + 8) % ringN0;
+                        }
+                        // 区间累计跨度(步数>16 的区间不是局部底边,
+                        // 是跨链错位/回绕, 不得误配)
+                        const auto& fp = initialRing[from];
+                        const auto& tp = initialRing[to];
+                        const double spanX = tp.x - fp.x;
+                        const double spanY = tp.y - fp.y;
+                        const double spanLen = std::hypot(spanX, spanY);
+                        std::size_t spanSteps = 0;
+                        for (std::size_t vi3 = from; spanSteps <= ringN0;
+                             ++spanSteps) {
+                            if (vi3 == to) break;
+                            vi3 = (vi3 + 1) % ringN0;
+                        }
+                        const double mainAngle = systemAngles.empty()
+                            ? 0.0 : systemAngles.front();
+                        const double spanFold = foldedAngleDistance90(
+                            std::atan2(spanY, spanX), mainAngle);
+                        const double minCapLen = std::max(0.8, 2.0 * pixelSize);
+                        const bool capCandidate = spanLen >= minCapLen &&
+                            spanSteps <= 16 &&
+                            spanFold <= 12.0 * M_PI / 180.0;
+                        bool capRestored = false;
+                        if (capCandidate) {
+                            // 端点投影到两侧吸附线, 底边方向≈span 方向
+                            const double tA0 = chainA.normalX * fp.x +
+                                chainA.normalY * fp.y - chainA.lineOffset;
+                            pcl::PointXYZ capA;
+                            capA.x = static_cast<float>(
+                                fp.x - tA0 * chainA.normalX);
+                            capA.y = static_cast<float>(
+                                fp.y - tA0 * chainA.normalY);
+                            capA.z = zVal;
+                            const double tB0 = chainB.normalX * tp.x +
+                                chainB.normalY * tp.y - chainB.lineOffset;
+                            pcl::PointXYZ capB;
+                            capB.x = static_cast<float>(
+                                tp.x - tB0 * chainB.normalX);
+                            capB.y = static_cast<float>(
+                                tp.y - tB0 * chainB.normalY);
+                            capB.z = zVal;
+                            const double capShiftA = std::hypot(
+                                capA.x - fp.x, capA.y - fp.y);
+                            const double capShiftB = std::hypot(
+                                capB.x - tp.x, capB.y - tp.y);
+                            // 底边贴合: 对区间实际边采样距离(区间即轮廓)
+                            if (capShiftA <= transitionShiftLimit &&
+                                capShiftB <= transitionShiftLimit) {
+                                // 底边贴合: capA→capB 段采样点到区间
+                                // 实际边(初始轮廓)的距离
+                                bool capFitOk = true;
+                                double capMaxDist = 0.0;
+                                for (int t = 1; t <= 3 && capFitOk; ++t) {
+                                    const double f = 0.25 * t;
+                                    pcl::PointXYZ mid;
+                                    mid.x = static_cast<float>(
+                                        capA.x + f * (capB.x - capA.x));
+                                    mid.y = static_cast<float>(
+                                        capA.y + f * (capB.y - capA.y));
+                                    double d = std::numeric_limits<double>::max();
+                                    std::size_t vi = from;
+                                    for (std::size_t guard = 0;
+                                         guard <= ringN0; ++guard) {
+                                        const auto nx =
+                                            (vi + 1) % ringN0;
+                                        const double dx = initialRing[nx].x -
+                                            initialRing[vi].x;
+                                        const double dy = initialRing[nx].y -
+                                            initialRing[vi].y;
+                                        const double ls = dx * dx + dy * dy;
+                                        if (ls > 1e-12) {
+                                            double tt =
+                                                ((mid.x - initialRing[vi].x) *
+                                                     dx +
+                                                 (mid.y - initialRing[vi].y) *
+                                                     dy) / ls;
+                                            tt = std::clamp(tt, 0.0, 1.0);
+                                            d = std::min(d, std::hypot(
+                                                mid.x - initialRing[vi].x -
+                                                    tt * dx,
+                                                mid.y - initialRing[vi].y -
+                                                    tt * dy));
+                                        }
+                                        if (nx == to) break;
+                                        vi = nx;
+                                    }
+                                    capMaxDist = std::max(capMaxDist, d);
+                                    if (d > kBridgeFitLimit) capFitOk = false;
+                                }
+                                if (capFitOk && capMaxDist < 1e9) {
+                                    bestPa = capA;
+                                    bestPb = capB;
+                                    bridgeSingleVertex = false;
+                                    bridgeDogleg = false;
+                                    bridgeUCap = false;
+                                    bridged = true;
+                                    ++gMissingCapRestored;
+                                    std::cerr << "[TopologyMissingCap] fid="
+                                              << source_feature_id_
+                                              << " part=" << partIndex
+                                              << " chain=" << c
+                                              << " between_vertices="
+                                              << from << ".." << to
+                                              << " candidate_length=" << spanLen
+                                              << " angle_error="
+                                              << spanFold * 180.0 / M_PI
+                                              << " restored=1"
+                                              << " source=original_span"
+                                              << " max_local_wall_dist="
+                                              << capMaxDist << std::endl;
+                                    capRestored = true;
+                                }
+                            }
+                        }
+                        if (!capRestored) {
+                            std::cerr << "[TopologyMissingCap] fid="
+                                      << source_feature_id_
+                                      << " part=" << partIndex
+                                      << " chain=" << c
+                                      << " between_vertices="
+                                      << from << ".." << to
+                                      << " candidate_length=" << spanLen
+                                      << " restored=0"
+                                      << " source=u_cap"
+                                      << " reason="
+                                      << (capCandidate ? "shift_or_wall_fit"
+                                                       : "no_vertical_span")
+                                      << std::endl;
+                            if (failureOut &&
+                                failureOut->failedTransitionReason.empty()) {
+                                failureOut->failedTransitionReason =
+                                    "no_missing_cap";
+                            }
+                        }
+                    }
+                    if (!bridged) {
                     auto projectOntoLine = [&](const DirectionChain& ch,
                                                pcl::PointXYZ& out) {
                         const double t = ch.normalX * rawCorner.x +
@@ -11737,6 +12024,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                     for (double s : sCandidates) {
                         const char* uCapReject = nullptr;
                         double uCapFit = 0.0;
+                        double uCapMaxDist = 0.0;
                         pcl::PointXYZ qA, qB;
                         qA.x = static_cast<float>(pA.x + s * tx);
                         qA.y = static_cast<float>(pA.y + s * ty);
@@ -11752,15 +12040,28 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                         const double lenSegA = std::hypot(qA.x - pA.x, qA.y - pA.y);
                         const double lenMid = std::hypot(qB.x - qA.x, qB.y - qA.y);
                         const double lenSegB = std::hypot(pB.x - qB.x, pB.y - qB.y);
-                        if (!uCapReject && (lenMid < 0.02 || lenSegA < 0.02 ||
-                                            lenSegB < 0.02)) {
+                        // 中段是封口底边, 必须非零; 侧段允许退化(tau≈0 且
+                        // s≈0 时 qA==pA / qB==pB 是合法的单段封口形式,
+                        // 不能因侧段长度为零拒绝——那是实现 bug)
+                        if (!uCapReject && lenMid < 0.02) {
                             uCapReject = "zero_length";
                         }
+                        const bool degenerateA = lenSegA < 0.02;  // pA==qA
+                        const bool degenerateB = lenSegB < 0.02;  // qB==pB
+                        const char* form = degenerateA && degenerateB
+                            ? "single"
+                            : degenerateA ? "left_degenerate"
+                            : degenerateB ? "right_degenerate"
+                            : "three_segment";
                         if (!uCapReject) {
+                            // 只对实际存在的非零段执行采样贴合
                             bool fitOk = true;
                             const pcl::PointXYZ* path[3][2] = {
                                 {&pA, &qA}, {&qA, &qB}, {&qB, &pB}};
+                            const bool segActive[3] = {
+                                !degenerateA, true, !degenerateB};
                             for (int seg = 0; seg < 3 && fitOk; ++seg) {
+                                if (!segActive[seg]) continue;
                                 for (int t = 1; t <= 3 && fitOk; ++t) {
                                     const double f = 0.25 * t;
                                     pcl::PointXYZ mid;
@@ -11771,6 +12072,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                         path[seg][0]->y +
                                         f * (path[seg][1]->y - path[seg][0]->y));
                                     const double d = localDist(mid);
+                                    uCapMaxDist = std::max(uCapMaxDist, d);
                                     if (d > kBridgeFitLimit) {
                                         fitOk = false;
                                     } else {
@@ -11780,7 +12082,22 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                             }
                             if (!fitOk) uCapReject = "wall_fit";
                         }
-                        if (uCapReject) continue;
+                        if (uCapReject) {
+                            if (failureOut && failureOut->failedTransitionReason.empty()) {
+                                failureOut->failedTransitionReason = uCapReject;
+                            }
+                            std::cerr << "[TopologyBridgeGuard] fid="
+                                      << source_feature_id_
+                                      << " part=" << partIndex
+                                      << " chain=" << c
+                                      << " type=parallel_u_cap"
+                                      << " s=" << s << "/" << sB
+                                      << " lens=" << lenSegA << "/"
+                                      << lenMid << "/" << lenSegB
+                                      << " accepted=0"
+                                      << " reason=" << uCapReject << std::endl;
+                            continue;
+                        }
                         const double shiftA = std::hypot(
                             pA.x - rawCorner.x, pA.y - rawCorner.y);
                         const double shiftB = std::hypot(
@@ -11797,6 +12114,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                             bridgeSingleVertex = false;
                             bridgeDogleg = false;
                             bridgeUCap = true;
+                            bridgeUCapDegenerateA = degenerateA;
+                            bridgeUCapDegenerateB = degenerateB;
                             bridged = true;
                             ++gParallelUCapAccepted;
                             std::cerr << "[TopologyBridgeGuard] fid="
@@ -11804,16 +12123,21 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                       << " part=" << partIndex
                                       << " chain=" << c
                                       << " type=parallel_u_cap"
+                                      << " form=" << form
+                                      << " tau=" << tau
                                       << " shift=" << s << "/" << sB
                                       << " lens=" << lenSegA << "/"
                                       << lenMid << "/" << lenSegB
                                       << " max_local_wall_dist="
-                                      << uCapFit / 9.0
+                                      << uCapMaxDist
                                       << " accepted=1" << std::endl;
                             anyLogged = true;
                         }
                     }
                     if (!bridged && !anyLogged) {
+                        if (failureOut && failureOut->failedTransitionReason.empty()) {
+                            failureOut->failedTransitionReason = "no_valid_s";
+                        }
                         std::cerr << "[TopologyBridgeGuard] fid="
                                   << source_feature_id_
                                   << " part=" << partIndex
@@ -11823,6 +12147,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                   << " accepted=0"
                                   << " reason=no_valid_s" << std::endl;
                     }
+                    } // !bridged(原始封口已恢复时跳过合成)
                 }
             }
             if (bridged) {
@@ -11840,9 +12165,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                               << " accepted=1" << std::endl;
                 }
                 if (bridgeUCap) {
+                    // 按退化形式插入, 不添加重复点
                     topologyPolygon.push_back(bestPa);
-                    topologyPolygon.push_back(bestQA);
-                    topologyPolygon.push_back(bestQB);
+                    if (!bridgeUCapDegenerateA) topologyPolygon.push_back(bestQA);
+                    if (!bridgeUCapDegenerateB) topologyPolygon.push_back(bestQB);
                     topologyPolygon.push_back(bestPb);
                 } else {
                     topologyPolygon.push_back(bestPa);

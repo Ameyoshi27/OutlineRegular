@@ -28,8 +28,14 @@ struct DetectedDirectionSystem {
     double extent = 0.0;            // 空间覆盖(bbox对角线)
     double confidence = 0.0;        // 综合置信度 [0,1]
     double prominence = 0.0;        // KDE 峰显著度(相对主峰高度 [0,1])
+    double height = 0.0;            // KDE 峰高(相对主峰归一, 主峰=1.0)
     double avgEdgeLen = 0.0;        // 系统内平均边长(m), 诊断锯齿伪系统
     bool active = false;            // 生效方向(下游只消费 active 系统)
+    // 直墙证据救回: prominence 不达标但 ±5° 内有独立直墙支撑的峰。
+    // 救回峰的角度用直链 4θ 加权圆均值精化, active 走直墙独立通道
+    bool evidenceBacked = false;
+    int straightSupportCount = 0;
+    double straightSupportLength = 0.0;
 };
 
 // 检测结果: 整体
@@ -43,6 +49,11 @@ struct DetectedDirectionResult {
     double rawPrimaryAngle = 0.0;
     bool primaryRefined = false;
     std::string refinementReason;
+    // 全局 PCA 主轴诊断(供下游 alternate_direction 重试)
+    bool pcaValid = false;
+    double pcaAngleRad = 0.0;
+    double pcaAxisRatio = 0.0;
+    double pcaAnisotropy = 0.0;
     // 诊断
     int totalChains = 0;
     int stableChains = 0;

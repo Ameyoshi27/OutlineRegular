@@ -419,6 +419,9 @@ DetectedDirectionResult DetectBuildingDirection(
         double height = 0.0;
         double prominence = 0.0;
         double angleRad = 0.0;  // 抛物线插值后的峰位置
+        bool evidenceBacked = false;       // 直墙证据救回(prominence 不达标)
+        const char* acceptReason = "prominence";
+        double refinedAngleRad = std::numeric_limits<double>::quiet_NaN();
     };
     std::vector<Peak> peaks;
     for (std::size_t b = 0; b < kKdeBins; ++b) {
@@ -462,12 +465,124 @@ DetectedDirectionResult DetectBuildingDirection(
     const double independentLengthLimit = std::max(6.0, 0.04 * totalPerimeter);
     std::vector<Peak> accepted;
     std::vector<bool> independentlySeparated;
+    // ---- 直墙支持评估: 峰 ±5° 内高质量直链统计(救援与角度精化共用) ----
+    struct StraightSupport {
+        int straightCount = 0;
+        double straightLength = 0.0;
+        double longest = 0.0;
+        const DetChain* longestChain = nullptr;
+        double x4 = 0.0, y4 = 0.0, weightSum = 0.0;  // 4θ 圆均值累积
+    };
+    auto evaluateStraightSupport = [&](double peakAngle) {
+        StraightSupport s;
+        for (const auto& chain : chains) {
+            if (foldedDistance90(chain.angleRad, peakAngle) >
+                5.0 * M_PI / 180.0) continue;
+            // 高质量直链: 弦路比 + 垂直偏差(随弦长放宽) + 最小长度
+            const double devLimit = std::max(0.60, 0.02 * chain.chordLength);
+            const bool straight = chain.continuity >= 0.97 &&
+                chain.maxDeviation <= devLimit &&
+                chain.length >= std::max(2.0, 3.0 * pixelSize);
+            if (!straight) continue;
+            ++s.straightCount;
+            s.straightLength += chain.length;
+            if (chain.length > s.longest) {
+                s.longest = chain.length;
+                s.longestChain = &chain;
+            }
+            // 精化权重 = 投票权重(len^1.5 × 直线性折扣)
+            s.x4 += chain.weight * std::cos(4.0 * chain.angleRad);
+            s.y4 += chain.weight * std::sin(4.0 * chain.angleRad);
+            s.weightSum += chain.weight;
+        }
+        return s;
+    };
+    // 主峰最强支持链(空间独立性参照)
+    const StraightSupport mainSupport =
+        evaluateStraightSupport(peaks.front().bin * binStep);
+    const double rescueLengthGate = std::max(8.0, 0.04 * totalPerimeter);
+    const double rescueLongestGate = std::max(10.0, 0.04 * totalPerimeter);
+
+    int rejectedDiag = 0;
     for (auto& peak : peaks) {
         if (static_cast<int>(accepted.size()) >= kMaxFinalSystems) break;
         peak.prominence = circularProminence(density, peak.bin);
         if (!accepted.empty() &&
             peak.prominence < kPeakProminenceRatio * mainHeight) {
-            continue;
+            // ---- 直墙证据救援 ----
+            // 不降全局 prominence; 只有"高度比够 + 与已接受峰距离够 +
+            // 独立直墙支撑够"的峰被救回。低而宽的锯齿隆起依旧被拒。
+            const double heightRatio =
+                peak.height / std::max(mainHeight, 1e-12);
+            bool farEnough = true;
+            for (const auto& kept : accepted) {
+                if (foldedDistance90(peak.bin * binStep, kept.angleRad) <
+                    12.0 * M_PI / 180.0) {
+                    farEnough = false;
+                    break;
+                }
+            }
+            StraightSupport support;
+            const char* rescueReason = nullptr;
+            if (heightRatio < 0.12) {
+                rescueReason = "insufficient_height";
+            } else if (!farEnough) {
+                rescueReason = "too_close";
+            } else {
+                support = evaluateStraightSupport(peak.bin * binStep);
+                const bool enough = (support.straightCount >= 2 &&
+                                     support.straightLength >= rescueLengthGate) ||
+                    (support.straightCount >= 1 &&
+                     support.longest >= rescueLongestGate);
+                if (!enough) {
+                    rescueReason = "insufficient_straight_support";
+                } else if (mainSupport.longestChain && support.longestChain) {
+                    // 空间独立: 与主峰最强支持链不是同一段墙
+                    const double centerGap = std::hypot(
+                        support.longestChain->centerX -
+                            mainSupport.longestChain->centerX,
+                        support.longestChain->centerY -
+                            mainSupport.longestChain->centerY);
+                    const double requiredGap = std::max(3.0, 0.15 *
+                        (support.longestChain->chordLength +
+                         mainSupport.longestChain->chordLength));
+                    if (centerGap < requiredGap) {
+                        rescueReason = "not_spatially_independent";
+                    }
+                }
+            }
+            const bool rescued = rescueReason == nullptr;
+            if (rescued) {
+                peak.evidenceBacked = true;
+                peak.acceptReason = "straight_wall_rescue";
+                // 角度精化: 救回峰不用 KDE bin 的粗位置, 用 ±5° 直链
+                // 4θ 加权圆均值(折叠空间周期 90°, 必须四倍角)
+                if (support.weightSum > 1e-9 &&
+                    std::hypot(support.x4, support.y4) >
+                        1e-12 * support.weightSum) {
+                    peak.refinedAngleRad = foldedAngle90(
+                        0.25 * std::atan2(support.y4, support.x4));
+                }
+            }
+            if (fid >= 0 && (rescued || rejectedDiag < 3)) {
+                if (!rescued) ++rejectedDiag;
+                std::cerr << "[DirectionPeakFilter] fid=" << fid
+                          << " part=" << partIdx
+                          << " raw_deg=" << peak.bin * binStep * 180.0 / M_PI
+                          << " height_ratio=" << heightRatio
+                          << " prominence_ratio=" << peak.prominence /
+                                 std::max(mainHeight, 1e-12)
+                          << " straight_chains=" << support.straightCount
+                          << " straight_length=" << support.straightLength
+                          << " longest_chain=" << support.longest
+                          << " spatially_independent="
+                          << (rescued ? 1 : 0)
+                          << " accepted=" << (rescued ? 1 : 0)
+                          << " reason=" << (rescued
+                              ? "straight_wall_rescue" : rescueReason)
+                          << std::endl;
+            }
+            if (!rescued) continue;
         }
         // 抛物线插值细化峰位置
         const double left = density[(peak.bin + kKdeBins - 1) % kKdeBins];
@@ -479,6 +594,10 @@ DetectedDirectionResult DetectBuildingDirection(
         peak.angleRad = foldedAngle90(
             (static_cast<double>(peak.bin) + std::clamp(shift, -1.0, 1.0))
             * binStep);
+        if (peak.evidenceBacked &&
+            std::isfinite(peak.refinedAngleRad)) {
+            peak.angleRad = peak.refinedAngleRad;
+        }
         bool tooClose = false;
         bool independentClosePeak = false;
         for (const auto& kept : accepted) {
@@ -545,6 +664,15 @@ DetectedDirectionResult DetectBuildingDirection(
         system.angleRad = peak.angleRad;
         system.prominence = mainHeight > 1e-12
             ? peak.prominence / mainHeight : 0.0;
+        system.height = mainHeight > 1e-12
+            ? peak.height / mainHeight : 0.0;
+        if (peak.evidenceBacked) {
+            const StraightSupport support =
+                evaluateStraightSupport(peak.angleRad);
+            system.evidenceBacked = true;
+            system.straightSupportCount = support.straightCount;
+            system.straightSupportLength = support.straightLength;
+        }
         double x4 = 0.0, y4 = 0.0;
         for (const auto& chain : chains) {
             if (foldedDistance90(chain.angleRad, peak.angleRad) > statWindow) continue;
@@ -591,18 +719,29 @@ DetectedDirectionResult DetectBuildingDirection(
         } else {
             const bool independentClosePeak =
                 i < independentlySeparated.size() && independentlySeparated[i];
-            const bool enoughLength = system.totalLength >= minPhysicalLength ||
-                (independentClosePeak && system.totalLength >= independentLengthLimit);
-            const bool enoughSupport =
-                weightShare >= kActiveSystemMinWeightShare ||
-                lengthShare >= kActiveSystemMinLengthShare ||
-                independentClosePeak;
+            // 救回峰走直墙独立通道: 救援时已验证数量/最长/空间独立,
+            // 这里复核直墙总长门槛(与普通通道互斥, 不降普通阈值)
+            const bool enoughLength = system.evidenceBacked
+                ? system.straightSupportLength >= rescueLengthGate
+                : system.totalLength >= minPhysicalLength ||
+                    (independentClosePeak &&
+                     system.totalLength >= independentLengthLimit);
+            const bool enoughSupport = system.evidenceBacked
+                ? (system.straightSupportCount >= 2 ||
+                   system.straightSupportLength >= rescueLengthGate &&
+                   system.straightSupportCount >= 1)
+                : (weightShare >= kActiveSystemMinWeightShare ||
+                   lengthShare >= kActiveSystemMinLengthShare ||
+                   independentClosePeak);
             system.active = enoughLength && enoughSupport;
             if (system.active) {
-                reason = independentClosePeak && system.totalLength < minPhysicalLength
-                    ? "accepted_independent_chain"
-                    : (weightShare >= kActiveSystemMinWeightShare
-                        ? "accepted_weight" : "accepted_length");
+                reason = system.evidenceBacked
+                    ? "accepted_straight_wall"
+                    : independentClosePeak &&
+                          system.totalLength < minPhysicalLength
+                        ? "accepted_independent_chain"
+                        : (weightShare >= kActiveSystemMinWeightShare
+                            ? "accepted_weight" : "accepted_length");
             }
         }
         if (system.active) ++activeCount;
@@ -633,6 +772,10 @@ DetectedDirectionResult DetectBuildingDirection(
     // 多方向建筑(activeCount>=2)绝不使用 PCA 覆盖峰。
     {
         const ShapePcaDirection pca = computeShapePca(smoothRing, pixelSize);
+        result.pcaValid = pca.valid;
+        result.pcaAngleRad = pca.angleRad;
+        result.pcaAxisRatio = pca.axisRatio;
+        result.pcaAnisotropy = pca.anisotropy;
         const double deltaDeg = pca.valid
             ? foldedDistance90(result.systems.front().angleRad, pca.angleRad)
                 * 180.0 / M_PI
