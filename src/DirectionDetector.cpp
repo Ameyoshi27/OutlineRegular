@@ -29,6 +29,7 @@ constexpr double kKdeBandwidthDeg = 5.0;       // 墙体方向自然散布量级
 constexpr double kLenExponent = 1.5;           // 长边主导, 短边保留贡献
 constexpr double kPeakProminenceRatio = 0.12;  // 次峰至少高出鞍部 12% 主峰高度
 constexpr double kMinPeakSeparationDeg = 10.0; // 更近的方向在像素尺度不可分
+constexpr double kIndependentPeakMinSeparationDeg = 7.0;
 constexpr int kMaxFinalSystems = 5;
 // ---- 候选峰 → 生效方向的判据 ----
 // weightShare: len^指数权重对长边超线性放大, 短而真实的墙体在权重上吃亏
@@ -63,12 +64,141 @@ double wrappedTurn(double a, double b) {
 
 struct DetChain {
     double angleRad = 0.0;  // 折叠角 [0, π/2)
-    double length = 0.0;
+    double length = 0.0;    // 路径长度
+    double chordLength = 0.0;
     double weight = 0.0;    // length^kLenExponent
+    double rmse = 0.0;
+    double maxDeviation = 0.0;
+    double continuity = 1.0;  // chord/path
+    double centerX = 0.0;
+    double centerY = 0.0;
     int edgeCount = 0;
 };
 
-// ---- 边链化: 空间连续且转向平缓的边合并成链, 链角=端点向量 ----
+// 正交最小二乘直线拟合(TLS): 返回主轴方向与偏差统计。
+// 方向折叠到 [0, π/2)。
+struct TlsLineFit {
+    double angleRad = 0.0;
+    double rmse = 0.0;
+    double maxDeviation = 0.0;
+    bool valid = false;
+};
+TlsLineFit fitLineTLS(const pcl::PointXYZ* points, std::size_t count) {
+    TlsLineFit fit;
+    if (count < 2) return fit;
+    double cx = 0.0, cy = 0.0;
+    for (std::size_t i = 0; i < count; ++i) {
+        cx += points[i].x; cy += points[i].y;
+    }
+    cx /= count; cy /= count;
+    double sxx = 0.0, sxy = 0.0, syy = 0.0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const double dx = points[i].x - cx;
+        const double dy = points[i].y - cy;
+        sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+    }
+    // 2x2 协方差主轴: λmax 的特征向量
+    const double halfTrace = 0.5 * (sxx + syy);
+    const double disc = std::sqrt(
+        0.25 * (sxx - syy) * (sxx - syy) + sxy * sxy);
+    const double lambdaMax = halfTrace + disc;
+    double dirX = 0.0, dirY = 0.0;
+    if (std::abs(sxy) > 1e-12) {
+        dirX = sxy; dirY = lambdaMax - sxx;
+    } else if (sxx >= syy) {
+        dirX = 1.0; dirY = 0.0;
+    } else {
+        dirX = 0.0; dirY = 1.0;
+    }
+    const double norm = std::hypot(dirX, dirY);
+    if (norm < 1e-12) return fit;
+    dirX /= norm; dirY /= norm;
+    double sumSq = 0.0, maxDev = 0.0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const double dx = points[i].x - cx;
+        const double dy = points[i].y - cy;
+        const double dev = std::abs(-dirY * dx + dirX * dy);
+        sumSq += dev * dev;
+        maxDev = std::max(maxDev, dev);
+    }
+    fit.angleRad = foldedAngle90(std::atan2(dirY, dirX));
+    fit.rmse = std::sqrt(sumSq / count);
+    fit.maxDeviation = maxDev;
+    fit.valid = true;
+    return fit;
+}
+
+// 全局形状 PCA: 等弧长采样 + 协方差主轴。
+// 简化后顶点密度不均, 顶点等权 PCA 会被密集区带偏,
+// 等弧长采样恢复边界长度的话语权。
+struct ShapePcaDirection {
+    bool valid = false;
+    double angleRad = 0.0;
+    double axisRatio = 1.0;
+    double anisotropy = 0.0;
+};
+ShapePcaDirection computeShapePca(
+    const std::vector<pcl::PointXYZ>& ring, double pixelSize) {
+    ShapePcaDirection pca;
+    if (ring.size() < 4) return pca;
+    const double spacing = std::clamp(pixelSize, 0.3, 0.8);
+    std::vector<double> sx, sy;  // 等弧长采样点
+    sx.reserve(static_cast<std::size_t>(600.0 / spacing));
+    sy.reserve(sx.capacity());
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % ring.size()];
+        const double len = std::hypot(b.x - a.x, b.y - a.y);
+        if (len < 1e-6) continue;  // 跳过零长边(含闭合重复点)
+        const int steps = std::max(1, static_cast<int>(len / spacing));
+        for (int k = 0; k < steps; ++k) {
+            const double t = static_cast<double>(k) / steps;
+            sx.push_back(a.x + t * (b.x - a.x));
+            sy.push_back(a.y + t * (b.y - a.y));
+        }
+    }
+    if (sx.size() < 8) return pca;
+    double cx = 0.0, cy = 0.0;
+    for (std::size_t i = 0; i < sx.size(); ++i) {
+        cx += sx[i]; cy += sy[i];
+    }
+    cx /= sx.size(); cy /= sy.size();
+    double sxx = 0.0, sxy = 0.0, syy = 0.0;
+    for (std::size_t i = 0; i < sx.size(); ++i) {
+        const double dx = sx[i] - cx;
+        const double dy = sy[i] - cy;
+        sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+    }
+    const double halfTrace = 0.5 * (sxx + syy);
+    const double disc = std::sqrt(
+        0.25 * (sxx - syy) * (sxx - syy) + sxy * sxy);
+    const double lambdaMax = halfTrace + disc;
+    const double lambdaMin = halfTrace - disc;
+    if (lambdaMax < 1e-9 || lambdaMin < 1e-9) return pca;
+    double dirX = 0.0, dirY = 0.0;
+    if (std::abs(sxy) > 1e-12) {
+        dirX = sxy; dirY = lambdaMax - sxx;
+    } else if (sxx >= syy) {
+        dirX = 1.0; dirY = 0.0;
+    } else {
+        dirX = 0.0; dirY = 1.0;
+    }
+    const double norm = std::hypot(dirX, dirY);
+    if (norm < 1e-12) return pca;
+    pca.angleRad = foldedAngle90(std::atan2(dirY / norm, dirX / norm));
+    pca.axisRatio = lambdaMax / std::max(lambdaMin, 1e-9);
+    pca.anisotropy = (lambdaMax - lambdaMin) /
+        std::max(lambdaMax + lambdaMin, 1e-9);
+    pca.valid = true;
+    return pca;
+}
+
+// ---- 边链化: 空间连续 + 转向平缓 + 整体直线性三重约束 ----
+// 平滑环上斜墙是方向渐变的短边串, 逐边投票会在角度空间被摊薄,
+// 而精确对齐栅格轴的楼梯边高度集中, 密度峰被伪方向占据。
+// 以链为单位投票可恢复墙体的真实长度话语权;
+// 整体直线性约束(TLS 拟合偏差 + 弦路比)阻止弯曲边串被合并成
+// 错误长斜弦后获得 length^1.5 高权重。
 std::vector<DetChain> buildChainsFromRing(
     const std::vector<pcl::PointXYZ>& ring, double pixelSize) {
     struct RingEdge {
@@ -107,25 +237,60 @@ std::vector<DetChain> buildChainsFromRing(
 
     const double mergeTurn = kChainMergeTurnDeg * M_PI / 180.0;
     const double minChainLength = std::max(1.0, 2.0 * pixelSize);
+    // 直线性容差: 超限的弯曲链不切断(保留方向证据), 但权重按
+    // 弯曲度指数降权——弯曲链(渐变墙/弧段)不能获得 length^1.5
+    // 的完整话语权, 否则其首尾弦方向会虚假主导 KDE。
+    const double maxDevLimit = std::max(0.35, 1.2 * pixelSize);
+
     std::vector<DetChain> chains;
     std::size_t chainFromVertex = 0;
+    std::size_t chainVertexCount = 0;  // 链覆盖的顶点数(含起点)
     double chainDir = 0.0;
     double chainLen = 0.0;
     int chainEdges = 0;
-    const auto closeChain = [&](std::size_t endVertex) {
+
+    // 环序收集链覆盖顶点 [chainFromVertex, 环序 count 个]
+    auto collectVertices = [&](std::size_t count,
+                               std::vector<pcl::PointXYZ>& out) {
+        out.clear();
+        out.reserve(count);
+        for (std::size_t k = 0; k < count; ++k) {
+            out.push_back(ring[(chainFromVertex + k) % ring.size()]);
+        }
+    };
+    std::vector<pcl::PointXYZ> chainPoints;
+
+    auto closeChain = [&](std::size_t endVertex) {
         if (chainEdges == 0) return;
         const auto& a = ring[chainFromVertex];
         const auto& b = ring[endVertex];
-        const double spanX = b.x - a.x;
-        const double spanY = b.y - a.y;
-        if (std::hypot(spanX, spanY) > 1e-6 && chainLen >= minChainLength) {
-            DetChain chain;
-            chain.angleRad = foldedAngle90(std::atan2(spanY, spanX));
-            chain.length = chainLen;
-            chain.weight = std::pow(chainLen, kLenExponent);
-            chain.edgeCount = chainEdges;
-            chains.push_back(chain);
+        const double chord = std::hypot(b.x - a.x, b.y - a.y);
+        if (chord < 1e-6 || chainLen < minChainLength) return;
+        DetChain chain;
+        chain.length = chainLen;
+        chain.chordLength = chord;
+        chain.centerX = 0.5 * (a.x + b.x);
+        chain.centerY = 0.5 * (a.y + b.y);
+        chain.edgeCount = chainEdges;
+        chain.continuity = chord / std::max(chainLen, 1e-9);
+        TlsLineFit fit;
+        if (chainVertexCount >= 3) {
+            collectVertices(chainVertexCount, chainPoints);
+            fit = fitLineTLS(chainPoints.data(), chainPoints.size());
         }
+        if (fit.valid) {
+            // TLS 主轴方向比首尾弦更接近真实墙方向(渐变段对称轴)
+            chain.angleRad = fit.angleRad;
+            chain.rmse = fit.rmse;
+            chain.maxDeviation = fit.maxDeviation;
+        } else {
+            chain.angleRad = foldedAngle90(std::atan2(b.y - a.y, b.x - a.x));
+        }
+        // 弯曲度惩罚: maxDev 在容差内全额权重, 超出按指数衰减
+        const double excess = std::max(0.0, chain.maxDeviation / maxDevLimit - 1.0);
+        const double linearityFactor = std::exp(-excess);
+        chain.weight = std::pow(chainLen, kLenExponent) * linearityFactor;
+        chains.push_back(chain);
         chainEdges = 0;
     };
 
@@ -134,6 +299,7 @@ std::vector<DetChain> buildChainsFromRing(
         const auto& edge = edgeList[idx];
         if (chainEdges == 0) {
             chainFromVertex = edge.from;
+            chainVertexCount = 2;  // 起点 + 本边终点
             chainDir = edge.dirRad;
             chainLen = edge.length;
             chainEdges = 1;
@@ -145,9 +311,12 @@ std::vector<DetChain> buildChainsFromRing(
                 std::cos(chainDir) * chainLen + std::cos(edge.dirRad) * edge.length);
             chainLen += edge.length;
             ++chainEdges;
+            ++chainVertexCount;
         } else {
-            closeChain(edge.from);  // 链终点 = 上一边终点 = 新边起点
+            // 转向超限: 关闭当前链(终点=新边起点), 新链从当前边开始
+            closeChain(edge.from);
             chainFromVertex = edge.from;
+            chainVertexCount = 2;
             chainDir = edge.dirRad;
             chainLen = edge.length;
             chainEdges = 1;
@@ -286,7 +455,13 @@ DetectedDirectionResult DetectBuildingDirection(
 
     const double mainHeight = peaks.front().height;
     const double minSeparation = kMinPeakSeparationDeg * M_PI / 180.0;
+    const double independentMinSeparation =
+        kIndependentPeakMinSeparationDeg * M_PI / 180.0;
+    const double independentAngleTolerance = 3.0 * M_PI / 180.0;
+    const double straightDeviationLimit = std::max(0.35, 1.2 * pixelSize);
+    const double independentLengthLimit = std::max(6.0, 0.04 * totalPerimeter);
     std::vector<Peak> accepted;
+    std::vector<bool> independentlySeparated;
     for (auto& peak : peaks) {
         if (static_cast<int>(accepted.size()) >= kMaxFinalSystems) break;
         peak.prominence = circularProminence(density, peak.bin);
@@ -305,13 +480,62 @@ DetectedDirectionResult DetectBuildingDirection(
             (static_cast<double>(peak.bin) + std::clamp(shift, -1.0, 1.0))
             * binStep);
         bool tooClose = false;
+        bool independentClosePeak = false;
         for (const auto& kept : accepted) {
-            if (foldedDistance90(peak.angleRad, kept.angleRad) < minSeparation) {
-                tooClose = true;
-                break;
+            const double peakGap = foldedDistance90(peak.angleRad, kept.angleRad);
+            if (peakGap >= minSeparation) continue;
+
+            // A 7-10 degree pair is retained only when each peak owns a
+            // different long, straight wall chain in a different location.
+            const DetChain* peakSupport = nullptr;
+            const DetChain* keptSupport = nullptr;
+            for (const auto& chain : chains) {
+                const double dPeak = foldedDistance90(chain.angleRad, peak.angleRad);
+                const double dKept = foldedDistance90(chain.angleRad, kept.angleRad);
+                const double chainDeviationLimit = std::max(
+                    straightDeviationLimit, 0.02 * chain.chordLength);
+                const bool straight = chain.maxDeviation <= chainDeviationLimit &&
+                    chain.continuity >= 0.97;
+                if (!straight || chain.length < independentLengthLimit) continue;
+                if (dPeak <= independentAngleTolerance && dPeak + 1e-6 < dKept &&
+                    (!peakSupport || chain.length > peakSupport->length)) {
+                    peakSupport = &chain;
+                }
+                if (dKept <= independentAngleTolerance && dKept + 1e-6 < dPeak &&
+                    (!keptSupport || chain.length > keptSupport->length)) {
+                    keptSupport = &chain;
+                }
             }
+            bool spatiallyIndependent = false;
+            if (peakSupport && keptSupport) {
+                const double centerGap = std::hypot(
+                    peakSupport->centerX - keptSupport->centerX,
+                    peakSupport->centerY - keptSupport->centerY);
+                const double requiredGap = std::max(
+                    3.0, 0.15 * (peakSupport->chordLength + keptSupport->chordLength));
+                spatiallyIndependent = centerGap >= requiredGap;
+            }
+            if (peakGap >= independentMinSeparation && spatiallyIndependent) {
+                independentClosePeak = true;
+                if (fid >= 0) {
+                    std::cerr << "[DirectionPeakIndependence] fid=" << fid
+                              << " part=" << partIdx
+                              << " kept_deg=" << kept.angleRad * 180.0 / M_PI
+                              << " peak_deg=" << peak.angleRad * 180.0 / M_PI
+                              << " gap_deg=" << peakGap * 180.0 / M_PI
+                              << " support_len=" << keptSupport->length
+                              << "/" << peakSupport->length
+                              << " accepted=1" << std::endl;
+                }
+                continue;
+            }
+            tooClose = true;
+            break;
         }
-        if (!tooClose) accepted.push_back(peak);
+        if (!tooClose) {
+            accepted.push_back(peak);
+            independentlySeparated.push_back(independentClosePeak);
+        }
     }
 
     // ---- 每峰统计: ±1 统计窗口内的链(软归属的统计近似) ----
@@ -365,15 +589,20 @@ DetectedDirectionResult DetectBuildingDirection(
             system.active = true;
             reason = "primary";
         } else {
-            const bool enoughLength =
-                system.totalLength >= minPhysicalLength;
+            const bool independentClosePeak =
+                i < independentlySeparated.size() && independentlySeparated[i];
+            const bool enoughLength = system.totalLength >= minPhysicalLength ||
+                (independentClosePeak && system.totalLength >= independentLengthLimit);
             const bool enoughSupport =
                 weightShare >= kActiveSystemMinWeightShare ||
-                lengthShare >= kActiveSystemMinLengthShare;
+                lengthShare >= kActiveSystemMinLengthShare ||
+                independentClosePeak;
             system.active = enoughLength && enoughSupport;
             if (system.active) {
-                reason = weightShare >= kActiveSystemMinWeightShare
-                    ? "accepted_weight" : "accepted_length";
+                reason = independentClosePeak && system.totalLength < minPhysicalLength
+                    ? "accepted_independent_chain"
+                    : (weightShare >= kActiveSystemMinWeightShare
+                        ? "accepted_weight" : "accepted_length");
             }
         }
         if (system.active) ++activeCount;
@@ -392,9 +621,81 @@ DetectedDirectionResult DetectBuildingDirection(
     }
 
     result.valid = true;
+    result.rawPrimaryAngle = result.systems.front().angleRad;
     result.primaryAngle = result.systems.front().angleRad;
     result.concentration = result.systems.front().concentration;
     result.multiDirection = activeCount >= 2;
+
+    // ---- 单方向 PCA 保守纠偏 ----
+    // KDE 负责发现方向系统; PCA 只在"明确单方向 + 形状有可靠主轴 +
+    // 与 KDE 主峰同族(3°~8°)"时校正角度。弯曲链合并造成的长斜弦
+    // 会把 KDE 峰从真实墙方向拉开几度, 等弧长 PCA 主轴不受此影响。
+    // 多方向建筑(activeCount>=2)绝不使用 PCA 覆盖峰。
+    {
+        const ShapePcaDirection pca = computeShapePca(smoothRing, pixelSize);
+        const double deltaDeg = pca.valid
+            ? foldedDistance90(result.systems.front().angleRad, pca.angleRad)
+                * 180.0 / M_PI
+            : 0.0;
+        const char* pcaReason = nullptr;
+        if (result.multiDirection || activeCount != 1) {
+            pcaReason = "multi_direction";
+        } else if (!pca.valid) {
+            pcaReason = "invalid_pca";
+        } else if (pca.axisRatio < 2.5) {
+            pcaReason = "weak_axis";
+        } else if (deltaDeg < 3.0) {
+            pcaReason = "delta_too_small";
+        } else if (deltaDeg > 8.0) {
+            pcaReason = "delta_too_large";
+        }
+        const bool corrected = pcaReason == nullptr;
+        if (corrected) {
+            // 双同步: 下游(dirBuild/dirCtx/fallbackSystems)全部从
+            // systems.front().angleRad 派生, 只改 primaryAngle 会失配
+            result.systems.front().angleRad = pca.angleRad;
+            result.primaryAngle = pca.angleRad;
+            result.primaryRefined = true;
+            result.refinementReason = "pca_corrected";
+        }
+        if (fid >= 0) {
+            std::cerr << "[DirectionPCA] fid=" << fid
+                      << " part=" << partIdx
+                      << " kde_deg=" << result.rawPrimaryAngle * 180.0 / M_PI
+                      << " pca_deg=" << pca.angleRad * 180.0 / M_PI
+                      << " axis_ratio=" << pca.axisRatio
+                      << " anisotropy=" << pca.anisotropy
+                      << " delta_deg=" << deltaDeg
+                      << " active_systems=" << activeCount
+                      << " multi=" << (result.multiDirection ? 1 : 0)
+                      << " corrected=" << (corrected ? 1 : 0)
+                      << " reason=" << (corrected ? "corrected" : pcaReason)
+                      << std::endl;
+            if (true) {
+                // 高权重链诊断(前 5 条, 直线性约束效果核查)
+                std::vector<std::size_t> byWeight(chains.size());
+                for (std::size_t i = 0; i < chains.size(); ++i) byWeight[i] = i;
+                std::sort(byWeight.begin(), byWeight.end(),
+                    [&](std::size_t a, std::size_t b) {
+                        return chains[a].weight > chains[b].weight;
+                    });
+                for (std::size_t k = 0; k < byWeight.size() && k < 5; ++k) {
+                    const auto& chain = chains[byWeight[k]];
+                    std::cerr << "[DirectionChain] fid=" << fid
+                              << " rank=" << (k + 1)
+                              << " angle_deg=" << chain.angleRad * 180.0 / M_PI
+                              << " path_length=" << chain.length
+                              << " chord_length=" << chain.chordLength
+                              << " rmse=" << chain.rmse
+                              << " max_deviation=" << chain.maxDeviation
+                              << " continuity=" << chain.continuity
+                              << " weight_share="
+                              << chain.weight / std::max(totalWeight, 1e-9)
+                              << std::endl;
+                }
+            }
+        }
+    }
 
     if (fid >= 0) {
         std::cerr << "[DirectionDetect] fid=" << fid << " part=" << partIdx
@@ -403,6 +704,8 @@ DetectedDirectionResult DetectBuildingDirection(
                   << " active_systems=" << activeCount
                   << " multi=" << (result.multiDirection ? 1 : 0)
                   << " primary_deg=" << result.primaryAngle * 180.0 / M_PI
+                  << " raw_primary_deg=" << result.rawPrimaryAngle * 180.0 / M_PI
+                  << " refined=" << (result.primaryRefined ? 1 : 0)
                   << " chains=" << chains.size()
                   << " perimeter=" << totalPerimeter
                   << " vertices=" << smoothRing.size()

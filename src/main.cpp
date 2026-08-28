@@ -4885,6 +4885,8 @@ bool SaveDebugDirectionSystems(
     OGRFieldDefn lenField("len_m", OFTReal);
     OGRFieldDefn multiField("multi_dir", OFTInteger);
     OGRFieldDefn activeField("active", OFTInteger);
+    OGRFieldDefn rawAngField("raw_ang", OFTReal);
+    OGRFieldDefn refinedField("refined", OFTInteger);
     OGRFieldDefn validField("valid", OFTInteger);
     OGRFieldDefn rejectField("reject", OFTString);
     layer->CreateField(&fidField);
@@ -4897,6 +4899,8 @@ bool SaveDebugDirectionSystems(
     layer->CreateField(&lenField);
     layer->CreateField(&multiField);
     layer->CreateField(&activeField);
+    layer->CreateField(&rawAngField);
+    layer->CreateField(&refinedField);
     layer->CreateField(&validField);
     layer->CreateField(&rejectField);
     OGRFeatureDefn* defn = layer->GetLayerDefn();
@@ -4929,6 +4933,10 @@ bool SaveDebugDirectionSystems(
                 feature->SetField("chains", sys.chainCount);
                 feature->SetField("len_m", sys.totalLength);
                 feature->SetField("active", sys.active ? 1 : 0);
+                feature->SetField("raw_ang",
+                    record.detected.rawPrimaryAngle * 180.0 / M_PI);
+                feature->SetField("refined",
+                    record.detected.primaryRefined ? 1 : 0);
             }
             feature->SetField("multi_dir", record.detected.multiDirection ? 1 : 0);
             feature->SetField("valid", record.detected.valid ? 1 : 0);
@@ -5810,6 +5818,7 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
         }
     }
     auto loopEnd = std::chrono::steady_clock::now();
+    outlineRegular::PrintTopologyRetrySummary();
 
     // ---- 全局重叠解决: 所有单体规则化完成后统一处理建筑间相交 ----
     {
@@ -6425,6 +6434,7 @@ std::cout << "閲囨牱鐐逛簯鍏?" << sampled->cloud->size()
     }
     auto loopEnd = std::chrono::steady_clock::now();
     outlineRegular::PrintHypothesisRepairSummary();
+    outlineRegular::PrintTopologyRetrySummary();
 
     const std::filesystem::path debugDir = std::filesystem::path(inputVector).parent_path();
     const std::filesystem::path debugBestPath = debugDir / "debug_best_hypothesis.shp";

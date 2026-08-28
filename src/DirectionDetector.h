@@ -35,9 +35,14 @@ struct DetectedDirectionSystem {
 // 检测结果: 整体
 struct DetectedDirectionResult {
     bool valid = false;              // 是否有可信方向
-    bool multiDirection = false;    // 是否多方向
+    bool multiDirection = false;    // 是否多方向(active系统数>=2)
     double primaryAngle = 0.0;      // 主方向折叠角
     std::vector<DetectedDirectionSystem> systems;
+    // PCA 纠偏诊断: rawPrimaryAngle 是 KDE 原始峰角,
+    // primaryAngle 可能已被单方向 PCA 纠偏覆盖
+    double rawPrimaryAngle = 0.0;
+    bool primaryRefined = false;
+    std::string refinementReason;
     // 诊断
     int totalChains = 0;
     int stableChains = 0;

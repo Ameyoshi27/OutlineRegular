@@ -178,6 +178,29 @@ public:
 		int partIndex = 0,
 		const std::vector<pcl::PointXYZ>* rawRing = nullptr,
 		const void* detectedDirection = nullptr); // DetectedDirectionResult* (void* 避免头文件依赖)
+	// 拓扑通道单次构造的失败信息(供 wrapper 定向重试决策)
+	struct TopologyPassFailure {
+		std::string precheckReason;          // Ceres 前结构预检拒绝原因(空=通过)
+		std::string candidateQualityReason;  // 候选全量质量诊断(wall_deviation 等)
+		std::string ceresReason;             // Ceres 后验收拒绝原因
+		// 构造阶段失败(precheck 之前): 链数不足/方向不确定/转接失败等
+		std::string constructionReason;
+		std::size_t failedTransitionChain = static_cast<std::size_t>(-1);
+	};
+	// 单次拓扑构造实现: strictGeometry=true 启用共线合并全区间校验
+	// 与桥接整段贴合校验(仅重试二使用)。失败信息经 failureOut 传出。
+	private:
+	std::vector<pcl::PointXYZ> TopologyPreservingRegularizeImpl(
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		bool& usedFallback,
+		DirectionContextOut* dirContext,
+		int partIndex,
+		const std::vector<pcl::PointXYZ>* rawRing,
+		const void* detectedDirection,
+		bool strictGeometry,
+		TopologyPassFailure* failureOut);
+	public:
 		// Last-resort output that still obeys one explicitly selected orthogonal
 		// direction. It is used instead of writing an unregularized ring.
 		// 多方向骨架: 仅 multiDirection=true 且 systemAngles>=2(生效系统,
@@ -244,6 +267,8 @@ public:
 	void setCurveRestorationEnabled(bool enabled) { curve_restoration_enabled_ = enabled; }
 // 打印结构感知假设修复的运行级汇总。
 	static void PrintHypothesisRepairSummary();
+	// 拓扑通道定向重试运行级汇总(进程累计)
+	static void PrintTopologyRetrySummary();
 	static bool estimateSupportDirection2D(
 		const pcl::PointCloud<pcl::PointXYZ>::Ptr& support,
 		double& angle,

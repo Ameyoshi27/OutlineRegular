@@ -10776,6 +10776,22 @@ std::vector<pcl::PointXYZ> outlineRegular::CleanLowEvidenceIrregularities(
     return current;
 }
 
+// 拓扑通道定向重试的运行级计数(进程累计)
+namespace {
+    int gRetryRawKdeAttempted = 0;
+    int gRetryRawKdeAccepted = 0;
+    int gRetryStrictAttempted = 0;
+    int gRetryStrictAccepted = 0;
+    int gTriggerWall = 0;
+    int gTriggerFlying = 0;
+    int gTriggerTransition = 0;
+    int gOrthogonalDoglegAccepted = 0;
+    int gParallelUCapAccepted = 0;
+}
+
+// 拓扑保持规则化主通道 wrapper: 首次正常构造; 失败后按失败类型
+// 定向重试(raw_kde 方向回滚 / strict_geometry 严格几何), 仍失败
+// 走 VDP→StrictFallback→OBR。已成功的建筑不进重试分支。
 std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     const std::vector<pcl::PointXYZ>& initialRing,
     double pixelSize,
@@ -10784,6 +10800,150 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     int partIndex,
     const std::vector<pcl::PointXYZ>* rawRing,
     const void* detectedDirection)
+{
+    TopologyPassFailure failure;
+    // 失败原因格式化: construction > precheck > ceres > candidateQuality
+    auto formatFailure = [](const TopologyPassFailure& f) {
+        if (!f.constructionReason.empty()) return f.constructionReason;
+        if (!f.precheckReason.empty()) return f.precheckReason;
+        if (!f.ceresReason.empty()) return f.ceresReason;
+        if (!f.candidateQualityReason.empty()) {
+            return f.candidateQualityReason;
+        }
+        return std::string("unknown");
+    };
+    std::vector<pcl::PointXYZ> first = TopologyPreservingRegularizeImpl(
+        initialRing, pixelSize, usedFallback, dirContext, partIndex,
+        rawRing, detectedDirection, false, &failure);
+    if (!first.empty()) return first;
+
+    // ---- 重试一: raw_kde 方向回滚 ----
+    // PCA 纠偏把主方向拉离 KDE 峰后候选自交的场景: 用原始 KDE 峰
+    // 重建格网。不修改原始检测结果, 只造局部副本。
+    TopologyPassFailure retryFailure;
+    bool retryAttempted = false;
+    if (failure.precheckReason == "self_intersecting" && detectedDirection) {
+        const auto* ext =
+            static_cast<const DetectedDirectionResult*>(detectedDirection);
+        int activeCount = 0;
+        for (const auto& s : ext->systems) {
+            if (s.active) ++activeCount;
+        }
+        const double angleDelta = ext->valid
+            ? std::abs(foldedAngleDistance90(
+                  ext->rawPrimaryAngle, ext->primaryAngle))
+            : 0.0;
+        if (ext->valid && ext->primaryRefined && activeCount == 1 &&
+            angleDelta > 1e-9) {
+            DetectedDirectionResult retryDir = *ext;
+            retryDir.primaryAngle = ext->rawPrimaryAngle;
+            for (auto& s : retryDir.systems) {
+                if (s.active) {
+                    s.angleRad = ext->rawPrimaryAngle;
+                    break;
+                }
+            }
+            retryDir.primaryRefined = false;
+            retryDir.refinementReason = "raw_kde_retry";
+            std::cerr << "[TopologyRetry] fid=" << source_feature_id_
+                      << " part=" << partIndex << " mode=raw_kde"
+                      << " old_deg=" << ext->primaryAngle * 180.0 / M_PI
+                      << " retry_deg=" << ext->rawPrimaryAngle * 180.0 / M_PI
+                      << " trigger=self_intersecting" << std::endl;
+            retryAttempted = true;
+            ++gRetryRawKdeAttempted;
+            std::vector<pcl::PointXYZ> second = TopologyPreservingRegularizeImpl(
+                initialRing, pixelSize, usedFallback, dirContext, partIndex,
+                rawRing, &retryDir, false, &retryFailure);
+            const bool accepted = !second.empty();
+            if (accepted) ++gRetryRawKdeAccepted;
+            std::cerr << "[TopologyRetryResult] fid=" << source_feature_id_
+                      << " mode=raw_kde accepted=" << (accepted ? 1 : 0)
+                      << " reason="
+                      << (accepted ? "ok" : formatFailure(retryFailure))
+                      << std::endl;
+            if (accepted) return second;
+        }
+    }
+
+    // ---- 重试二: strict_geometry 严格几何 ----
+    // 三类触发: 双重 wall_deviation / 双重 flying_vertex / 构造期
+    // 转接失败。MergeGuard 阻断漂移合并 + 严格桥接贴合 + dogleg/U形
+    // 封口重建, 全部质量门保持不变。
+    {
+        const TopologyPassFailure& effective =
+            (retryAttempted &&
+             !retryFailure.constructionReason.empty() &&
+             failure.constructionReason.empty())
+                ? retryFailure : failure;
+        const char* trigger = nullptr;
+        if (!effective.constructionReason.empty()) {
+            trigger = "transition_construction_failed";
+        } else if (effective.ceresReason == "wall_deviation" &&
+                   effective.candidateQualityReason == "wall_deviation") {
+            trigger = "wall_deviation";
+        } else if (effective.ceresReason == "flying_vertex" &&
+                   effective.candidateQualityReason == "flying_vertex") {
+            trigger = "flying_vertex";
+        }
+        if (trigger) {
+            std::cerr << "[TopologyRetry] fid=" << source_feature_id_
+                      << " part=" << partIndex << " mode=strict_geometry"
+                      << " trigger=" << trigger
+                      << " chain="
+                      << (effective.failedTransitionChain ==
+                              static_cast<std::size_t>(-1)
+                              ? -1
+                              : static_cast<long long>(
+                                    effective.failedTransitionChain))
+                      << std::endl;
+            ++gRetryStrictAttempted;
+            if (std::string(trigger) == "wall_deviation") ++gTriggerWall;
+            else if (std::string(trigger) == "flying_vertex") ++gTriggerFlying;
+            else ++gTriggerTransition;
+            TopologyPassFailure strictFailure;
+            std::vector<pcl::PointXYZ> third = TopologyPreservingRegularizeImpl(
+                initialRing, pixelSize, usedFallback, dirContext, partIndex,
+                rawRing, detectedDirection, true, &strictFailure);
+            const bool accepted = !third.empty();
+            if (accepted) ++gRetryStrictAccepted;
+            std::cerr << "[TopologyRetryResult] fid=" << source_feature_id_
+                      << " mode=strict_geometry accepted=" << (accepted ? 1 : 0)
+                      << " reason="
+                      << (accepted ? "ok" : formatFailure(strictFailure))
+                      << std::endl;
+            if (accepted) return third;
+        }
+    }
+    return {};
+}
+
+void outlineRegular::PrintTopologyRetrySummary()
+{
+    std::cout << "[TopologyRetrySummary]"
+              << " raw_kde_attempted=" << gRetryRawKdeAttempted
+              << " raw_kde_accepted=" << gRetryRawKdeAccepted
+              << " strict_geometry_attempted=" << gRetryStrictAttempted
+              << " strict_geometry_accepted=" << gRetryStrictAccepted
+              << " trigger_wall=" << gTriggerWall
+              << " trigger_flying=" << gTriggerFlying
+              << " trigger_transition=" << gTriggerTransition
+              << " orthogonal_dogleg_accepted=" << gOrthogonalDoglegAccepted
+              << " parallel_u_cap_accepted=" << gParallelUCapAccepted
+              << " original_topology_changed=0"
+              << std::endl;
+}
+
+std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
+    const std::vector<pcl::PointXYZ>& initialRing,
+    double pixelSize,
+    bool& usedFallback,
+    DirectionContextOut* dirContext,
+    int partIndex,
+    const std::vector<pcl::PointXYZ>* rawRing,
+    const void* detectedDirection,
+    bool strictGeometry,
+    TopologyPassFailure* failureOut)
 {
     usedFallback = false;
     if (initialRing.size() < 6) {
@@ -11057,6 +11217,9 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
         // 方向不确定: 交给 VDP 备用流程, 不强行套用方向系统。
         // 区分原因: 未归组占比超限(方向证据冲突) vs 置信度/评分不足
         usedFallback = true;
+        if (failureOut) {
+            failureOut->constructionReason = "direction_uncertain";
+        }
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                   << " part=" << partIndex
                   << " reason="
@@ -11139,12 +11302,45 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 if (onx * cj.normalX + ony * cj.normalY < 0.0) { onx = -onx; ony = -ony; }
                 const double offJ = onx * cj.centerX + ony * cj.centerY;
                 if (std::abs(ci.lineOffset - offJ) > offsetMergeTol) continue;
+                // 严格模式: 合并链全区间校验——按环序取 ci 起点到 cj 终点
+                // 的完整初始轮廓区间, 对合并候选直线算最大垂距。相邻链
+                // 两两比较会发生传递性累计漂移(每步都在容差内, 累计远
+                // 超容差), 产生横跨轮廓的伪长边。
+                if (strictGeometry) {
+                    const double mergedOff =
+                        (ci.lineOffset * ci.length + offJ * cj.length) /
+                        std::max(ci.length + cj.length, 1e-9);
+                    double spanMaxDev = 0.0;
+                    std::size_t spanPoints = 0;
+                    std::size_t idx = ci.startIndexOriginal;
+                    const std::size_t ringSize = initialRing.size();
+                    for (std::size_t guard = 0; guard <= ringSize; ++guard) {
+                        const auto& p = initialRing[idx];
+                        spanMaxDev = std::max(spanMaxDev,
+                            std::abs(onx * p.x + ony * p.y - mergedOff));
+                        ++spanPoints;
+                        if (idx == cj.endIndexOriginal) break;
+                        idx = (idx + 1) % ringSize;
+                    }
+                    if (spanMaxDev > fitTolerance) {
+                        std::cerr << "[TopologyMergeGuard] fid="
+                                  << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " chain=" << i
+                                  << " span_points=" << spanPoints
+                                  << " max_dev=" << spanMaxDev
+                                  << " tolerance=" << fitTolerance
+                                  << " rejected=1" << std::endl;
+                        continue;
+                    }
+                }
                 // 合并: 保留 i 的区间端点，几何参数取长度加权
                 DirectionChain m = ci;
                 const double w1 = ci.length;
                 const double w2 = cj.length;
                 const double wSum = std::max(w1 + w2, 1e-9);
                 m.endPoint = cj.endPoint;
+                m.endIndexOriginal = cj.endIndexOriginal;
                 m.length = w1 + w2;
                 m.centerX = 0.5 * (m.startPoint.x + m.endPoint.x);
                 m.centerY = 0.5 * (m.startPoint.y + m.endPoint.y);
@@ -11160,6 +11356,9 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     }
     if (topoChains.size() < 3) {
         usedFallback = true;
+        if (failureOut) {
+            failureOut->constructionReason = "merged_chains_too_few";
+        }
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                   << " reason=merged_chains_too_few" << std::endl;
         return {};
@@ -11231,6 +11430,13 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 const double marginB = std::max(1.0, 0.5 * lenB);
                 const double tA = segParam(isect, chainA);
                 const double tB = segParam(isect, chainB);
+                const double normalDot = std::abs(
+                    chainA.normalX * chainB.normalX +
+                    chainA.normalY * chainB.normalY);
+                const bool orthogonalMicroCorner =
+                    normalDot < 0.05 &&
+                    std::min(lenA, lenB) <= 1.5 &&
+                    shift <= 1.5;
                 // 有限边段交点的全部条件: 数值有效 + 近角点 + 参数在
                 // 两链有限范围内(含适度外延, 允许墙线自然延伸到角点)。
                 // 垂直链对的交点是唯一的合法角点(active 方向的任何
@@ -11238,10 +11444,23 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 // 吸附偏差交给 Ceres 拉回。
                 if (std::isfinite(isect.x) && std::isfinite(isect.y) &&
                     shift <= transitionShiftLimit &&
-                    tA >= -marginA && tA <= lenA + marginA &&
-                    tB >= -marginB && tB <= lenB + marginB) {
+                    ((tA >= -marginA && tA <= lenA + marginA &&
+                      tB >= -marginB && tB <= lenB + marginB) ||
+                     orthogonalMicroCorner)) {
                     vertex = isect;
                     useIntersection = true;
+                    if (orthogonalMicroCorner &&
+                        !(tA >= -marginA && tA <= lenA + marginA &&
+                          tB >= -marginB && tB <= lenB + marginB)) {
+                        std::cerr << "[TopologyTransition] fid="
+                                  << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " chain=" << c
+                                  << " stage=orthogonal_micro_corner"
+                                  << " shift=" << shift
+                                  << " len=" << lenA << "/" << lenB
+                                  << " accepted=1" << std::endl;
+                    }
                 }
             }
         }
@@ -11255,11 +11474,49 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
             // Ceres 前 direction_violation 的主要来源)。
             bool bridged = false;
             bool bridgeSingleVertex = false;  // 两链同线: 交点重合, 单顶点转接
+            bool bridgeDogleg = false;        // 两段正交桥: pa→rawCorner→pb
+            bool bridgeUCap = false;          // 平行链 U 形封口: pA→qA→qB→pB
             double bestCost = std::numeric_limits<double>::max();
-            pcl::PointXYZ bestPa, bestPb;
+            pcl::PointXYZ bestPa, bestPb, bestQA, bestQB;
             // 位移预算随相邻物理链尺度增长，但封顶4m；桥接边长度不能
             // 超过两端位移预算之和。最终仍由Ceres后完整质量检查裁决。
             const double bridgeGapLimit = 2.0 * transitionShiftLimit;
+            // 严格模式: 桥接段整段贴合校验(采样点到初始轮廓距离)
+            double bestFitPenalty = 0.0;
+            auto distToInitialRing = [&](const pcl::PointXYZ& pt) {
+                double best = std::numeric_limits<double>::max();
+                for (std::size_t i = 0; i < initialRing.size(); ++i) {
+                    const auto& a = initialRing[i];
+                    const auto& b = initialRing[(i + 1) % initialRing.size()];
+                    const double dx = b.x - a.x;
+                    const double dy = b.y - a.y;
+                    const double lenSq = dx * dx + dy * dy;
+                    if (lenSq < 1e-12) continue;
+                    double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+                    t = std::clamp(t, 0.0, 1.0);
+                    best = std::min(best,
+                        std::hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy));
+                }
+                return best;
+            };
+            // 段 pa→pb 在 t=0.25/0.5/0.75 采样, 任一点距环 >1.2m 无效;
+            // 返回贴合惩罚(采样距离和, 供代价比较)
+            constexpr double kBridgeFitLimit = 1.2;
+            auto segmentFitPenalty = [&](const pcl::PointXYZ& pa,
+                                         const pcl::PointXYZ& pb,
+                                         double& penalty) {
+                penalty = 0.0;
+                for (int t = 1; t <= 3; ++t) {
+                    const double s = 0.25 * t;
+                    pcl::PointXYZ mid;
+                    mid.x = static_cast<float>(pa.x + s * (pb.x - pa.x));
+                    mid.y = static_cast<float>(pa.y + s * (pb.y - pa.y));
+                    const double d = distToInitialRing(mid);
+                    if (d > kBridgeFitLimit) return false;
+                    penalty += d;
+                }
+                return true;
+            };
             for (double baseAngle : systemAngles) {
                 for (int k = 0; k < 2; ++k) {
                     const double psi = baseAngle + k * M_PI / 2.0;
@@ -11289,23 +11546,316 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                         shiftB > transitionShiftLimit) continue;
                     const double gap = std::hypot(pa.x - pb.x, pa.y - pb.y);
                     if (gap > bridgeGapLimit) continue;
-                    const double cost = shiftA + shiftB + gap;
+                    double fitPenalty = 0.0;
+                    if (strictGeometry &&
+                        !segmentFitPenalty(pa, pb, fitPenalty)) {
+                        continue;  // 桥接段跨离初始轮廓
+                    }
+                    const double cost = shiftA + shiftB + gap + fitPenalty;
                     if (cost < bestCost) {
                         bestCost = cost;
                         bestPa = pa;
                         bestPb = pb;
+                        bestFitPenalty = fitPenalty;
                         bridgeSingleVertex = gap < 0.05;
+                        bridgeDogleg = false;
                         bridged = true;
                     }
                 }
             }
+            // 严格模式: 两段正交桥(orthogonal dogleg)候选——原始角点
+            // 分别投影到两链吸附线, 路径 pa→rawCorner→pb 的两段分别
+            // 垂直于所属链(即平行于该链方向系统的正交方向)。仅适用
+            // 两链近垂直(法向点积≈0); 反向平行链的 U 形封口见下方
+            // parallel_u_cap。
+            if (strictGeometry && !bridged) {
+                const double normalDot = std::abs(
+                    chainA.normalX * chainB.normalX +
+                    chainA.normalY * chainB.normalY);
+                // 法向夹角接近 90° 时 |dot| 接近 0
+                const double kDoglegOrthogonalDotMax =
+                    std::sin(3.0 * M_PI / 180.0);
+                const char* doglegReject = nullptr;
+                if (normalDot > kDoglegOrthogonalDotMax) {
+                    doglegReject = "angle";
+                }
+                if (normalDot <= kDoglegOrthogonalDotMax) {
+                    auto projectOntoChainLine = [&](const DirectionChain& ch,
+                                                    pcl::PointXYZ& out) {
+                        const double t = ch.normalX * (rawCorner.x) +
+                                         ch.normalY * (rawCorner.y) - ch.lineOffset;
+                        out.x = static_cast<float>(rawCorner.x - t * ch.normalX);
+                        out.y = static_cast<float>(rawCorner.y - t * ch.normalY);
+                        out.z = zVal;
+                    };
+                    pcl::PointXYZ pa, pb;
+                    projectOntoChainLine(chainA, pa);
+                    projectOntoChainLine(chainB, pb);
+                    const double shiftA = std::hypot(
+                        pa.x - rawCorner.x, pa.y - rawCorner.y);
+                    const double shiftB = std::hypot(
+                        pb.x - rawCorner.x, pb.y - rawCorner.y);
+                    const double lenAseg = shiftA;
+                    const double lenBseg = shiftB;
+                    if (shiftA > transitionShiftLimit ||
+                        shiftB > transitionShiftLimit) {
+                        doglegReject = "shift";
+                    } else if (lenAseg < 0.02 || lenBseg < 0.02) {
+                        doglegReject = "zero_length";
+                    } else {
+                        double penaltyA = 0.0, penaltyB = 0.0;
+                        const bool fitA = segmentFitPenalty(pa, rawCorner, penaltyA);
+                        const bool fitB = segmentFitPenalty(rawCorner, pb, penaltyB);
+                        if (!fitA || !fitB) {
+                            doglegReject = "wall_fit";
+                        } else {
+                            const double cost = shiftA + shiftB +
+                                lenAseg + lenBseg + penaltyA + penaltyB;
+                            if (cost < bestCost) {
+                                bestCost = cost;
+                                bestPa = pa;
+                                bestPb = pb;
+                                bridgeSingleVertex = false;
+                                bridgeDogleg = true;
+                                bridged = true;
+                                ++gOrthogonalDoglegAccepted;
+                                std::cerr << "[TopologyBridgeGuard] fid="
+                                          << source_feature_id_
+                                          << " part=" << partIndex
+                                          << " chain=" << c
+                                          << " type=orthogonal_dogleg"
+                                          << " normal_dot=" << normalDot
+                                          << " shift_a=" << shiftA
+                                          << " shift_b=" << shiftB
+                                          << " max_wall_dist="
+                                          << std::max(penaltyA, penaltyB) / 3.0
+                                          << " accepted=1" << std::endl;
+                            }
+                        }
+                    }
+                    if (doglegReject) {
+                        std::cerr << "[TopologyBridgeGuard] fid="
+                                  << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " chain=" << c
+                                  << " type=orthogonal_dogleg"
+                                  << " normal_dot=" << normalDot
+                                  << " shift_a=" << shiftA
+                                  << " shift_b=" << shiftB
+                                  << " accepted=0"
+                                  << " reason=" << doglegReject << std::endl;
+                    }
+                } else if (doglegReject) {
+                    std::cerr << "[TopologyBridgeGuard] fid="
+                              << source_feature_id_
+                              << " part=" << partIndex
+                              << " chain=" << c
+                              << " type=orthogonal_dogleg"
+                              << " normal_dot=" << normalDot
+                              << " accepted=0"
+                              << " reason=" << doglegReject << std::endl;
+                }
+            }
+            // 严格模式: 平行链的 U 形封口(parallel_u_cap)——
+            // 两平行墙(不同 offset)由三段闭合: 切向段 ∥ 墙, 中段 ⊥ 墙,
+            // 全部属于 active 方向系统。统一参数化: qA = pA + s·tA,
+            // qB = pB + (s-τ)·tA (τ 为两投影点切向差), 中段垂直约束
+            // 联动 sA/sB; s 从有限候选集取 {0, τ, τ/2, 局部轮廓投影}。
+            if (strictGeometry && !bridged) {
+                const double normalDotU = std::abs(
+                    chainA.normalX * chainB.normalX +
+                    chainA.normalY * chainB.normalY);
+                const double kParallelDotMin =
+                    std::cos(3.0 * M_PI / 180.0);
+                if (normalDotU >= kParallelDotMin) {
+                    auto projectOntoLine = [&](const DirectionChain& ch,
+                                               pcl::PointXYZ& out) {
+                        const double t = ch.normalX * rawCorner.x +
+                                         ch.normalY * rawCorner.y - ch.lineOffset;
+                        out.x = static_cast<float>(rawCorner.x - t * ch.normalX);
+                        out.y = static_cast<float>(rawCorner.y - t * ch.normalY);
+                        out.z = zVal;
+                    };
+                    pcl::PointXYZ pA, pB;
+                    projectOntoLine(chainA, pA);
+                    projectOntoLine(chainB, pB);
+                    // 切向必须用吸附线方向(norm+90°), 不能用链的原始
+                    // 弦方向——弦与吸附线可差数十度, τ 与滑移方向随之
+                    // 失真, 三段不再真正平行/垂直于吸附墙
+                    const double tx = -chainA.normalY;
+                    const double ty = chainA.normalX;
+                    const double tau = (pB.x - pA.x) * tx + (pB.y - pA.y) * ty;
+                    // 局部窗口: 转接附近初始环区间(贴合校验用)
+                    const auto sIdx = chainA.startIndexOriginal;
+                    const auto eIdx = chainB.endIndexOriginal;
+                    const std::size_t ringN = initialRing.size();
+                    std::vector<std::pair<pcl::PointXYZ, pcl::PointXYZ>>
+                        localEdges;
+                    {
+                        std::size_t idx2 = sIdx;
+                        for (std::size_t guard = 0; guard <= ringN; ++guard) {
+                            const auto nxt = (idx2 + 1) % ringN;
+                            localEdges.emplace_back(initialRing[idx2],
+                                                    initialRing[nxt]);
+                            if (nxt == eIdx) break;
+                            idx2 = nxt;
+                        }
+                    }
+                    auto localDist = [&](const pcl::PointXYZ& pt) {
+                        double best = std::numeric_limits<double>::max();
+                        for (const auto& seg : localEdges) {
+                            const double dx = seg.second.x - seg.first.x;
+                            const double dy = seg.second.y - seg.first.y;
+                            const double ls = dx * dx + dy * dy;
+                            if (ls < 1e-12) continue;
+                            double t = ((pt.x - seg.first.x) * dx +
+                                        (pt.y - seg.first.y) * dy) / ls;
+                            t = std::clamp(t, 0.0, 1.0);
+                            best = std::min(best, std::hypot(
+                                pt.x - seg.first.x - t * dx,
+                                pt.y - seg.first.y - t * dy));
+                        }
+                        return best;
+                    };
+                    std::vector<double> sCandidates;
+                    sCandidates.push_back(0.0);
+                    sCandidates.push_back(tau);
+                    sCandidates.push_back(0.5 * tau);
+                    {
+                        const std::size_t cornerIdx = chainA.endIndexOriginal;
+                        for (int delta = -2; delta <= 2; ++delta) {
+                            const std::size_t vi =
+                                (cornerIdx + ringN + delta) % ringN;
+                            const double sv = (initialRing[vi].x - pA.x) * tx +
+                                              (initialRing[vi].y - pA.y) * ty;
+                            if (std::abs(sv) <= 2.0 + transitionShiftLimit) {
+                                sCandidates.push_back(sv);
+                            }
+                        }
+                    }
+                    bool anyLogged = false;
+                    for (double s : sCandidates) {
+                        const char* uCapReject = nullptr;
+                        double uCapFit = 0.0;
+                        pcl::PointXYZ qA, qB;
+                        qA.x = static_cast<float>(pA.x + s * tx);
+                        qA.y = static_cast<float>(pA.y + s * ty);
+                        qA.z = zVal;
+                        const double sB = s - tau;
+                        qB.x = static_cast<float>(pB.x + sB * tx);
+                        qB.y = static_cast<float>(pB.y + sB * ty);
+                        qB.z = zVal;
+                        if (std::abs(s) > transitionShiftLimit ||
+                            std::abs(sB) > transitionShiftLimit) {
+                            uCapReject = "shift";
+                        }
+                        const double lenSegA = std::hypot(qA.x - pA.x, qA.y - pA.y);
+                        const double lenMid = std::hypot(qB.x - qA.x, qB.y - qA.y);
+                        const double lenSegB = std::hypot(pB.x - qB.x, pB.y - qB.y);
+                        if (!uCapReject && (lenMid < 0.02 || lenSegA < 0.02 ||
+                                            lenSegB < 0.02)) {
+                            uCapReject = "zero_length";
+                        }
+                        if (!uCapReject) {
+                            bool fitOk = true;
+                            const pcl::PointXYZ* path[3][2] = {
+                                {&pA, &qA}, {&qA, &qB}, {&qB, &pB}};
+                            for (int seg = 0; seg < 3 && fitOk; ++seg) {
+                                for (int t = 1; t <= 3 && fitOk; ++t) {
+                                    const double f = 0.25 * t;
+                                    pcl::PointXYZ mid;
+                                    mid.x = static_cast<float>(
+                                        path[seg][0]->x +
+                                        f * (path[seg][1]->x - path[seg][0]->x));
+                                    mid.y = static_cast<float>(
+                                        path[seg][0]->y +
+                                        f * (path[seg][1]->y - path[seg][0]->y));
+                                    const double d = localDist(mid);
+                                    if (d > kBridgeFitLimit) {
+                                        fitOk = false;
+                                    } else {
+                                        uCapFit += d;
+                                    }
+                                }
+                            }
+                            if (!fitOk) uCapReject = "wall_fit";
+                        }
+                        if (uCapReject) continue;
+                        const double shiftA = std::hypot(
+                            pA.x - rawCorner.x, pA.y - rawCorner.y);
+                        const double shiftB = std::hypot(
+                            pB.x - rawCorner.x, pB.y - rawCorner.y);
+                        const double cost = shiftA + shiftB +
+                            lenSegA + lenMid + lenSegB + uCapFit +
+                            0.1 * (std::abs(s) + std::abs(sB));
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            bestPa = pA;
+                            bestPb = pB;
+                            bestQA = qA;
+                            bestQB = qB;
+                            bridgeSingleVertex = false;
+                            bridgeDogleg = false;
+                            bridgeUCap = true;
+                            bridged = true;
+                            ++gParallelUCapAccepted;
+                            std::cerr << "[TopologyBridgeGuard] fid="
+                                      << source_feature_id_
+                                      << " part=" << partIndex
+                                      << " chain=" << c
+                                      << " type=parallel_u_cap"
+                                      << " shift=" << s << "/" << sB
+                                      << " lens=" << lenSegA << "/"
+                                      << lenMid << "/" << lenSegB
+                                      << " max_local_wall_dist="
+                                      << uCapFit / 9.0
+                                      << " accepted=1" << std::endl;
+                            anyLogged = true;
+                        }
+                    }
+                    if (!bridged && !anyLogged) {
+                        std::cerr << "[TopologyBridgeGuard] fid="
+                                  << source_feature_id_
+                                  << " part=" << partIndex
+                                  << " chain=" << c
+                                  << " type=parallel_u_cap"
+                                  << " tau=" << tau
+                                  << " accepted=0"
+                                  << " reason=no_valid_s" << std::endl;
+                    }
+                }
+            }
             if (bridged) {
-                // 同线链的交点重合: 单顶点即可; 否则插入桥接点对,
-                // 连接边方向 = 桥接方向(active 方向)
-                topologyPolygon.push_back(bestPa);
-                if (!bridgeSingleVertex) topologyPolygon.push_back(bestPb);
+                // 同线链的交点重合: 单顶点即可; orthogonal_dogleg 插入
+                // 原始角点锚定的三顶点路径; parallel_u_cap 插入三段四顶点
+                // 路径; 否则插入桥接点对, 连接边方向 = 桥接方向
+                if (strictGeometry && !bridgeDogleg && !bridgeUCap &&
+                    !bridgeSingleVertex) {
+                    std::cerr << "[TopologyBridgeGuard] fid="
+                              << source_feature_id_
+                              << " part=" << partIndex
+                              << " chain=" << c
+                              << " type=single"
+                              << " max_wall_dist=" << bestFitPenalty / 3.0
+                              << " accepted=1" << std::endl;
+                }
+                if (bridgeUCap) {
+                    topologyPolygon.push_back(bestPa);
+                    topologyPolygon.push_back(bestQA);
+                    topologyPolygon.push_back(bestQB);
+                    topologyPolygon.push_back(bestPb);
+                } else {
+                    topologyPolygon.push_back(bestPa);
+                    if (bridgeDogleg) topologyPolygon.push_back(rawCorner);
+                    if (!bridgeSingleVertex) topologyPolygon.push_back(bestPb);
+                }
             } else {
                 // 无法构造合法转接: 不静默生成斜边, 候选作废
+                if (failureOut) {
+                    failureOut->constructionReason =
+                        "transition_construction_failed";
+                    failureOut->failedTransitionChain = c;
+                }
                 std::cerr << "[TopologyTransition] fid=" << source_feature_id_
                           << " part=" << partIndex
                           << " chain=" << c
@@ -11336,6 +11886,17 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     // candidate is small, so rebuild the assignment from the resulting edge
     // angles; every edge is then fixed to one supplied system before Ceres.
     removeDuplicatePoints2D(topologyPolygon, 0.05f);
+    {
+        auto cleaned = CleanLowEvidenceIrregularities(topologyPolygon);
+        if (cleaned.size() >= 4 && cleaned.size() < topologyPolygon.size() &&
+            isSimplePolygon2D(cleaned)) {
+            std::cerr << "[TopologyCandidateClean] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " vertices=" << topologyPolygon.size()
+                      << "->" << cleaned.size() << std::endl;
+            topologyPolygon.swap(cleaned);
+        }
+    }
     std::vector<int> fixedEdgeAssignments(topologyPolygon.size(), -1);
     for (std::size_t i = 0; i < topologyPolygon.size(); ++i) {
         const auto& a = topologyPolygon[i];
@@ -11409,6 +11970,23 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     };
     // 候选诊断: 拒绝时输出边明细(索引/长度/角度/最近系统角误差)
     auto dumpCandidateEdges = [&](const std::vector<pcl::PointXYZ>& poly) {
+        auto pointToInitialRing = [&](const pcl::PointXYZ& point) {
+            double best = std::numeric_limits<double>::max();
+            for (std::size_t j = 0; j < initialRing.size(); ++j) {
+                const auto& p = initialRing[j];
+                const auto& q = initialRing[(j + 1) % initialRing.size()];
+                const double dx = q.x - p.x, dy = q.y - p.y;
+                const double lenSq = dx * dx + dy * dy;
+                if (lenSq < 1e-12) continue;
+                double t = ((point.x - p.x) * dx +
+                            (point.y - p.y) * dy) / lenSq;
+                t = std::clamp(t, 0.0, 1.0);
+                best = std::min(best, std::hypot(
+                    point.x - p.x - t * dx,
+                    point.y - p.y - t * dy));
+            }
+            return best;
+        };
         for (std::size_t i = 0; i < poly.size(); ++i) {
             const auto& a = poly[i];
             const auto& b = poly[(i + 1) % poly.size()];
@@ -11442,18 +12020,26 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                       << " ang_deg=" << ang * 180.0 / M_PI
                       << " nearest_sys_deg=" << bestAng * 180.0 / M_PI
                       << " sys_err_deg=" << bestErr * 180.0 / M_PI
-                      << " mid_to_ring=" << midDist << std::endl;
+                      << " mid_to_ring=" << midDist
+                      << " vertex_to_ring=" << pointToInitialRing(a)
+                      << std::endl;
         }
     };
     const std::string candidateReason = candidatePrecheck(topologyPolygon);
     if (!candidateReason.empty()) {
         usedFallback = true;
+        if (failureOut) failureOut->precheckReason = candidateReason;
         std::cerr << "[TopologyCandidateReject] fid=" << source_feature_id_
                   << " stage=precheck reason=" << candidateReason << std::endl;
         dumpCandidateEdges(topologyPolygon);
         std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                   << " reason=candidate_precheck" << std::endl;
         return {};
+    }
+    // 候选全量质量诊断(不拒, 供 strict_geometry 重试触发判定):
+    // Ceres 前的候选若已 wall_deviation, Ceres 拒因同源时重试二才有意义
+    if (failureOut) {
+        failureOut->candidateQualityReason = qualityCheck(topologyPolygon, 2.5);
     }
 
     // raw 采样点到 smooth 环边界的距离(门控用)
@@ -11521,7 +12107,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
 
     const double smoothStep = std::clamp(pixelSize, 0.3, 0.8);
     smoothSamples = sampleBoundary(initialRing, smoothStep, 0);
-    const double assocMaxDist = std::max(3.0 * pixelSize, 1.2);
+    // Candidate construction can move a valid grid intersection beyond the
+    // old 1.2-1.35m association gate. Give Ceres enough observations to pull
+    // those edges back; final wall/vertex quality limits remain unchanged.
+    const double assocMaxDist = std::max(4.0 * pixelSize, 2.0);
     auto associateEdge = [&](const pcl::PointXYZ& pt) {
         int bestEdge = -1;
         double bestDist = assocMaxDist;
@@ -11741,8 +12330,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     if (ceresResult.size() < 3) {
         std::cerr << "[TopologyCeresReject] fid=" << source_feature_id_
                   << " reason=empty_result" << std::endl;
+        if (failureOut) failureOut->ceresReason = "empty_result";
         const std::string localReason = candidateUsable();
         if (!localReason.empty()) {
+            dumpCandidateEdges(topologyPolygon);
             usedFallback = true;
             std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                       << " part=" << partIndex
@@ -11757,8 +12348,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     if (!ceresReason.empty()) {
         std::cerr << "[TopologyCeresReject] fid=" << source_feature_id_
                   << " reason=" << ceresReason << std::endl;
+        if (failureOut) failureOut->ceresReason = ceresReason;
         const std::string localReason = candidateUsable();
         if (!localReason.empty()) {
+            dumpCandidateEdges(topologyPolygon);
             usedFallback = true;
             std::cerr << "[TopologyFallbackToVDP] fid=" << source_feature_id_
                       << " part=" << partIndex
@@ -12181,3 +12774,4 @@ std::vector<pcl::PointXYZ> RestoreMaskConicArcs(
     }
     return result;
 }
+  
