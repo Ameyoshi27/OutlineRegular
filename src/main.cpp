@@ -201,6 +201,10 @@ constexpr bool kMaskCurveDetectionDebugOnly = true; // 禁用弧检测+恢复, �
 // 才进入正式规则化(所有下游统一消费筛选结果); false = 完全恢复
 // DirectionDetector 全部 active 方向直接生效的行为。
 constexpr bool kUseTopologyDirectionABSelection = true;
+// raw-only 实验开关: true = 主方向检测/拓扑通道/Ceres/质量检查全部
+// 使用平滑前的原始栅格轮廓(单残差, rawRing 参数置空); false = 保持
+// 当前 smooth 方向拓扑 + raw/smooth 双残差正式模式。
+constexpr bool kUseRawOutlineForAllRegularization = false;
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -5583,6 +5587,14 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
 
     RegularizationDebugCollector debugCollector;
     std::vector<DebugDirectionRecord> directionDebugRecords;
+    // raw-only 实验模式运行级统计
+    struct RawOnlyStats {
+        long long requested = 0;
+        long long applied = 0;
+        long long fallbackSmooth = 0;
+        long long invalidRaw = 0;
+        long long ambiguous = 0;
+    } rawOnlyStats;
     // Legacy best/initial slots remain for backward-compatible enum values;
     // current mask-only output uses topology, vdp, or strict_fallback only.
     struct PathStatAccum {
@@ -5663,13 +5675,13 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                 continue;
             }
             const std::vector<pcl::PointXYZ>* rawRingForPart = nullptr;
+            double bestScore = -1.0;  // raw 部件 bbox 匹配分数(raw-only 应用条件)
             const auto rawIt = rawRingsByFid.find(
                 static_cast<long long>(inFeature->GetFID()));
             if (rawIt != rawRingsByFid.end() && !rawIt->second.empty()) {
                 // SimplifyPreserveTopology normally preserves part order. For
                 // defensive handling of reordered multipart geometries, choose
                 // the raw part with the largest bbox overlap with this smooth part.
-                double bestScore = -1.0;
                 for (const auto& rawCandidate : rawIt->second) {
                     double sMinX = 1e18, sMinY = 1e18, sMaxX = -1e18, sMaxY = -1e18;
                     double rMinX = 1e18, rMinY = 1e18, rMaxX = -1e18, rMaxY = -1e18;
@@ -5704,20 +5716,58 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
             MaskOnlyFallback fallback = MaskOnlyFallback::Final;
             MaskOnlyPath path = MaskOnlyPath::InitialRing;
             DetectedDirectionResult ringDetectedDir;
+            // ---- raw-only 实验模式: 工作环/残差环统一 ----
+            // 匹配分数 >=0.5 才视为可靠(低分/多部件歧义时回退 smooth
+            // 双残差, 不允许静默使用错误 raw 部件)
+            const bool rawMatchValid =
+                rawRingForPart && rawRingForPart->size() >= 3 &&
+                bestScore >= 0.5;
+            const std::vector<pcl::PointXYZ>* workingRing = &ring;
+            const std::vector<pcl::PointXYZ>* residualRawRing = rawRingForPart;
+            if (kUseRawOutlineForAllRegularization) {
+                ++rawOnlyStats.requested;
+                if (rawMatchValid) {
+                    workingRing = rawRingForPart;
+                    residualRawRing = nullptr;  // 禁止 raw 重复采样
+                    ++rawOnlyStats.applied;
+                    std::cerr << "[RawOnlyMode] fid=" << buildingId
+                              << " part=" << (ringIdx - 1)
+                              << " requested=1 applied=1"
+                              << " smooth_vertices=" << ring.size()
+                              << " raw_vertices=" << rawRingForPart->size()
+                              << " match_score=" << bestScore
+                              << " regularization_ring=raw"
+                              << " residual_mode=raw_single" << std::endl;
+                } else {
+                    ++rawOnlyStats.fallbackSmooth;
+                    if (rawRingForPart && rawRingForPart->size() < 3) {
+                        ++rawOnlyStats.invalidRaw;
+                    }
+                    if (!rawRingForPart || bestScore < 0.5) {
+                        ++rawOnlyStats.ambiguous;
+                    }
+                    std::cerr << "[RawOnlyMode] fid=" << buildingId
+                              << " part=" << (ringIdx - 1)
+                              << " requested=1 applied=0"
+                              << " reason=no_matching_raw_part"
+                              << " match_score=" << bestScore << std::endl;
+                }
+            }
             auto result = RegularizeRingFromMaskOnly(
-                ring, static_cast<long long>(buildingId), &bestHypothesis,
+                *workingRing, static_cast<long long>(buildingId), &bestHypothesis,
                 &fallback, &path, ringIdx - 1,
-                rawRingForPart, &ringDirCtx, maskPixelSize, &ringDetectedDir);
+                residualRawRing, &ringDirCtx, maskPixelSize, &ringDetectedDir);
             // 主方向调试: 质心用 shoelace 公式, 线段半径取 bbox 对角线一半
+            // (raw-only 模式下按实际工作环计算, 与方向线位置一致)
             {
                 DebugDirectionRecord dirRec;
                 dirRec.sourceFid = static_cast<long long>(buildingId);
                 dirRec.ringIndex = ringIdx - 1;
                 double area2 = 0.0, cxAcc = 0.0, cyAcc = 0.0;
                 double bbMinX = 1e18, bbMinY = 1e18, bbMaxX = -1e18, bbMaxY = -1e18;
-                for (std::size_t i = 0; i < ring.size(); ++i) {
-                    const auto& a = ring[i];
-                    const auto& b = ring[(i + 1) % ring.size()];
+                for (std::size_t i = 0; i < workingRing->size(); ++i) {
+                    const auto& a = (*workingRing)[i];
+                    const auto& b = (*workingRing)[(i + 1) % workingRing->size()];
                     const double cross = static_cast<double>(a.x) * b.y
                                        - static_cast<double>(b.x) * a.y;
                     area2 += cross;
@@ -5732,9 +5782,9 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                     dirRec.cx = cxAcc / (3.0 * area2);
                     dirRec.cy = cyAcc / (3.0 * area2);
                 } else {
-                    for (const auto& p : ring) {
-                        dirRec.cx += p.x / ring.size();
-                        dirRec.cy += p.y / ring.size();
+                    for (const auto& p : *workingRing) {
+                        dirRec.cx += p.x / workingRing->size();
+                        dirRec.cy += p.y / workingRing->size();
                     }
                 }
                 dirRec.halfSpan = 0.55 * std::hypot(bbMaxX - bbMinX, bbMaxY - bbMinY);
@@ -5864,6 +5914,15 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     }
     auto loopEnd = std::chrono::steady_clock::now();
     outlineRegular::PrintTopologyRetrySummary();
+    if (kUseRawOutlineForAllRegularization) {
+        std::cout << "[RawOnlyModeSummary]"
+                  << " requested_parts=" << rawOnlyStats.requested
+                  << " applied_parts=" << rawOnlyStats.applied
+                  << " fallback_smooth_parts=" << rawOnlyStats.fallbackSmooth
+                  << " invalid_raw_parts=" << rawOnlyStats.invalidRaw
+                  << " ambiguous_raw_matches=" << rawOnlyStats.ambiguous
+                  << std::endl;
+    }
 
     // ---- 全局重叠解决: 所有单体规则化完成后统一处理建筑间相交 ----
     {

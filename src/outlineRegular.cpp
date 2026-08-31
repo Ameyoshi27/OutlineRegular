@@ -13086,6 +13086,18 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
     std::cerr << "[DenseResidual] fid=" << source_feature_id_
               << " residual_points=" << residualCloud->size()
               << " raw=" << (rawAccepted ? 1 : 0) << std::endl;
+    // 残差模式诊断: raw-only 实验下 initialRing 即原始轮廓, 单组采样
+    if (!evaluationOnly) {
+        std::cerr << "[TopologyResidualMode] fid=" << source_feature_id_
+                  << " part=" << partIndex
+                  << " mode=" << (rawAccepted ? "dual" : "single")
+                  << " samples=" << residualCloud->size()
+                  << " spacing=" << smoothStep
+                  << " raw_branch=" << (rawAccepted ? 1 : 0)
+                  << " note="
+                  << (rawAccepted ? "raw+smooth_dual" : "initialRing_single")
+                  << std::endl;
+    }
 
     if (rawAccepted && kDumpRawResidualPoints && !evaluationOnly) {
         auto& debugPoints = RawResidualDebugPoints();
