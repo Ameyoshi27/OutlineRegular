@@ -6049,6 +6049,16 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
                       << " (" << directionDebugRecords.size() << " rings)" << std::endl;
         }
     }
+    // 平差后局部拓扑约简(shadow-only)的 before/after 调试输出
+    {
+        const std::filesystem::path postDbgPath =
+            debugDir / "debug_topology_post_simplify.shp";
+        if (outlineRegular::SaveDebugTopologyPostSimplify(
+                postDbgPath.string(), originOffset, srsClone)) {
+            std::cout << "[MaskOnly] post-simplify debug saved: "
+                      << postDbgPath.string() << std::endl;
+        }
+    }
     if (srsClone) srsClone->Release();
 
     const double loopSec =

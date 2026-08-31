@@ -257,9 +257,115 @@ public:
 		bool passed = false;
 		std::string reason;
 	};
+	// ---- 唯一共享缺陷枚举器 ----
+	enum class LocalDefectType { ShortDiagonal, Spike, Zigzag };
+	struct LocalDefect {
+		LocalDefectType type = LocalDefectType::Spike;
+		std::size_t vertexIndex = 0;
+		std::size_t edgeIndex = 0;
+		pcl::PointXYZ point;
+		double edgeLength1 = 0.0;
+		double edgeLength2 = 0.0;
+		double angleDeg = 0.0;
+		double triangleArea = 0.0;
+		double deviation = 0.0;
+		double contributionLength = 0.0;
+	};
+	struct LocalDefectSummary {
+		std::vector<LocalDefect> defects;
+		int shortDiagonalCount = 0;
+		int spikeCount = 0;
+		int zigzagCount = 0;
+		double irregularLength = 0.0;
+		double perimeter = 0.0;
+		double irregularLengthRatio = 0.0;
+	};
+	static LocalDefectSummary EnumerateLocalDefects(
+		const std::vector<pcl::PointXYZ>& polygon,
+		const DirectionContextOut& context);
+	struct MicroEdgeStats {
+		int count = 0;
+		double totalLength = 0.0;
+		double minLength = 0.0;
+		std::vector<std::size_t> edgeIndices;
+	};
+	static MicroEdgeStats AnalyzeMicroEdges(
+		const std::vector<pcl::PointXYZ>& polygon);
 	static LocalRegularityMetrics AnalyzeLocalRegularity(
 		const std::vector<pcl::PointXYZ>& poly,
 		const DirectionContextOut& dirContext);
+	// ---- 平差后局部拓扑约简器(shadow-only) ----
+	enum class TopologyReductionType {
+		MicroDogleg, StraightZigzagRun, LowEvidenceSpike, LowEvidenceNotch
+	};
+	struct TopologyReductionOperation {
+		TopologyReductionType type = TopologyReductionType::MicroDogleg;
+		std::size_t startVertex = 0;
+		std::size_t endVertex = 0;
+		int removedVertices = 0;
+		double spanLength = 0.0;
+		double maxDeviation = 0.0;
+		double depth = 0.0;
+		double areaChange = 0.0;
+		int targetSystem = -1;
+		double targetAngle = 0.0;
+		bool accepted = false;
+		std::string reason;
+	};
+	struct TopologyPostSimplificationResult {
+		std::vector<pcl::PointXYZ> candidate;        // 约简后候选
+		std::vector<int> edgeAssignments;            // 重建的方向归属
+		std::vector<TopologyReductionOperation> operations;
+		int microDoglegsRemoved = 0;
+		int zigzagRunsReplaced = 0;
+		int spikesRemoved = 0;
+		int notchesRemoved = 0;
+		int removedVertices = 0;
+		bool changed = false;
+	};
+	// 平差后微台阶折叠 + 锯齿run直线替换 + 低证据尖刺/缺口清理
+	// (方向感知: 折叠/替换边必须归属 active 方向系统)
+	static TopologyPostSimplificationResult BuildTopologyPostSimplification(
+		const std::vector<pcl::PointXYZ>& ceresResult,
+		const std::vector<int>& fixedAssignments,
+		const std::vector<double>& systemAngles,
+		double pixelSize,
+		const std::vector<pcl::PointXYZ>& smoothRing,
+		const std::vector<pcl::PointXYZ>* rawRing,
+		long long fid = -1,
+		int partIndex = 0);
+	// 最终阶梯后处理(第二次 Ceres 之后): 长连续栅格阶梯以保留端点的
+	// 单弦替换, 直边不属于 active system——记为 final_staircase_exception,
+	// 不进任何 Ceres、不新增方向系统。仅 single-direction 启用。
+	struct FinalStaircaseResult {
+		bool attempted = false;
+		bool accepted = false;
+		std::vector<pcl::PointXYZ> polygon;   // 替换后(拒绝时为输入副本)
+		double pathLength = 0.0;
+		double chordLength = 0.0;
+		double chordAngleDeg = 0.0;
+		double tlsAngleDeg = 0.0;
+		double rmse = 0.0;
+		double maxDev = 0.0;
+		int alternations = 0;
+		int edgeCount = 0;
+		std::size_t startVertex = 0, endVertex = 0;
+		std::string rejectReason;
+	};
+	static FinalStaircaseResult BuildFinalStaircaseReduction(
+		const std::vector<pcl::PointXYZ>& secondCeresResult,
+		const std::vector<double>& systemAngles,
+		double pixelSize,
+		const std::vector<pcl::PointXYZ>& smoothRing,
+		const std::vector<pcl::PointXYZ>* rawRing,
+		bool isMultiDirection,
+		long long fid = -1,
+		int partIndex = 0);
+	// 调试 shp: 每个变化环写 before/after 两条记录
+	static bool SaveDebugTopologyPostSimplify(
+		const std::string& shpPath,
+		const Eigen::Vector3d& originOffset,
+		OGRSpatialReference* spatialRef);
 	// 完整拓扑管线结果: polygon + 最终失败传播 + 接受阶段
 	struct TopologyPipelineResult {
 		std::vector<pcl::PointXYZ> polygon;
@@ -455,7 +561,8 @@ private:
 		bool allow_diagonal_edges,
 		const std::vector<double>& preferred_line_angles = std::vector<double>(),
 		const std::vector<int>* fixed_edge_assignments = nullptr,
-		bool preserve_topology = false);
+		bool preserve_topology = false,
+		bool strict_vertex_count = false);
 	double computeDLGPriorEnergy(const std::vector<pcl::PointXYZ>& hypothesis);
 	void initializeDLGPrior();
 

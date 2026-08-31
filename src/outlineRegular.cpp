@@ -8484,7 +8484,8 @@ void outlineRegular::optimizeWithHardConstraints(
     bool allow_diagonal_edges,
     const std::vector<double>& preferred_line_angles,
     const std::vector<int>* fixed_edge_assignments,
-    bool preserve_topology)
+    bool preserve_topology,
+    bool strict_vertex_count)
 {
     // 初始化当前多边形
     std::vector<pcl::PointXYZ> current_polygon = hypothesis_raw;
@@ -9023,13 +9024,14 @@ void outlineRegular::optimizeWithHardConstraints(
         }
 
         // 传递给下一次迭代
-        // 注: 平行相邻边(台阶 jog)求交 NaN 丢顶点、退化合并是优化器清理
-        // 台阶伪影的自然机制, 不强行锁顶点数(锁住会保留中间态斜边);
-        // 输出层面的方向一致性由拓扑通道的 rogue 检查兜底。
+        // strict_vertex_count: 顶点数必须守恒(约简器第二次Ceres)——近平行求交 NaN 丢点属于
+        // 隐式删点(违反"删点只能由约简操作显式完成"的契约),
+        // 该轮整体回滚到 last_valid_polygon
         const bool new_polygon_valid =
             new_polygon.size() >= 3 &&
             isSimplePolygon2D(new_polygon) &&
-            polygonIoU2D(new_polygon, backup_polygon) >= (allow_diagonal_edges ? 0.55 : 0.65);
+            polygonIoU2D(new_polygon, backup_polygon) >= (allow_diagonal_edges ? 0.55 : 0.65) &&
+            (!strict_vertex_count || new_polygon.size() == n);
 
         if (!new_polygon_valid) {
             std::cerr << "[Ceres] reject invalid iteration polygon; keep last valid polygon"
@@ -9038,19 +9040,8 @@ void outlineRegular::optimizeWithHardConstraints(
             break;
         }
 
-        if (new_polygon.size() == n && new_polygon.size() >= 3) {
-            current_polygon = new_polygon;
-            last_valid_polygon = current_polygon;
-        }
-        else if (new_polygon.size() >= 3) {
-            // 顶点数变化但多边形仍有效，继续迭代
-            current_polygon = new_polygon;
-            last_valid_polygon = current_polygon;
-        }
-        else {
-            // 如果求交失败导致拓扑破坏，终止迭代
-            break;
-        }
+        current_polygon = new_polygon;
+        last_valid_polygon = current_polygon;
     }
 
     // 所有的迭代结束后，更新最终假设
@@ -10608,63 +10599,1224 @@ bool outlineRegular::SaveRawResidualDebugDump(
     return true;
 }
 
-outlineRegular::LocalRegularityMetrics outlineRegular::AnalyzeLocalRegularity(
+// ===== 平差后局部拓扑约简器(shadow-only) =====
+// 调试记录收集(进程级)
+namespace {
+struct PostSimplifyDebugRecord {
+    long long fid = -1;
+    int part = 0;
+    int stage = 0;             // 0=before 1=after
+    int operationCount = 0;
+    int removedVertices = 0;
+    int microCount = 0;
+    int runCount = 0;
+    int spikeCount = 0;
+    bool accepted = false;
+    std::string rejectReason;
+    std::vector<pcl::PointXYZ> ring;
+};
+std::vector<PostSimplifyDebugRecord>& PostSimplifyRecords() {
+    static std::vector<PostSimplifyDebugRecord> instance;
+    return instance;
+}
+} // namespace
+
+// 边方向到最近系统的归属: 返回 {system, 与系统角的折叠距离}
+// ===== PostAssignEdge v2: 无向 π 周期归一化 + 容差裁决 =====
+struct PostAssignInfo {
+    int system = -1;          // 超容差时 -1(非法边, 调用方必须处理)
+    double dist = 1e9;        // 到系统的无向直线角距(π 周期)
+    bool parallelAxis = true; // 平行系统角(true) vs 正交轴(false)
+};
+static PostAssignInfo PostAssignEdge(double edgeAngle,
+                                     const std::vector<double>& systemAngles,
+                                     double tolRad) {
+    PostAssignInfo info;
+    auto undirectedDiff = [](double a, double b) {
+        double d = std::abs(a - b);
+        while (d > M_PI) d = 2.0 * M_PI - d;   // 归到 [0, π]
+        d = std::min(d, M_PI - d);              // 无向直线: [0, π/2]
+        return d;
+    };
+    for (std::size_t s = 0; s < systemAngles.size(); ++s) {
+        const double dPar = undirectedDiff(edgeAngle, systemAngles[s]);
+        const double dOrtho = std::abs(dPar - M_PI / 2.0);
+        const double d = std::min(dPar, dOrtho);
+        if (d < info.dist) {
+            info.dist = d;
+            info.system = static_cast<int>(s);
+            info.parallelAxis = dPar <= dOrtho;
+        }
+    }
+    if (info.dist > tolRad) info.system = -1;
+    return info;
+}
+
+// ===== 开放折线采样(不闭合) =====
+static std::vector<pcl::PointXYZ> PostSampleOpen(
+    const std::vector<pcl::PointXYZ>& pts, double spacing) {
+    std::vector<pcl::PointXYZ> out;
+    if (pts.size() < 2) return out;
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const auto& a = pts[i];
+        const auto& b = pts[i + 1];
+        const double len = std::hypot(b.x - a.x, b.y - a.y);
+        const int steps = std::max(1, static_cast<int>(len / spacing));
+        for (int k = 0; k < steps; ++k) {
+            const double t = static_cast<double>(k) / steps;
+            pcl::PointXYZ pt;
+            pt.x = static_cast<float>(a.x + t * (b.x - a.x));
+            pt.y = static_cast<float>(a.y + t * (b.y - a.y));
+            out.push_back(pt);
+        }
+    }
+    out.push_back(pts.back());
+    return out;
+}
+
+// ===== 局部双向边界证据(开放折线 ↔ 参考环) =====
+// forward: 候选采样→参考环; reverse: 参考环局部弧→候选折线
+struct PostLocalEvidence {
+    double fwdMedian = 0.0, fwdQ90 = 0.0, fwdMax = 0.0;
+    double revMedian = 0.0, revQ90 = 0.0, revMax = 0.0;
+    bool valid = false;
+};
+static PostLocalEvidence PostLocalBiEvidence(
+    const std::vector<pcl::PointXYZ>& candidateOpen,
+    const std::vector<pcl::PointXYZ>& refRing,
+    double spacing) {
+    PostLocalEvidence ev;
+    if (candidateOpen.size() < 2 || refRing.size() < 3) return ev;
+    auto distToRingFn = [](const pcl::PointXYZ& pt,
+                           const std::vector<pcl::PointXYZ>& ring) {
+        double best = std::numeric_limits<double>::max();
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            const auto& a = ring[i];
+            const auto& b = ring[(i + 1) % ring.size()];
+            const double dx = b.x - a.x, dy = b.y - a.y;
+            const double ls = dx * dx + dy * dy;
+            if (ls < 1e-12) continue;
+            double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
+            t = std::clamp(t, 0.0, 1.0);
+            best = std::min(best, std::hypot(pt.x - a.x - t * dx,
+                                             pt.y - a.y - t * dy));
+        }
+        return best;
+    };
+    // forward
+    std::vector<double> fwd;
+    for (const auto& pt : PostSampleOpen(candidateOpen, spacing)) {
+        fwd.push_back(distToRingFn(pt, refRing));
+    }
+    // reverse: 参考环上靠近候选折线的局部点 → 候选
+    std::vector<double> rev;
+    for (std::size_t i = 0; i < refRing.size(); ++i) {
+        // 参考点必须离候选折线有限距离(局部窗口)
+        double d = distToRingFn(refRing[i], candidateOpen);
+        (void)d;
+    }
+    // reverse 用采样: 参考环全部采样太重, 只取离候选折线最近的弧段
+    // 简化: 参考环采样点中, 到候选折线距离 < spacing*6 的纳入
+    for (std::size_t i = 0; i < refRing.size(); ++i) {
+        const auto& a = refRing[i];
+        const auto& b = refRing[(i + 1) % refRing.size()];
+        const double len = std::hypot(b.x - a.x, b.y - a.y);
+        const int steps = std::max(1, static_cast<int>(len / spacing));
+        for (int k = 0; k < steps; ++k) {
+            const double t = static_cast<double>(k) / steps;
+            pcl::PointXYZ pt;
+            pt.x = static_cast<float>(a.x + t * (b.x - a.x));
+            pt.y = static_cast<float>(a.y + t * (b.y - a.y));
+            const double d = distToRingFn(pt, candidateOpen);
+            if (d < 6.0 * spacing + 1.0) {
+                rev.push_back(d);
+            }
+        }
+    }
+    auto statsOf = [](std::vector<double>& v) {
+        if (v.empty()) return std::make_tuple(0.0, 0.0, 0.0);
+        std::sort(v.begin(), v.end());
+        return std::make_tuple(v[v.size() / 2],
+            v[static_cast<std::size_t>(v.size() * 0.9)], v.back());
+    };
+    std::tie(ev.fwdMedian, ev.fwdQ90, ev.fwdMax) = statsOf(fwd);
+    std::tie(ev.revMedian, ev.revQ90, ev.revMax) = statsOf(rev);
+    ev.valid = !fwd.empty() && !rev.empty();
+    return ev;
+}
+
+// ===== 纯几何辅助(保留) =====
+static double PostSignedArea(const std::vector<pcl::PointXYZ>& poly) {
+    double a = 0.0;
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const auto& p = poly[i];
+        const auto& q = poly[(i + 1) % poly.size()];
+        a += p.x * q.y - q.x * p.y;
+    }
+    return 0.5 * a;
+}
+// 删除 (keepA, keepB) 开区间内部顶点后环是否简单
+static bool PostRemovalKeepsSimple(
     const std::vector<pcl::PointXYZ>& poly,
+    std::size_t keepA, std::size_t keepB) {
+    std::vector<pcl::PointXYZ> reduced;
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        std::size_t k = (keepA + 1) % poly.size();
+        bool skip = false;
+        while (k != keepB) {
+            if (i == k) { skip = true; break; }
+            k = (k + 1) % poly.size();
+        }
+        if (!skip) reduced.push_back(poly[i]);
+    }
+    return reduced.size() >= 3 && isSimplePolygon2D(reduced);
+}
+static double PostDistToRing(const pcl::PointXYZ& pt,
+                             const std::vector<pcl::PointXYZ>& ring) {
+    double best = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        const auto& a = ring[i];
+        const auto& b = ring[(i + 1) % ring.size()];
+        const double dx = b.x - a.x, dy = b.y - a.y;
+        const double ls = dx * dx + dy * dy;
+        if (ls < 1e-12) continue;
+        double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
+        t = std::clamp(t, 0.0, 1.0);
+        best = std::min(best, std::hypot(pt.x - a.x - t * dx,
+                                         pt.y - a.y - t * dy));
+    }
+    return best;
+}
+static bool PostFitLine(const std::vector<pcl::PointXYZ>& pts,
+                        double& dirX, double& dirY, double& rmse,
+                        double& maxDev) {
+    if (pts.size() < 2) return false;
+    double mx = 0.0, my = 0.0;
+    for (const auto& p : pts) { mx += p.x; my += p.y; }
+    mx /= pts.size(); my /= pts.size();
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (const auto& p : pts) {
+        const double dx = p.x - mx, dy = p.y - my;
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+    const double theta = 0.5 * std::atan2(2.0 * sxy, sxx - syy);
+    dirX = std::cos(theta); dirY = std::sin(theta);
+    rmse = 0.0; maxDev = 0.0;
+    for (const auto& p : pts) {
+        const double dx = p.x - mx, dy = p.y - my;
+        const double perp = -dx * dirY + dy * dirX;
+        rmse += perp * perp;
+        maxDev = std::max(maxDev, std::abs(perp));
+    }
+    rmse = std::sqrt(rmse / pts.size());
+    return true;
+}
+
+// ===== 约简器 v2: 迭代式单操作执行 =====
+outlineRegular::TopologyPostSimplificationResult
+outlineRegular::BuildTopologyPostSimplification(
+    const std::vector<pcl::PointXYZ>& ceresResult,
+    const std::vector<int>& fixedAssignments,
+    const std::vector<double>& systemAngles,
+    double pixelSize,
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>* rawRing,
+    long long fid,
+    int partIndex)
+{
+    TopologyPostSimplificationResult result;
+    if (ceresResult.size() < 5 || systemAngles.empty()) {
+        result.candidate = ceresResult;
+        return result;
+    }
+    const double dirTolRad = 12.0 * M_PI / 180.0;
+    // A类: 微台阶门槛(单方向模式一个像素, 带上限)
+    const double microDepthLimit = std::min(0.5, std::max(0.15, pixelSize));
+    // B类: 正交往返
+    const double detourDepthLimit = std::max(0.35, 1.2 * pixelSize);
+    // C类: 长栅格阶梯
+    const double stairMinSpan = std::max(8.0, 16.0 * pixelSize);
+    const double stairRmseGate = std::max(0.45, 1.5 * pixelSize);
+    const double stairMaxDevGate = std::max(0.80, 2.5 * pixelSize);
+    const double areaGate = std::max(0.10, 1.2 * pixelSize * pixelSize);
+    const double q90Gate = std::max(0.10, 0.35 * pixelSize);
+    const double centroidGate = 0.30;
+    const double spacing = std::clamp(pixelSize, 0.3, 0.8);
+    constexpr int kMaxOps = 24;      // 只限已接受操作数
+    constexpr int kMaxRounds = 12;
+    int acceptedOpCount = 0;
+    // 拒绝诊断去重(相同窗口+相同原因只记录一次)
+    std::vector<std::string> seenRejects;
+
+    std::vector<pcl::PointXYZ> work = ceresResult;
+    auto logOp = [&](TopologyReductionType opType, const char* type,
+                     std::size_t s, std::size_t e,
+                     int removed, double span, double depth, double maxDev,
+                     int sys, double sysAngle, bool accepted,
+                     const std::string& reason) {
+        TopologyReductionOperation op;
+        // 枚举由调用方直接传入(此前按首字母推断, spike 的 's' 会
+        // 误记为 StraightZigzagRun)
+        op.type = opType;
+        op.startVertex = s; op.endVertex = e;
+        op.removedVertices = removed; op.spanLength = span;
+        op.depth = depth; op.maxDeviation = maxDev;
+        op.targetSystem = sys; op.targetAngle = sysAngle;
+        op.accepted = accepted; op.reason = reason;
+        if (accepted) ++acceptedOpCount;
+        result.operations.push_back(op);
+        if (fid >= 0) {
+            std::cerr << "[TopologyPostReduce] fid=" << fid
+                      << " part=" << partIndex << " type=" << type
+                      << " start=" << s << " end=" << e
+                      << " removed=" << removed
+                      << " span=" << span << " depth=" << depth
+                      << " max_dev=" << maxDev
+                      << " target_system=" << sys
+                      << " target_deg=" << sysAngle * 180.0 / M_PI
+                      << " accepted=" << (accepted ? 1 : 0)
+                      << " reason=" << reason << std::endl;
+        }
+    };
+    // raw/smooth 局部双向证据(before=原折线, after=替换弦)
+    auto evidenceGate = [&](const std::vector<pcl::PointXYZ>& runPts,
+                            const pcl::PointXYZ& A, const pcl::PointXYZ& B)
+                            -> std::string {
+        std::vector<pcl::PointXYZ> chord = {A, B};
+        for (const auto* ref : {&smoothRing, rawRing}) {
+            if (!ref) continue;
+            const PostLocalEvidence before =
+                PostLocalBiEvidence(runPts, *ref, spacing);
+            const PostLocalEvidence after =
+                PostLocalBiEvidence(chord, *ref, spacing);
+            if (!before.valid || !after.valid) continue;
+            if (after.fwdQ90 > before.fwdQ90 + q90Gate ||
+                after.revQ90 > before.revQ90 + q90Gate) {
+                return "local_evidence_degrade(fwd " +
+                    std::to_string(before.fwdQ90) + "->" +
+                    std::to_string(after.fwdQ90) + ", rev " +
+                    std::to_string(before.revQ90) + "->" +
+                    std::to_string(after.revQ90) + ")";
+            }
+        }
+        return "";
+    };
+    // raw/smooth 是否有真实凹凸支撑该结构: 参考轮廓上靠近弦投影区的点,
+    // 垂直距离达到结构深度 70% 的占比。亚像素结构(< pixelSize)没有
+    // 物理可分辨性——栅格轮廓的固有粗粝不构成支撑证据
+    // 参考轮廓局部弧是否真实支撑该凹凸: 投影区内点的带符号垂距
+    // 达到 max(0.7*depth, 像素噪声下限) 且同侧连续占比达门槛才算支撑;
+    // 靠近弦的点(perp 小)不构成支撑证据
+    auto structuralSupport = [&](const pcl::PointXYZ& A,
+                                 const pcl::PointXYZ& B,
+                                 double depth) -> std::pair<bool, std::string> {
+        // 亚像素结构(depth < pixelSize)无物理可分辨性: 弱化证据要求,
+        // 直接判无支撑(可删除); 超像素结构走完整支撑判定
+        if (depth < pixelSize) return {false, "subpixel"};
+        const double supportDepth = std::max(depth * 0.7, 0.5 * pixelSize);
+        for (const auto* ref : {&smoothRing, rawRing}) {
+            if (!ref) continue;
+            const double abLen = std::hypot(static_cast<double>(B.x) - A.x, static_cast<double>(B.y) - A.y);
+            if (abLen < 1e-6) continue;
+            const double ux = (B.x - A.x) / abLen;
+            const double uy = (B.y - A.y) / abLen;
+            int support = 0, total = 0;
+            for (const auto& p : *ref) {
+                const double px = p.x - A.x, py = p.y - A.y;
+                const double along = px * ux + py * uy;
+                if (along < -0.5 || along > abLen + 0.5) continue;
+                const double perp = std::abs(-px * uy + py * ux);
+                // 只有偏移达到支撑深度的点才证明参考轮廓有同样凹凸
+                if (perp >= supportDepth) ++support;
+                ++total;
+            }
+            if (total > 0 &&
+                static_cast<double>(support) / total >= 0.04) {
+                return {true, "supported(depth>=" +
+                    std::to_string(supportDepth) + ",ratio=" +
+                    std::to_string(static_cast<double>(support) / total) + ")"};
+            }
+        }
+        return {false, ""};
+    };
+
+    // ---- 事务式缺陷验证 helper ----
+    DirectionContextOut defCtx;
+    defCtx.valid = true;
+    defCtx.completeEvidence = true;
+    defCtx.primaryAngle = systemAngles.empty() ? 0.0 : systemAngles.front();
+    defCtx.systemAngles = systemAngles;
+    defCtx.multiDirection = systemAngles.size() >= 2;
+    constexpr double kDefectEpsilon = 1e-9;
+    auto defectCheck = [&](const std::vector<pcl::PointXYZ>& before,
+                           const std::vector<pcl::PointXYZ>& after,
+                           const char* opType, std::size_t start,
+                           std::size_t end) -> std::string {
+        const auto bd = EnumerateLocalDefects(before, defCtx);
+        const auto ad = EnumerateLocalDefects(after, defCtx);
+        std::string reasons;
+        if (ad.shortDiagonalCount > bd.shortDiagonalCount) {
+            reasons += "short_diagonal " + std::to_string(bd.shortDiagonalCount)
+                + "->" + std::to_string(ad.shortDiagonalCount) + ";";
+        }
+        if (ad.spikeCount > bd.spikeCount) {
+            reasons += "spike " + std::to_string(bd.spikeCount)
+                + "->" + std::to_string(ad.spikeCount) + ";";
+        }
+        if (ad.zigzagCount > bd.zigzagCount) {
+            reasons += "zigzag " + std::to_string(bd.zigzagCount)
+                + "->" + std::to_string(ad.zigzagCount) + ";";
+        }
+        if (ad.irregularLength > bd.irregularLength + kDefectEpsilon) {
+            reasons += "irregular_length "
+                + std::to_string(bd.irregularLength) + "->"
+                + std::to_string(ad.irregularLength) + ";";
+        }
+        if (fid >= 0) {
+            std::cerr << "[TopologyOperationDefects] fid=" << fid
+                      << " part=" << partIndex
+                      << " type=" << opType
+                      << " start=" << start << " end=" << end
+                      << " before_vertices=" << before.size()
+                      << " after_vertices=" << after.size()
+                      << " before_d/s/z=" << bd.shortDiagonalCount
+                      << "/" << bd.spikeCount << "/" << bd.zigzagCount
+                      << " after_d/s/z=" << ad.shortDiagonalCount
+                      << "/" << ad.spikeCount << "/" << ad.zigzagCount
+                      << " before_irr=" << bd.irregularLength
+                      << " after_irr=" << ad.irregularLength
+                      << " before_ratio=" << bd.irregularLengthRatio
+                      << " after_ratio=" << ad.irregularLengthRatio
+                      << " accepted=" << (reasons.empty() ? 1 : 0)
+                      << " reason="
+                      << (reasons.empty() ? "ok" : "defect_regression:" + reasons)
+                      << std::endl;
+        }
+        return reasons;
+    };
+
+    // ---- 迭代执行: 每轮选一个最高置信度操作 ----
+    for (int round = 0; round < kMaxRounds && acceptedOpCount < kMaxOps;
+         ++round) {
+        const std::size_t n = work.size();
+        if (n < 5) break;
+        bool applied = false;
+
+        // ===== 优先级 1: MicroDogleg(单方向正交微台阶) =====
+        for (std::size_t i0 = 0; i0 < n && !applied; ++i0) {
+            const std::size_t i1 = (i0 + 1) % n;
+            const std::size_t i2 = (i0 + 2) % n;
+            const std::size_t i3 = (i0 + 3) % n;
+            const auto P0 = work[i0], P1 = work[i1], P2 = work[i2], P3 = work[i3];
+            const double len0 = std::hypot(P1.x - P0.x, P1.y - P0.y);
+            const double len1 = std::hypot(P2.x - P1.x, P2.y - P1.y);
+            const double len2 = std::hypot(P3.x - P2.x, P3.y - P2.y);
+            if (len0 < 1.5 || len2 < 1.5) continue;      // 支撑边足够长
+            if (len1 > microDepthLimit || len1 < 1e-6) continue;
+            const double ang0 = std::atan2(P1.y - P0.y, P1.x - P0.x);
+            const double ang2 = std::atan2(P3.y - P2.y, P3.x - P2.x);
+            const double ang1 = std::atan2(P2.y - P1.y, P2.x - P1.x);
+            // E1 近垂直于 E0
+            auto undiff = [](double a, double b) {
+                double d = std::abs(a - b);
+                while (d > M_PI) d = 2.0 * M_PI - d;
+                return std::min(d, M_PI - d);
+            };
+            if (std::abs(undiff(ang1, ang0) - M_PI / 2.0) > 15.0 * M_PI / 180.0) {
+                continue;   // E1 不垂直
+            }
+            if (undiff(ang0, ang2) > 3.0 * M_PI / 180.0) continue;  // E0/E2 平行
+            // E0/E2 用 fixedAssignments 确认同系统同轴族
+            int sysE0 = (i0 < fixedAssignments.size())
+                ? fixedAssignments[i0] : -1;
+            int sysE2 = (i0 + 2 < fixedAssignments.size())
+                ? fixedAssignments[i0 + 2] : -1;
+            const auto a0 = PostAssignEdge(ang0, systemAngles, dirTolRad);
+            const auto a2 = PostAssignEdge(ang2, systemAngles, dirTolRad);
+            int targetSys = a0.system;
+            if (sysE0 >= 0 && sysE0 == sysE2) {
+                targetSys = sysE0;   // 优先原始 assignments
+            } else if (a0.system < 0 || a0.system != a2.system ||
+                       a0.parallelAxis != a2.parallelAxis) {
+                continue;
+            }
+            const double ang3 = std::atan2(P3.y - P0.y, P3.x - P0.x);
+            const auto a3 = PostAssignEdge(ang3, systemAngles, dirTolRad);
+            if (a3.system != targetSys) continue;
+            const double triArea = 0.5 * std::abs(
+                (P1.x - P0.x) * (P2.y - P0.y) - (P2.x - P0.x) * (P1.y - P0.y));
+            if (triArea > areaGate * 4.0) continue;
+            if (!PostRemovalKeepsSimple(work, i0, i3)) continue;
+            // 证据门: raw/smooth 是否支撑这个台阶
+            const std::vector<pcl::PointXYZ> runPts = {P0, P1, P2, P3};
+            const auto [supported, supDetail] = structuralSupport(P0, P3, len1);
+            if (supported) {
+                logOp(TopologyReductionType::MicroDogleg, "micro_dogleg", i0, i3, 2, len0 + len1 + len2, len1,
+                      0.0, targetSys,
+                      systemAngles[static_cast<std::size_t>(targetSys)],
+                      false, "raw_supported_step:" + supDetail);
+                continue;
+            }
+            const std::string evReason = evidenceGate(runPts, P0, P3);
+            if (!evReason.empty()) {
+                logOp(TopologyReductionType::MicroDogleg, "micro_dogleg", i0, i3, 2, len0 + len1 + len2, len1,
+                      0.0, targetSys,
+                      systemAngles[static_cast<std::size_t>(targetSys)],
+                      false, evReason);
+                continue;
+            }
+            // 事务式: 副本上应用, 缺陷非恶化才提交
+            {
+                std::vector<pcl::PointXYZ> trial = work;
+                const std::size_t t1 = std::min(i1, i2);
+                const std::size_t t2 = std::max(i1, i2);
+                trial.erase(trial.begin() + static_cast<long>(t2));
+                trial.erase(trial.begin() + static_cast<long>(t1));
+                const std::string dr = defectCheck(work, trial, "micro_dogleg", i0, i3);
+                if (!dr.empty()) {
+                    logOp(TopologyReductionType::MicroDogleg, "micro_dogleg",
+                          i0, i3, 2, len0 + len1 + len2, len1, 0.0, targetSys,
+                          systemAngles[static_cast<std::size_t>(targetSys)],
+                          false, "defect_regression:" + dr);
+                    continue;
+                }
+                work = std::move(trial);
+            }
+            ++result.microDoglegsRemoved;
+            logOp(TopologyReductionType::MicroDogleg, "micro_dogleg", i0, i3, 2, len0 + len1 + len2, len1, 0.0,
+                  targetSys, systemAngles[static_cast<std::size_t>(targetSys)],
+                  true, "micro_dogleg_folded");
+            applied = true;
+        }
+        if (applied) continue;
+
+        // ===== 优先级 2: OrthogonalDetour(正交短台阶/浅缺口, 3-5 边) =====
+        for (int width = 5; width >= 3 && !applied; --width) {
+            for (std::size_t i0 = 0; i0 < n && !applied; ++i0) {
+                const std::size_t iEnd = (i0 + static_cast<std::size_t>(width)) % n;
+                if (i0 == iEnd) continue;
+                // 首尾长边
+                const auto A = work[i0];
+                const auto prev = work[(i0 + n - 1) % n];
+                const auto B = work[iEnd];
+                const auto next = work[(iEnd + 1) % n];
+                const double lenFirst = std::hypot(A.x - prev.x, A.y - prev.y);
+                const double lenLast = std::hypot(next.x - B.x, next.y - B.y);
+                if (lenFirst < 2.0 || lenLast < 2.0) continue;
+                const double angFirst = std::atan2(A.y - prev.y, A.x - prev.x);
+                const double angLast = std::atan2(next.y - B.y, next.x - B.x);
+                const auto aF = PostAssignEdge(angFirst, systemAngles, dirTolRad);
+                const auto aL = PostAssignEdge(angLast, systemAngles, dirTolRad);
+                if (aF.system < 0 || aF.system != aL.system ||
+                    aF.parallelAxis != aL.parallelAxis) continue;
+                // 中间边: 收集 run 顶点/检查正交往返
+                std::vector<pcl::PointXYZ> runPts;
+                double pathLen = 0.0;
+                double lateralDisp = 0.0;
+                auto undiff2 = [](double a, double b) {
+                    double d = std::abs(a - b);
+                    while (d > M_PI) d = 2.0 * M_PI - d;
+                    return std::min(d, M_PI - d);
+                };
+                const double ux = (B.x - A.x) / std::max(
+                    std::hypot(static_cast<double>(B.x) - A.x, static_cast<double>(B.y) - A.y), 1e-9);
+                const double uy = (B.y - A.y) / std::max(
+                    std::hypot(static_cast<double>(B.x) - A.x, static_cast<double>(B.y) - A.y), 1e-9);
+                bool orthogonalBack = true;
+                std::size_t k = i0;
+                for (std::size_t step = 0; step <= static_cast<std::size_t>(width); ++step) {
+                    runPts.push_back(work[k]);
+                    if (step < static_cast<std::size_t>(width)) {
+                        const auto& pk = work[k];
+                        const auto& pk1 = work[(k + 1) % n];
+                        const double len = std::hypot(pk1.x - pk.x, pk1.y - pk.y);
+                        pathLen += len;
+                        const double ang = std::atan2(pk1.y - pk.y, pk1.x - pk.x);
+                        // 中间边应近正交或近平行于首边(正交往返)
+                        const double dPar = undiff2(ang, angFirst);
+                        const double dOrt = std::abs(dPar - M_PI / 2.0);
+                        if (std::min(dPar, dOrt) > 20.0 * M_PI / 180.0) {
+                            orthogonalBack = false;
+                            break;
+                        }
+                    }
+                    k = (k + 1) % n;
+                }
+                if (!orthogonalBack || runPts.size() < 4) continue;
+                // 弦
+                const double chordLen = std::hypot(static_cast<double>(B.x) - A.x, static_cast<double>(B.y) - A.y);
+                if (chordLen < 1e-6) continue;
+                // 横向深度: run 顶点到弦 AB 的最大垂距
+                double depth = 0.0;
+                for (const auto& p : runPts) {
+                    const double px = p.x - A.x, py = p.y - A.y;
+                    depth = std::max(depth, std::abs(-px * uy + py * ux));
+                }
+                if (depth > detourDepthLimit) continue;
+                // 面积变化
+                double runArea2 = 0.0;
+                for (std::size_t idx = 0; idx + 1 < runPts.size(); ++idx) {
+                    runArea2 += runPts[idx].x * runPts[idx + 1].y -
+                                runPts[idx + 1].x * runPts[idx].y;
+                }
+                runArea2 += runPts.back().x * runPts.front().y -
+                           runPts.front().x * runPts.back().y;
+                if (std::abs(runArea2) * 0.5 > areaGate * 6.0) continue;
+                // 替换弦归属
+                const double angChord = std::atan2(B.y - A.y, B.x - A.x);
+                const auto aC = PostAssignEdge(angChord, systemAngles, dirTolRad);
+                if (aC.system != aF.system) continue;
+                if (!PostRemovalKeepsSimple(work, i0, iEnd)) continue;
+                // 证据
+                const auto [detSup, detSupDetail] = structuralSupport(A, B, depth);
+                if (detSup) {
+                    logOp(TopologyReductionType::LowEvidenceNotch, "orthogonal_detour", i0, iEnd, width - 1, pathLen,
+                          depth, 0.0, aF.system,
+                          systemAngles[static_cast<std::size_t>(aF.system)],
+                          false, "raw_supported_detour:" + detSupDetail);
+                    continue;
+                }
+                const std::string evReason = evidenceGate(runPts, A, B);
+                if (!evReason.empty()) {
+                    logOp(TopologyReductionType::LowEvidenceNotch, "orthogonal_detour", i0, iEnd, width - 1, pathLen,
+                          depth, 0.0, aF.system,
+                          systemAngles[static_cast<std::size_t>(aF.system)],
+                          false, evReason);
+                    continue;
+                }
+                {
+                    std::vector<pcl::PointXYZ> trial;
+                    for (std::size_t idx = 0; idx < n; ++idx) {
+                        std::size_t kk = (i0 + 1) % n;
+                        bool skip = false;
+                        while (kk != iEnd) {
+                            if (idx == kk) { skip = true; break; }
+                            kk = (kk + 1) % n;
+                        }
+                        if (!skip) trial.push_back(work[idx]);
+                    }
+                    const std::string dr = defectCheck(
+                        work, trial, "orthogonal_detour", i0, iEnd);
+                    if (!dr.empty()) {
+                        logOp(TopologyReductionType::LowEvidenceNotch, "orthogonal_detour",
+                              i0, iEnd, width - 1, pathLen, depth, 0.0, aF.system,
+                              systemAngles[static_cast<std::size_t>(aF.system)],
+                              false, "defect_regression:" + dr);
+                        continue;
+                    }
+                    work = std::move(trial);
+                }
+                ++result.notchesRemoved;
+                logOp(TopologyReductionType::LowEvidenceNotch, "orthogonal_detour", i0, iEnd, width - 1, pathLen, depth,
+                      0.0, aF.system,
+                      systemAngles[static_cast<std::size_t>(aF.system)],
+                      true, "orthogonal_detour_folded");
+                applied = true;
+            }
+        }
+        if (applied) continue;
+
+        // (LongRasterStaircase 移至第二次 Ceres 后的最终后处理——
+        //  它产生的斜直边不属于 active system, 不得进入第二次 Ceres)
+
+        // ===== 优先级 4: 普通 zigzag run(短锯齿, 目标方向约束) =====
+        if (n >= 8) {
+            for (int width = 12; width >= 4 && !applied; --width) {
+                for (std::size_t i0 = 0; i0 < n && !applied; ++i0) {
+                    const std::size_t iEnd = (i0 + static_cast<std::size_t>(width)) % n;
+                    std::vector<pcl::PointXYZ> runPts;
+                    double pathLen = 0.0;
+                    std::size_t k = i0;
+                    for (std::size_t step = 0; step <= static_cast<std::size_t>(width);
+                         ++step) {
+                        runPts.push_back(work[k]);
+                        if (step < static_cast<std::size_t>(width)) {
+                            pathLen += std::hypot(
+                                work[(k + 1) % n].x - work[k].x,
+                                work[(k + 1) % n].y - work[k].y);
+                        }
+                        k = (k + 1) % n;
+                    }
+                    const auto A = work[i0];
+                    const auto B = work[iEnd];
+                    const double chordLen = std::hypot(static_cast<double>(B.x) - A.x, static_cast<double>(B.y) - A.y);
+                    if (chordLen < std::max(2.5, 5.0 * pixelSize)) continue;
+                    if (pathLen < chordLen * 1.2) continue;
+                    double dirX, dirY, rmse, maxDev;
+                    if (!PostFitLine(runPts, dirX, dirY, rmse, maxDev)) continue;
+                    const double fitAng = std::atan2(dirY, dirX);
+                    const auto fa = PostAssignEdge(fitAng, systemAngles, dirTolRad);
+                    if (fa.system < 0) continue;   // 必须归属 active 系统
+                    if (maxDev > std::max(0.8, 2.5 * pixelSize)) continue;
+                    if (!PostRemovalKeepsSimple(work, i0, iEnd)) continue;
+                    const std::string evReason = evidenceGate(runPts, A, B);
+                    if (!evReason.empty()) {
+                        logOp(TopologyReductionType::StraightZigzagRun, "zigzag_run", i0, iEnd, width - 1, pathLen, 0.0,
+                              maxDev, fa.system,
+                              systemAngles[static_cast<std::size_t>(fa.system)],
+                              false, evReason);
+                        continue;
+                    }
+                    {
+                        std::vector<pcl::PointXYZ> trial;
+                        for (std::size_t idx = 0; idx < n; ++idx) {
+                            std::size_t kk = (i0 + 1) % n;
+                            bool skip = false;
+                            while (kk != iEnd) {
+                                if (idx == kk) { skip = true; break; }
+                                kk = (kk + 1) % n;
+                            }
+                            if (!skip) trial.push_back(work[idx]);
+                        }
+                        const std::string dr = defectCheck(work, trial, "zigzag_run", i0, iEnd);
+                        if (!dr.empty()) {
+                            logOp(TopologyReductionType::StraightZigzagRun, "zigzag_run",
+                                  i0, iEnd, width - 1, pathLen, 0.0, maxDev, fa.system,
+                                  systemAngles[static_cast<std::size_t>(fa.system)],
+                                  false, "defect_regression:" + dr);
+                            continue;
+                        }
+                        work = std::move(trial);
+                    }
+                    ++result.zigzagRunsReplaced;
+                    logOp(TopologyReductionType::StraightZigzagRun, "zigzag_run", i0, iEnd, width - 1, pathLen, 0.0,
+                          maxDev, fa.system,
+                          systemAngles[static_cast<std::size_t>(fa.system)],
+                          true, "zigzag_run_replaced");
+                    applied = true;
+                }
+            }
+        }
+        if (applied) continue;
+
+        // ===== 优先级 5: 低证据尖刺(带 raw/smooth 证据) =====
+        for (std::size_t i = 0; i < n && !applied; ++i) {
+            const auto prev = work[(i + n - 1) % n];
+            const auto cur = work[i];
+            const auto next = work[(i + 1) % n];
+            const double l1 = std::hypot(cur.x - prev.x, cur.y - prev.y);
+            const double l2 = std::hypot(next.x - cur.x, next.y - cur.y);
+            if (l1 > std::max(0.5, 1.5 * pixelSize) ||
+                l2 > std::max(0.5, 1.5 * pixelSize)) continue;
+            const double triArea = 0.5 * std::abs(
+                (cur.x - prev.x) * (next.y - prev.y) -
+                (next.x - prev.x) * (cur.y - prev.y));
+            if (triArea > areaGate) continue;
+            const std::size_t ip = (i + n - 1) % n;
+            const std::size_t in = (i + 1) % n;
+            if (!PostRemovalKeepsSimple(work, ip, in)) continue;
+            // 证据: 尖刺位置在参考上无支撑
+            const auto [spSup, spSupDetail] =
+                structuralSupport(prev, next, std::min(l1, l2));
+            if (spSup) {
+                logOp(TopologyReductionType::LowEvidenceSpike, "spike", i, in, 1, l1 + l2, std::min(l1, l2), 0.0, -1,
+                      0.0, false, "raw_supported_spike:" + spSupDetail);
+                continue;
+            }
+            const std::vector<pcl::PointXYZ> runPts = {prev, cur, next};
+            const std::string evReason = evidenceGate(runPts, prev, next);
+            if (!evReason.empty()) {
+                logOp(TopologyReductionType::LowEvidenceSpike, "spike", i, in, 1, l1 + l2, std::min(l1, l2), 0.0, -1,
+                      0.0, false, evReason);
+                continue;
+            }
+            {
+                std::vector<pcl::PointXYZ> trial = work;
+                trial.erase(trial.begin() + static_cast<long>(i));
+                const std::string dr = defectCheck(work, trial, "spike", i, in);
+                if (!dr.empty()) {
+                    logOp(TopologyReductionType::LowEvidenceSpike, "spike",
+                          i, in, 1, l1 + l2, std::min(l1, l2), 0.0, -1, 0.0,
+                          false, "defect_regression:" + dr);
+                    continue;
+                }
+                work = std::move(trial);
+            }
+            ++result.spikesRemoved;
+            logOp(TopologyReductionType::LowEvidenceSpike, "spike", i, in, 1, l1 + l2, std::min(l1, l2), 0.0, -1, 0.0,
+                  true, "low_evidence_spike");
+            applied = true;
+        }
+        if (!applied) break;   // 无操作可应用, 结束
+    }
+
+    result.candidate = work;
+    result.removedVertices = static_cast<int>(ceresResult.size()) -
+        static_cast<int>(work.size());
+    result.changed = result.removedVertices > 0;
+
+    // 重建 assignments(free edge 用 -2 区分于未归属)
+    result.edgeAssignments.clear();
+    for (std::size_t i = 0; i < work.size(); ++i) {
+        const auto& p1 = work[i];
+        const auto& p2 = work[(i + 1) % work.size()];
+        const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        const double ang = std::atan2(p2.y - p1.y, p2.x - p1.x);
+        const auto as = PostAssignEdge(ang, systemAngles, dirTolRad);
+        if (len >= 0.8 && as.system < 0) {
+            // 长边无法归属 active system: 阶段 A 候选整体拒绝
+            // (自由边只允许出现在 B 阶段的最终后处理, 不进 Ceres)
+            result.changed = false;
+            result.candidate = ceresResult;
+            result.edgeAssignments.clear();
+            break;
+        }
+        result.edgeAssignments.push_back(as.system);
+    }
+    return result;
+}
+
+// 调试 shp 保存(stage=0/1/2)
+// ===== BuildFinalStaircaseReduction =====
+// 最终阶梯后处理(第二次 Ceres 之后): 长连续栅格阶梯以保留端点的
+// 单弦替换。直边不属于 active system——标记 final_staircase_exception,
+// 不进 Ceres、不新增方向系统、不改变 single-direction。
+// 仅当拟合方向距所有 active 系统 >12° 时才成为例外; 12° 内的
+// 归属系统(如 fid13 的 48.37°→47.65°)不算例外, 由阶段 A 处理。
+outlineRegular::FinalStaircaseResult
+outlineRegular::BuildFinalStaircaseReduction(
+    const std::vector<pcl::PointXYZ>& secondCeresResult,
+    const std::vector<double>& systemAngles,
+    double pixelSize,
+    const std::vector<pcl::PointXYZ>& smoothRing,
+    const std::vector<pcl::PointXYZ>* rawRing,
+    bool isMultiDirection,
+    long long fid,
+    int partIndex)
+{
+    FinalStaircaseResult res;
+    res.polygon = secondCeresResult;
+    if (isMultiDirection) return res;   // 本轮仅 single-direction
+    const std::size_t n = secondCeresResult.size();
+    if (n < 8) return res;
+    const double dirTol = 12.0 * M_PI / 180.0;
+    const double stairMinSpan = std::max(8.0, 16.0 * pixelSize);
+    const double rmseGate = std::max(0.45, 1.5 * pixelSize);
+    const double maxDevGate = std::max(0.80, 2.5 * pixelSize);
+    const double spacing = std::clamp(pixelSize, 0.3, 0.8);
+    auto undiff = [](double a, double b) {
+        double d = std::abs(a - b);
+        while (d > M_PI) d = 2.0 * M_PI - d;
+        return std::min(d, M_PI - d);
+    };
+    auto distPtSeg = [](const pcl::PointXYZ& pt,
+                        const pcl::PointXYZ& a, const pcl::PointXYZ& b) {
+        const double dx = b.x - a.x, dy = b.y - a.y;
+        const double ls = dx * dx + dy * dy;
+        if (ls < 1e-12) return std::hypot(
+            static_cast<double>(pt.x) - a.x, static_cast<double>(pt.y) - a.y);
+        double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
+        t = std::clamp(t, 0.0, 1.0);
+        return std::hypot(static_cast<double>(pt.x) - a.x - t * dx,
+                          static_cast<double>(pt.y) - a.y - t * dy);
+    };
+    // 开放折线采样(不闭合)
+    auto sampleOpen = [&](const std::vector<pcl::PointXYZ>& pts) {
+        std::vector<pcl::PointXYZ> out;
+        for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+            const double len = std::hypot(pts[i+1].x - pts[i].x, pts[i+1].y - pts[i].y);
+            const int steps = std::max(1, static_cast<int>(len / spacing));
+            for (int k = 0; k < steps; ++k) {
+                const double t = static_cast<double>(k) / steps;
+                pcl::PointXYZ pt;
+                pt.x = static_cast<float>(pts[i].x + t * (pts[i+1].x - pts[i].x));
+                pt.y = static_cast<float>(pts[i].y + t * (pts[i+1].y - pts[i].y));
+                out.push_back(pt);
+            }
+        }
+        if (!pts.empty()) out.push_back(pts.back());
+        return out;
+    };
+    auto q90Of = [&](const std::vector<pcl::PointXYZ>& samples,
+                     const pcl::PointXYZ& a, const pcl::PointXYZ& b) {
+        std::vector<double> ds;
+        for (const auto& p : samples) ds.push_back(distPtSeg(p, a, b));
+        std::sort(ds.begin(), ds.end());
+        return ds.empty() ? 0.0 : ds[static_cast<std::size_t>(ds.size() * 0.9)];
+    };
+
+    // 扫描窗口 8..24 边, 选最佳候选
+    struct Cand {
+        std::size_t i0, iEnd;
+        int edges, alts;
+        double pathLen, chordLen, chordAng, tlsAng, rmse, maxDev;
+        double q90Before, q90After;
+    };
+    std::vector<Cand> cands;
+    for (int width = 24; width >= 8; --width) {
+        for (std::size_t i0 = 0; i0 < n; ++i0) {
+            const std::size_t iEnd = (i0 + static_cast<std::size_t>(width)) % n;
+            if (i0 == iEnd) continue;
+            // 收集
+            std::vector<pcl::PointXYZ> runPts;
+            double pathLen = 0.0;
+            int alts = 0, prevAxis = -1;
+            const auto A = secondCeresResult[i0];
+            const auto second0 = secondCeresResult[(i0 + 1) % n];
+            const auto B = secondCeresResult[iEnd];
+            const double baseAng = std::atan2(second0.y - A.y, second0.x - A.x);
+            const double abLen = std::hypot(B.x - A.x, B.y - A.y);
+            if (abLen < 1e-6) continue;
+            const double ux = (B.x - A.x) / abLen, uy = (B.y - A.y) / abLen;
+            bool monotonic = true;
+            double lastAlong = -1e9;
+            std::size_t k = i0;
+            for (std::size_t step = 0; step <= static_cast<std::size_t>(width); ++step) {
+                runPts.push_back(secondCeresResult[k]);
+                const double along = (secondCeresResult[k].x - A.x) * ux +
+                                     (secondCeresResult[k].y - A.y) * uy;
+                if (along < lastAlong - 0.15) monotonic = false;
+                lastAlong = along;
+                if (step < static_cast<std::size_t>(width)) {
+                    const auto& pk = secondCeresResult[k];
+                    const auto& pk1 = secondCeresResult[(k + 1) % n];
+                    pathLen += std::hypot(pk1.x - pk.x, pk1.y - pk.y);
+                    const double ang = std::atan2(pk1.y - pk.y, pk1.x - pk.x);
+                    const double dPar = undiff(ang, baseAng);
+                    const int axis = (dPar < M_PI / 4.0) ? 0 : 1;
+                    if (axis != prevAxis && prevAxis >= 0) ++alts;
+                    prevAxis = axis;
+                }
+                k = (k + 1) % n;
+            }
+            if (!monotonic) continue;
+            if (alts < 6) continue;
+            if (abLen < stairMinSpan) continue;
+            if (pathLen < abLen * 1.15) continue;
+            // TLS
+            double dirX, dirY, rmse, maxDev;
+            if (!PostFitLine(runPts, dirX, dirY, rmse, maxDev)) continue;
+            if (rmse > rmseGate || maxDev > maxDevGate) continue;
+            const double tlsAng = std::atan2(dirY, dirX);
+            const double chordAng = std::atan2(B.y - A.y, B.x - A.x);
+            // TLS 角与弦角一致性(差过大拒绝, 不投影端点)
+            if (undiff(tlsAng, chordAng) > 8.0 * M_PI / 180.0) continue;
+            // 距 active 系统 12° 内 → 不是例外, 不处理
+            bool nearSystem = false;
+            for (double sys : systemAngles) {
+                if (undiff(tlsAng, sys) <= dirTol ||
+                    undiff(tlsAng, sys + M_PI / 2.0) <= dirTol) {
+                    nearSystem = true;
+                    break;
+                }
+            }
+            if (nearSystem) continue;
+            // 局部双向证据(run 折线 vs 弦, 对 smooth+raw)
+            // 真实局部双向证据: 端点映射到参考环, 取连续局部弧,
+            // 计算 run/弦→参考弧 与 参考弧→run/弦 的 q90
+            double evBeforeSmooth = 0, evAfterSmooth = 0;
+            double evBeforeRaw = 0, evAfterRaw = 0;
+            bool evidenceOk = true;
+            for (const auto* ref : {&smoothRing, rawRing}) {
+                if (!ref) continue;
+                // 端点映射: 找 A/B 在参考环上的最近边
+                auto mapPt = [&](const pcl::PointXYZ& p,
+                                 std::size_t& edgeIdx, double& t) {
+                    double best = 1e18;
+                    for (std::size_t i = 0; i < ref->size(); ++i) {
+                        const auto& a = (*ref)[i];
+                        const auto& b = (*ref)[(i + 1) % ref->size()];
+                        const double dx = b.x - a.x, dy = b.y - a.y;
+                        const double ls = dx * dx + dy * dy;
+                        if (ls < 1e-12) continue;
+                        double tt = ((p.x - a.x) * dx + (p.y - a.y) * dy) / ls;
+                        tt = std::clamp(tt, 0.0, 1.0);
+                        const double d = std::hypot(p.x - a.x - tt * dx,
+                                                    p.y - a.y - tt * dy);
+                        if (d < best) { best = d; edgeIdx = i; t = tt; }
+                    }
+                    return best;
+                };
+                std::size_t eA, eB; double tA, tB;
+                const double mapA = mapPt(A, eA, tA);
+                const double mapB = mapPt(B, eB, tB);
+                if (mapA > 1.5 || mapB > 1.5) { evidenceOk = false; break; }
+                // 提取连续局部弧: 两条环向路径选与 run 长度更接近的
+                auto extractArc = [&](bool forward)
+                    -> std::vector<pcl::PointXYZ> {
+                    std::vector<pcl::PointXYZ> arc;
+                    if (forward) {
+                        for (std::size_t i = eA; ; i = (i + 1) % ref->size()) {
+                            arc.push_back((*ref)[i]);
+                            if (i == eB) break;
+                        }
+                    } else {
+                        for (std::size_t i = eB; ; i = (i + 1) % ref->size()) {
+                            arc.push_back((*ref)[i]);
+                            if (i == eA) break;
+                        }
+                    }
+                    return arc;
+                };
+                const auto arcF = extractArc(true);
+                const auto arcR = extractArc(false);
+                const auto& arc = (arcF.size() <= arcR.size()) ? arcF : arcR;
+                if (arc.size() < 2) { evidenceOk = false; break; }
+                // forward: run/弦采样→局部弧(开放折线距离)
+                auto distToOpen = [](const pcl::PointXYZ& pt,
+                                     const std::vector<pcl::PointXYZ>& pl) {
+                    double best = 1e18;
+                    for (std::size_t i = 0; i + 1 < pl.size(); ++i) {
+                        const auto& a = pl[i];
+                        const auto& b = pl[i + 1];
+                        const double dx = b.x - a.x, dy = b.y - a.y;
+                        const double ls = dx * dx + dy * dy;
+                        if (ls < 1e-12) continue;
+                        double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / ls;
+                        t = std::clamp(t, 0.0, 1.0);
+                        best = std::min(best, std::hypot(
+                            static_cast<double>(pt.x) - a.x - t * dx,
+                            static_cast<double>(pt.y) - a.y - t * dy));
+                    }
+                    return best;
+                };
+                auto q90toArc = [&](const std::vector<pcl::PointXYZ>& pl) {
+                    std::vector<double> ds;
+                    for (const auto& p : sampleOpen(pl)) {
+                        ds.push_back(distToOpen(p, arc));
+                    }
+                    std::sort(ds.begin(), ds.end());
+                    return ds.empty() ? 0.0
+                        : ds[static_cast<std::size_t>(ds.size() * 0.9)];
+                };
+                const double before = q90toArc(runPts);
+                const double after = q90toArc({A, B});
+                const double gate = std::max(0.10, 0.35 * pixelSize);
+                if (after > before + gate) { evidenceOk = false; break; }
+                if (ref == &smoothRing) {
+                    evBeforeSmooth = before; evAfterSmooth = after;
+                } else {
+                    evBeforeRaw = before; evAfterRaw = after;
+                }
+            }
+            if (!evidenceOk) continue;
+            cands.push_back({i0, iEnd, width, alts, pathLen, abLen, chordAng, tlsAng,
+                             rmse, maxDev, evBeforeSmooth, evAfterSmooth});
+        }
+    }
+    if (cands.empty()) return res;
+    // 选最长弦
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.chordLen > b.chordLen; });
+    const Cand& best = cands.front();
+    res.attempted = true;
+    res.pathLength = best.pathLen;
+    res.chordLength = best.chordLen;
+    res.chordAngleDeg = best.chordAng * 180.0 / M_PI;
+    res.tlsAngleDeg = best.tlsAng * 180.0 / M_PI;
+    res.rmse = best.rmse;
+    res.maxDev = best.maxDev;
+    res.alternations = best.alts;
+    res.edgeCount = best.edges;
+    res.startVertex = best.i0;
+    res.endVertex = best.iEnd;
+    // TLS 角度
+    {
+        std::vector<pcl::PointXYZ> pts;
+        std::size_t k = best.i0;
+        for (std::size_t step = 0; step <= static_cast<std::size_t>(best.edges); ++step) {
+            pts.push_back(secondCeresResult[k]);
+            k = (k + 1) % n;
+        }
+        double dirX, dirY, rmse2, maxDev2;
+        if (PostFitLine(pts, dirX, dirY, rmse2, maxDev2)) {
+            res.tlsAngleDeg = std::atan2(dirY, dirX) * 180.0 / M_PI;
+        }
+    }
+    // 应用: 删除 (i0, iEnd) 开区间, 保留 A/B
+    {
+        std::vector<pcl::PointXYZ> reduced;
+        for (std::size_t idx = 0; idx < n; ++idx) {
+            std::size_t kk = (best.i0 + 1) % n;
+            bool skip = false;
+            while (kk != best.iEnd) {
+                if (idx == kk) { skip = true; break; }
+                kk = (kk + 1) % n;
+            }
+            if (!skip) reduced.push_back(secondCeresResult[idx]);
+        }
+        // 简单性
+        if (reduced.size() < 3 || !isSimplePolygon2D(reduced)) {
+            res.rejectReason = "not_simple_after_replace";
+            return res;
+        }
+        // 面积/质心
+        const double areaBefore = std::abs(polygonArea2D(secondCeresResult));
+        const double areaAfter = std::abs(polygonArea2D(reduced));
+        if (areaBefore > 1e-6 &&
+            std::abs(areaAfter - areaBefore) / areaBefore > 0.02) {
+            res.rejectReason = "area_change_too_large";
+            return res;
+        }
+        res.polygon = std::move(reduced);
+        res.accepted = true;
+    }
+    if (fid >= 0) {
+        std::cerr << "[FinalStaircase] fid=" << fid << " part=" << partIndex
+                  << " start=" << best.i0 << " end=" << best.iEnd
+                  << " edges=" << best.edges
+                  << " alternations=" << best.alts
+                  << " path=" << best.pathLen
+                  << " chord=" << best.chordLen
+                  << " chord_deg=" << best.chordAng * 180.0 / M_PI
+                  << " tls_deg=" << res.tlsAngleDeg
+                  << " rmse=" << best.rmse
+                  << " max_dev=" << best.maxDev
+                  << " smooth_ev_before=" << best.q90Before
+                  << " smooth_ev_after=" << best.q90After
+                  << " accepted=" << (res.accepted ? 1 : 0)
+                  << " reject=" << res.rejectReason
+                  << std::endl;
+    }
+    return res;
+}
+
+
+bool outlineRegular::SaveDebugTopologyPostSimplify(
+    const std::string& shpPath,
+    const Eigen::Vector3d& originOffset,
+    OGRSpatialReference* spatialRef)
+{
+    auto& records = PostSimplifyRecords();
+    if (records.empty()) return true;
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("ESRI Shapefile");
+    if (!driver) return false;
+    for (const char* ext : {".shp", ".shx", ".dbf", ".prj", ".cpg"}) {
+        std::filesystem::path p = shpPath;
+        p.replace_extension(ext);
+        std::error_code ec;
+        std::filesystem::remove(p, ec);
+    }
+    GDALDataset* dataset = driver->Create(shpPath.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    if (!dataset) return false;
+    OGRLayer* layer = dataset->CreateLayer(
+        "debug_topology_post_simplify", spatialRef, wkbPolygon25D, nullptr);
+    if (!layer) { GDALClose(dataset); return false; }
+    OGRFieldDefn fFid("src_fid", OFTInteger64);
+    OGRFieldDefn fPart("part", OFTInteger);
+    OGRFieldDefn fStage("stage", OFTInteger);  // 0=ceres1 1=reduced 2=ceres2
+    OGRFieldDefn fOps("operation_count", OFTInteger);
+    OGRFieldDefn fRem("removed_vertices", OFTInteger);
+    OGRFieldDefn fMicro("micro_count", OFTInteger);
+    OGRFieldDefn fRun("run_count", OFTInteger);
+    OGRFieldDefn fSpike("spike_count", OFTInteger);
+    OGRFieldDefn fAcc("accepted", OFTInteger);
+    OGRFieldDefn fFinal("final_accepted", OFTInteger);
+    OGRFieldDefn fReason("reject_reason", OFTString);
+    layer->CreateField(&fFid); layer->CreateField(&fPart);
+    layer->CreateField(&fStage); layer->CreateField(&fOps);
+    layer->CreateField(&fRem); layer->CreateField(&fMicro);
+    layer->CreateField(&fRun); layer->CreateField(&fSpike);
+    layer->CreateField(&fAcc); layer->CreateField(&fFinal);
+    layer->CreateField(&fReason);
+    OGRFeatureDefn* defn = layer->GetLayerDefn();
+    for (const auto& rec : records) {
+        if (rec.ring.size() < 3) continue;
+        OGRPolygon poly;
+        OGRLinearRing lr;
+        for (const auto& p : rec.ring) {
+            lr.addPoint(p.x + originOffset.x(), p.y + originOffset.y(),
+                        p.z + originOffset.z());
+        }
+        lr.addPoint(rec.ring.front().x + originOffset.x(),
+                    rec.ring.front().y + originOffset.y(),
+                    rec.ring.front().z + originOffset.z());
+        poly.addRing(&lr);
+        OGRFeature* f = OGRFeature::CreateFeature(defn);
+        // Shapefile truncates names longer than 10 characters. Use creation
+        // order so fields such as operation_count remain writable.
+        f->SetField(0, static_cast<GIntBig>(rec.fid));
+        f->SetField(1, rec.part);
+        f->SetField(2, rec.stage);
+        f->SetField(3, rec.operationCount);
+        f->SetField(4, rec.removedVertices);
+        f->SetField(5, rec.microCount);
+        f->SetField(6, rec.runCount);
+        f->SetField(7, rec.spikeCount);
+        f->SetField(8, rec.accepted ? 1 : 0);
+        f->SetField(9, rec.accepted ? 1 : 0);
+        f->SetField(10, rec.rejectReason.c_str());
+        f->SetGeometry(&poly);
+        layer->CreateFeature(f);
+        OGRFeature::DestroyFeature(f);
+    }
+    GDALClose(dataset);
+    return true;
+}
+
+
+
+// ===== EnumerateLocalDefects: 唯一共享缺陷枚举器 =====
+// 判据与阈值完全来自现有常量, 禁止在诊断代码中硬编码
+outlineRegular::LocalDefectSummary outlineRegular::EnumerateLocalDefects(
+    const std::vector<pcl::PointXYZ>& polygon,
     const DirectionContextOut& dirContext)
 {
-    LocalRegularityMetrics m;
-    if (poly.size() < 3) {
-        m.reason = "too_few_vertices";
-        return m;
-    }
-    const std::size_t n = poly.size();
-    int shortDiagonal = 0, spike = 0, zigzag = 0;
-    double irregularLength = 0.0, perimeter = 0.0;
+    LocalDefectSummary summary;
+    if (polygon.size() < 3) return summary;
+    const std::size_t n = polygon.size();
+    double perimeter = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
-        const auto& p1 = poly[i];
-        const auto& p2 = poly[(i + 1) % n];
-        perimeter += std::hypot(p2.x - p1.x, p2.y - p1.y);
+        perimeter += std::hypot(polygon[(i + 1) % n].x - polygon[i].x,
+                                polygon[(i + 1) % n].y - polygon[i].y);
     }
+    summary.perimeter = perimeter;
+    // 短斜边
     if (dirContext.valid && !dirContext.systemAngles.empty()) {
         for (std::size_t i = 0; i < n; ++i) {
-            const auto& p1 = poly[i];
-            const auto& p2 = poly[(i + 1) % n];
+            const auto& p1 = polygon[i];
+            const auto& p2 = polygon[(i + 1) % n];
             const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
             if (len < kDirDiagShortDiagMinLen || len >= 3.0) continue;
             const double ang = std::atan2(p2.y - p1.y, p2.x - p1.x);
             bool ok = false;
             for (double a : dirContext.systemAngles) {
                 if (foldedAngleDistance90(ang, a) * 180.0 / M_PI <= 12.0) {
-                    ok = true;
-                    break;
+                    ok = true; break;
                 }
             }
             if (!ok) {
-                ++shortDiagonal;
-                irregularLength += len;
+                LocalDefect d;
+                d.type = LocalDefectType::ShortDiagonal;
+                d.edgeIndex = i;
+                d.point = p1;
+                d.edgeLength1 = len;
+                d.contributionLength = len;
+                summary.defects.push_back(d);
+                ++summary.shortDiagonalCount;
+                summary.irregularLength += len;
             }
         }
     }
+    // spike + zigzag
     for (std::size_t i = 0; i < n; ++i) {
-        const auto& prev = poly[(i + n - 1) % n];
-        const auto& cur = poly[i];
-        const auto& next = poly[(i + 1) % n];
+        const auto prev = polygon[(i + n - 1) % n];
+        const auto cur = polygon[i];
+        const auto next = polygon[(i + 1) % n];
         const double v1x = cur.x - prev.x, v1y = cur.y - prev.y;
         const double v2x = next.x - cur.x, v2y = next.y - cur.y;
         const double l1 = std::hypot(v1x, v1y);
         const double l2 = std::hypot(v2x, v2y);
         if (l1 < 1e-9 || l2 < 1e-9) continue;
         const double cosA = (v1x * v2x + v1y * v2y) / (l1 * l2);
-        const double angleDeg =
-            std::acos(std::clamp(cosA, -1.0, 1.0)) * 180.0 / M_PI;
+        const double angleDeg = std::acos(std::clamp(cosA, -1.0, 1.0)) * 180.0 / M_PI;
         if (angleDeg < kDirDiagSpikeAngleDeg) {
             const double triArea = 0.5 * std::abs(
                 (cur.x - prev.x) * (next.y - prev.y) -
                 (next.x - prev.x) * (cur.y - prev.y));
-            if (triArea < kDirDiagSpikeMaxArea ||
-                (l1 < 2.0 && l2 < 2.0)) {
-                ++spike;
-                irregularLength += std::min(l1, l2);
+            if (triArea < kDirDiagSpikeMaxArea || (l1 < 2.0 && l2 < 2.0)) {
+                LocalDefect d;
+                d.type = LocalDefectType::Spike;
+                d.vertexIndex = i;
+                d.point = cur;
+                d.edgeLength1 = l1;
+                d.edgeLength2 = l2;
+                d.angleDeg = angleDeg;
+                d.triangleArea = triArea;
+                d.contributionLength = std::min(l1, l2);
+                summary.defects.push_back(d);
+                ++summary.spikeCount;
+                summary.irregularLength += d.contributionLength;
             }
         }
         {
@@ -10677,26 +11829,69 @@ outlineRegular::LocalRegularityMetrics outlineRegular::AnalyzeLocalRegularity(
                     chordLen;
                 const double turnDeg = 180.0 - angleDeg;
                 if (dev < kDirDiagZigzagChordDev && turnDeg > 5.0 && turnDeg < 45.0) {
-                    ++zigzag;
-                    irregularLength += std::min(l1, l2);
+                    LocalDefect d;
+                    d.type = LocalDefectType::Zigzag;
+                    d.vertexIndex = i;
+                    d.point = cur;
+                    d.edgeLength1 = l1;
+                    d.edgeLength2 = l2;
+                    d.deviation = dev;
+                    d.contributionLength = std::min(l1, l2);
+                    summary.defects.push_back(d);
+                    ++summary.zigzagCount;
+                    summary.irregularLength += d.contributionLength;
                 }
             }
         }
     }
-    m.shortDiagonalCount = shortDiagonal;
-    m.spikeCount = spike;
-    m.zigzagCount = zigzag;
-    m.irregularLengthRatio =
-        perimeter > 1e-9 ? irregularLength / perimeter : 0.0;
-    m.passed = (shortDiagonal == 0 && m.irregularLengthRatio <= 0.10) &&
-        spike == 0 && zigzag < 3;
+    summary.irregularLengthRatio = perimeter > 1e-9
+        ? summary.irregularLength / perimeter : 0.0;
+    return summary;
+}
+
+outlineRegular::MicroEdgeStats outlineRegular::AnalyzeMicroEdges(
+    const std::vector<pcl::PointXYZ>& polygon)
+{
+    MicroEdgeStats stats;
+    double minLength = std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < polygon.size(); ++i) {
+        const double length = std::hypot(
+            polygon[(i + 1) % polygon.size()].x - polygon[i].x,
+            polygon[(i + 1) % polygon.size()].y - polygon[i].y);
+        if (length >= 0.15 || length <= 1e-6) continue;
+        ++stats.count;
+        stats.totalLength += length;
+        minLength = std::min(minLength, length);
+        stats.edgeIndices.push_back(i);
+    }
+    if (stats.count > 0) stats.minLength = minLength;
+    return stats;
+}
+
+outlineRegular::LocalRegularityMetrics outlineRegular::AnalyzeLocalRegularity(
+    const std::vector<pcl::PointXYZ>& poly,
+    const DirectionContextOut& dirContext)
+{
+    LocalRegularityMetrics m;
+    if (poly.size() < 3) {
+        m.reason = "too_few_vertices";
+        return m;
+    }
+    const LocalDefectSummary s = EnumerateLocalDefects(poly, dirContext);
+    m.shortDiagonalCount = s.shortDiagonalCount;
+    m.spikeCount = s.spikeCount;
+    m.zigzagCount = s.zigzagCount;
+    m.irregularLengthRatio = s.irregularLengthRatio;
+    m.passed = (s.shortDiagonalCount == 0 && s.irregularLengthRatio <= 0.10) &&
+        s.spikeCount == 0 && s.zigzagCount < 3;
     if (!m.passed) {
-        if (shortDiagonal > 0) m.reason = "short_diagonal";
-        else if (spike > 0) m.reason = "spike";
+        if (s.shortDiagonalCount > 0) m.reason = "short_diagonal";
+        else if (s.spikeCount > 0) m.reason = "spike";
         else m.reason = "zigzag";
     }
     return m;
 }
+
 
 std::string outlineRegular::CheckFallbackLocalRegularity(
     const std::vector<pcl::PointXYZ>& poly,
@@ -10792,6 +11987,10 @@ std::vector<pcl::PointXYZ> outlineRegular::CleanLowEvidenceIrregularities(
 
 // 拓扑通道定向重试的运行级计数(进程累计)
 namespace {
+// 平差后局部拓扑约简(shadow-only 阶段开关)
+constexpr bool kEnableTopologyPostSimplification = true;
+constexpr bool kTopologyPostSimplificationShadowOnly = true;
+
     int gRetryRawKdeAttempted = 0;
     int gRetryRawKdeAccepted = 0;
     int gRetryStrictAttempted = 0;
@@ -13262,6 +14461,295 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                   << " area_ratio_smooth="
                   << (resultArea / std::max(std::abs(polygonArea2D(initialRing)), 1e-6))
                   << std::endl;
+    }
+
+    // ---- 7.5 平差后局部拓扑约简 v5(shadow-only) ----
+    // 四候选独立构造: S0(基线)/SA(阶段A+Ceres2)/SB(S0直跑staircase)/
+    // SAB(SA跑staircase)。SB 不受 A 阶段结果门控。
+    if (kEnableTopologyPostSimplification && !evaluationOnly &&
+        ceresResult.size() >= 5) {
+        const std::vector<pcl::PointXYZ> S0 = ceresResult;
+        const MicroEdgeStats microS0 = AnalyzeMicroEdges(S0);
+        auto logMicroEdges = [&](const char* stage,
+                                 const MicroEdgeStats& stats) {
+            if (source_feature_id_ < 0) return;
+            std::cerr << "[MicroEdgeDiag] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " stage=" << stage
+                      << " count=" << stats.count
+                      << " total_length=" << stats.totalLength
+                      << " min_length=" << stats.minLength
+                      << " indices=";
+            for (std::size_t i = 0; i < stats.edgeIndices.size(); ++i) {
+                if (i > 0) std::cerr << ",";
+                std::cerr << "e" << stats.edgeIndices[i];
+            }
+            std::cerr << std::endl;
+        };
+        logMicroEdges("S0", microS0);
+        // ---- A 阶段 + SA ----
+        const auto postResult = BuildTopologyPostSimplification(
+            S0, fixedEdgeAssignments, systemAngles, pixelSize,
+            initialRing, rawRing, source_feature_id_, partIndex);
+        bool saValid = false;
+        std::vector<pcl::PointXYZ> SA = S0;
+        std::string saReason = postResult.changed ? "" : "no_A_change";
+        if (postResult.changed) {
+            DirectionContextOut localContext;
+            localContext.valid = true;
+            localContext.completeEvidence = true;
+            localContext.primaryAngle = systemAngles.empty()
+                ? 0.0 : systemAngles.front();
+            localContext.systemAngles = systemAngles;
+            localContext.multiDirection = isMultiDirection;
+            const LocalDefectSummary defectsFirst =
+                EnumerateLocalDefects(S0, localContext);
+            std::vector<pcl::PointXYZ> secondCandidate = postResult.candidate;
+            std::vector<int> secondAssignments = postResult.edgeAssignments;
+            optimizeWithHardConstraints(
+                secondCandidate, residualCloud, isMultiDirection,
+                preferredAngles, &secondAssignments, true,
+                /*strict_vertex_count=*/true);
+            std::vector<pcl::PointXYZ> secondResult = best_hypothesis;
+            best_hypothesis = S0;  // 立即恢复
+            const MicroEdgeStats microReduced =
+                AnalyzeMicroEdges(postResult.candidate);
+            const MicroEdgeStats microCeres2 = AnalyzeMicroEdges(secondResult);
+            logMicroEdges("reduced", microReduced);
+            logMicroEdges("ceres2", microCeres2);
+            if (source_feature_id_ >= 0) {
+                std::cerr << "[MicroEdgeTransition] fid=" << source_feature_id_
+                          << " part=" << partIndex
+                          << " S0_to_reduced=" << microS0.count
+                          << "->" << microReduced.count
+                          << " reduced_to_ceres2=" << microReduced.count
+                          << "->" << microCeres2.count
+                          << " S0_to_ceres2=" << microS0.count
+                          << "->" << microCeres2.count << std::endl;
+            }
+            const bool countConserved =
+                secondResult.size() == postResult.candidate.size();
+            const std::string secondReason = [&]() {
+                DirectionContextOut ctx;
+                ctx.valid = true;
+                ctx.completeEvidence = true;
+                ctx.primaryAngle = systemAngles.empty()
+                    ? 0.0 : systemAngles.front();
+                ctx.systemAngles = systemAngles;
+                ctx.multiDirection = isMultiDirection;
+                // qualityCheck 需要 isMultiDirection 上下文
+                return CheckPolygonQualityVsRing(
+                    secondResult, initialRing, true, isMultiDirection,
+                    systemAngles, 2.5, -1, partIndex);
+            }();
+            const LocalDefectSummary defectsSecond =
+                EnumerateLocalDefects(secondResult, localContext);
+            struct SAPostValidation {
+                bool enoughVertices = false;
+                bool vertexCountConserved = false;
+                bool geometryPassed = false;
+                bool vertexReduced = false;
+                bool microReductionPassed = false;
+                bool microCeresPassed = false;
+                bool shortDiagonalPassed = false;
+                bool spikePassed = false;
+                bool zigzagPassed = false;
+                bool irregularRatioPassed = false;
+            } validation;
+            validation.enoughVertices = secondResult.size() >= 3;
+            validation.vertexCountConserved = countConserved;
+            validation.geometryPassed = secondReason.empty();
+            validation.vertexReduced = secondResult.size() < S0.size();
+            validation.microReductionPassed = microReduced.count <= microS0.count;
+            validation.microCeresPassed = microCeres2.count <= microReduced.count;
+            validation.shortDiagonalPassed = defectsSecond.shortDiagonalCount <=
+                defectsFirst.shortDiagonalCount;
+            validation.spikePassed =
+                defectsSecond.spikeCount <= defectsFirst.spikeCount;
+            validation.zigzagPassed =
+                defectsSecond.zigzagCount <= defectsFirst.zigzagCount;
+            validation.irregularRatioPassed = defectsSecond.irregularLengthRatio <=
+                defectsFirst.irregularLengthRatio + 0.02;
+            saValid = validation.enoughVertices &&
+                validation.vertexCountConserved && validation.geometryPassed &&
+                validation.vertexReduced && validation.microReductionPassed &&
+                validation.microCeresPassed && validation.shortDiagonalPassed &&
+                validation.spikePassed && validation.zigzagPassed &&
+                validation.irregularRatioPassed;
+            if (saValid) {
+                SA = secondResult;
+            } else {
+                saReason = !countConserved ? "vertex_count_not_conserved"
+                    : !secondReason.empty() ? secondReason
+                    : !(validation.microReductionPassed && validation.microCeresPassed)
+                        ? (!validation.microReductionPassed
+                            ? "micro_edge_regression_in_reduction"
+                            : "micro_edge_regression_in_ceres2")
+                    : "local_regularity_regression";
+            }
+            std::string failedGates;
+            auto addFailedGate = [&](bool passed, const char* name) {
+                if (passed) return;
+                if (!failedGates.empty()) failedGates += ",";
+                failedGates += name;
+            };
+            addFailedGate(validation.enoughVertices, "enough_vertices");
+            addFailedGate(validation.vertexCountConserved, "vertex_count_conserved");
+            addFailedGate(validation.geometryPassed, "geometry");
+            addFailedGate(validation.vertexReduced, "vertex_reduced");
+            addFailedGate(validation.microReductionPassed, "micro_reduction");
+            addFailedGate(validation.microCeresPassed, "micro_ceres2");
+            addFailedGate(validation.shortDiagonalPassed, "short_diagonal");
+            addFailedGate(validation.spikePassed, "spike");
+            addFailedGate(validation.zigzagPassed, "zigzag");
+            addFailedGate(validation.irregularRatioPassed, "irregular_ratio");
+            if (source_feature_id_ >= 0) {
+                std::cerr << "[SAPostValidation] fid=" << source_feature_id_
+                          << " part=" << partIndex
+                          << " vertices=" << S0.size() << "/"
+                          << postResult.candidate.size() << "/" << secondResult.size()
+                          << " count_conserved=" << validation.vertexCountConserved
+                          << " geometry_passed=" << validation.geometryPassed
+                          << " geometry_reason="
+                          << (secondReason.empty() ? "none" : secondReason)
+                          << " vertex_reduced=" << validation.vertexReduced
+                          << " micro=" << microS0.count << "/"
+                          << microReduced.count << "/" << microCeres2.count
+                          << " diag=" << defectsFirst.shortDiagonalCount
+                          << "->" << defectsSecond.shortDiagonalCount
+                          << " spike=" << defectsFirst.spikeCount
+                          << "->" << defectsSecond.spikeCount
+                          << " zigzag=" << defectsFirst.zigzagCount
+                          << "->" << defectsSecond.zigzagCount
+                          << " irregular_length=" << defectsFirst.irregularLength
+                          << "->" << defectsSecond.irregularLength
+                          << " irregular_ratio=" << defectsFirst.irregularLengthRatio
+                          << "->" << defectsSecond.irregularLengthRatio
+                          << " gates="
+                          << validation.enoughVertices
+                          << validation.vertexCountConserved
+                          << validation.geometryPassed
+                          << validation.vertexReduced
+                          << validation.microReductionPassed
+                          << validation.microCeresPassed
+                          << validation.shortDiagonalPassed
+                          << validation.spikePassed
+                          << validation.zigzagPassed
+                          << validation.irregularRatioPassed
+                          << " accepted=" << saValid
+                          << " primary_reject_reason="
+                          << (saReason.empty() ? "none" : saReason)
+                          << " all_failed_gates="
+                          << (failedGates.empty() ? "none" : failedGates)
+                          << std::endl;
+            }
+            std::cerr << "[TopologyPostSummary] fid=" << source_feature_id_
+                      << " part=" << partIndex
+                      << " mode=" << (isMultiDirection ? "multi" : "single")
+                      << " first_vertices=" << S0.size()
+                      << " reduced_vertices=" << postResult.candidate.size()
+                      << " second_ceres_vertices=" << secondResult.size()
+                      << " micro_removed=" << postResult.microDoglegsRemoved
+                      << " detours_removed=" << postResult.notchesRemoved
+                      << " runs_replaced=" << postResult.zigzagRunsReplaced
+                      << " spikes_removed=" << postResult.spikesRemoved
+                      << " first_diag/spk/zz=" << defectsFirst.shortDiagonalCount
+                      << "/" << defectsFirst.spikeCount << "/" << defectsFirst.zigzagCount
+                      << " second_diag/spk/zz=" << defectsSecond.shortDiagonalCount
+                      << "/" << defectsSecond.spikeCount << "/" << defectsSecond.zigzagCount
+                      << " accepted=" << (saValid ? 1 : 0)
+                      << " reject_reason=" << saReason
+                      << " shadow_only=1" << std::endl;
+            // 缺陷逐阶段诊断(直接使用 EnumerateLocalDefects, 无独立判据)
+            if (source_feature_id_ == 13) {
+                auto dumpDefects2 = [&](const std::vector<pcl::PointXYZ>& poly,
+                                        const char* tag) {
+                    const auto s = EnumerateLocalDefects(poly, localContext);
+                    for (const auto& d : s.defects) {
+                        const char* tn =
+                            d.type == LocalDefectType::ShortDiagonal ? "short_diagonal"
+                            : d.type == LocalDefectType::Spike ? "spike" : "zigzag";
+                        std::cerr << "[LocalDefectDiag] fid=13 stage=" << tag
+                                  << " type=" << tn
+                                  << " vidx=" << d.vertexIndex
+                                  << " eidx=" << d.edgeIndex
+                                  << " xy=" << d.point.x << "," << d.point.y
+                                  << " l1=" << d.edgeLength1
+                                  << " l2=" << d.edgeLength2
+                                  << " angle=" << d.angleDeg
+                                  << " tri_area=" << d.triangleArea
+                                  << " dev=" << d.deviation << std::endl;
+                    }
+                };
+                dumpDefects2(S0, "S0");
+                dumpDefects2(postResult.candidate, "reduced");
+                dumpDefects2(secondResult, "ceres2");
+            }
+        }
+        // ---- SB: 始终从 S0 直跑(不受 changed/SA 影响) ----
+        FinalStaircaseResult fsrSB;
+        {
+            fsrSB = BuildFinalStaircaseReduction(
+                S0, systemAngles, pixelSize, initialRing, rawRing,
+                isMultiDirection, source_feature_id_, partIndex);
+            if (fsrSB.attempted) {
+                std::cerr << "[StaircaseAB] fid=" << source_feature_id_
+                          << " candidate=SB"
+                          << " input_vertices=" << S0.size()
+                          << " final_vertices=" << fsrSB.polygon.size()
+                          << " edges=" << fsrSB.edgeCount
+                          << " path=" << fsrSB.pathLength
+                          << " chord=" << fsrSB.chordLength
+                          << " tls_deg=" << fsrSB.tlsAngleDeg
+                          << " accepted=" << (fsrSB.accepted ? 1 : 0)
+                          << " reject=" << fsrSB.rejectReason << std::endl;
+            }
+        }
+        // ---- SAB: 仅 SA 有效时 ----
+        FinalStaircaseResult fsrSAB;
+        if (saValid && SA.size() != S0.size()) {
+            fsrSAB = BuildFinalStaircaseReduction(
+                SA, systemAngles, pixelSize, initialRing, rawRing,
+                isMultiDirection, source_feature_id_, partIndex);
+            if (fsrSAB.attempted) {
+                std::cerr << "[StaircaseAB] fid=" << source_feature_id_
+                          << " candidate=SAB"
+                          << " input_vertices=" << SA.size()
+                          << " final_vertices=" << fsrSAB.polygon.size()
+                          << " accepted=" << (fsrSAB.accepted ? 1 : 0)
+                          << " reject=" << fsrSAB.rejectReason << std::endl;
+            }
+        }
+        // ---- 调试记录: S0/SA/SB/SAB 四条(修复 SAB 不写 debug) ----
+        {
+            auto& records = PostSimplifyRecords();
+            auto pushCand = [&](const std::vector<pcl::PointXYZ>& ring,
+                                const char* tag, bool valid,
+                                const std::string& reason) {
+                PostSimplifyDebugRecord r;
+                r.fid = source_feature_id_;
+                r.part = partIndex;
+                r.stage = 3;
+                r.accepted = valid;
+                r.rejectReason = std::string(tag) + "|" + reason;
+                r.ring = ring;
+                records.push_back(std::move(r));
+            };
+            pushCand(S0, "S0", true, "baseline");
+            if (postResult.changed) {
+                pushCand(SA, "SA", saValid, saReason);
+            }
+            if (fsrSB.attempted) {
+                pushCand(fsrSB.polygon, "SB", fsrSB.accepted,
+                         fsrSB.rejectReason.empty() ? "staircase_hit" :
+                             fsrSB.rejectReason);
+            }
+            if (saValid && SA.size() != S0.size() && fsrSAB.attempted) {
+                pushCand(fsrSAB.polygon, "SAB", fsrSAB.accepted,
+                         fsrSAB.rejectReason.empty() ? "staircase_hit" :
+                             fsrSAB.rejectReason);
+            }
+        }
     }
     std::cerr << "[TopologyAccept] fid=" << source_feature_id_
               << " source=ceres vertices=" << ceresResult.size()
