@@ -10608,27 +10608,27 @@ bool outlineRegular::SaveRawResidualDebugDump(
     return true;
 }
 
-std::string outlineRegular::CheckFallbackLocalRegularity(
+outlineRegular::LocalRegularityMetrics outlineRegular::AnalyzeLocalRegularity(
     const std::vector<pcl::PointXYZ>& poly,
-    const DirectionContextOut& dirContext,
-    long long fid,
-    int partIndex,
-    const char* stage)
+    const DirectionContextOut& dirContext)
 {
-    if (poly.size() < 3) return "too_few_vertices";
-    const std::size_t m = poly.size();
+    LocalRegularityMetrics m;
+    if (poly.size() < 3) {
+        m.reason = "too_few_vertices";
+        return m;
+    }
+    const std::size_t n = poly.size();
     int shortDiagonal = 0, spike = 0, zigzag = 0;
     double irregularLength = 0.0, perimeter = 0.0;
-    for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t i = 0; i < n; ++i) {
         const auto& p1 = poly[i];
-        const auto& p2 = poly[(i + 1) % m];
+        const auto& p2 = poly[(i + 1) % n];
         perimeter += std::hypot(p2.x - p1.x, p2.y - p1.y);
     }
-    // 1) 短斜边: 0.8~3m 的边做方向检查(有方向证据时)
     if (dirContext.valid && !dirContext.systemAngles.empty()) {
-        for (std::size_t i = 0; i < m; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             const auto& p1 = poly[i];
-            const auto& p2 = poly[(i + 1) % m];
+            const auto& p2 = poly[(i + 1) % n];
             const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
             if (len < kDirDiagShortDiagMinLen || len >= 3.0) continue;
             const double ang = std::atan2(p2.y - p1.y, p2.x - p1.x);
@@ -10645,11 +10645,10 @@ std::string outlineRegular::CheckFallbackLocalRegularity(
             }
         }
     }
-    // 2) 尖刺与 3) 近共线锯齿: 逐顶点检查
-    for (std::size_t i = 0; i < m; ++i) {
-        const auto& prev = poly[(i + m - 1) % m];
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& prev = poly[(i + n - 1) % n];
         const auto& cur = poly[i];
-        const auto& next = poly[(i + 1) % m];
+        const auto& next = poly[(i + 1) % n];
         const double v1x = cur.x - prev.x, v1y = cur.y - prev.y;
         const double v2x = next.x - cur.x, v2y = next.y - cur.y;
         const double l1 = std::hypot(v1x, v1y);
@@ -10658,8 +10657,6 @@ std::string outlineRegular::CheckFallbackLocalRegularity(
         const double cosA = (v1x * v2x + v1y * v2y) / (l1 * l2);
         const double angleDeg =
             std::acos(std::clamp(cosA, -1.0, 1.0)) * 180.0 / M_PI;
-        // 尖刺: 内角 <32° 且 三角面积小(删除该点几何损失可忽略)
-        // 或两侧都是短边(细尖残留)
         if (angleDeg < kDirDiagSpikeAngleDeg) {
             const double triArea = 0.5 * std::abs(
                 (cur.x - prev.x) * (next.y - prev.y) -
@@ -10670,7 +10667,6 @@ std::string outlineRegular::CheckFallbackLocalRegularity(
                 irregularLength += std::min(l1, l2);
             }
         }
-        // 近共线锯齿: 顶点紧贴前后连线但转角明显(>5°)
         {
             const double chordDx = next.x - prev.x;
             const double chordDy = next.y - prev.y;
@@ -10687,32 +10683,50 @@ std::string outlineRegular::CheckFallbackLocalRegularity(
             }
         }
     }
-    const double irregularRatio =
+    m.shortDiagonalCount = shortDiagonal;
+    m.spikeCount = spike;
+    m.zigzagCount = zigzag;
+    m.irregularLengthRatio =
         perimeter > 1e-9 ? irregularLength / perimeter : 0.0;
-    // Direction evidence is a hard contract: no visible straight edge may
-    // remain outside the accepted direction systems. Curves are disabled in
-    // mask-only mode, so there is no curve exemption here.
-    const bool accepted =
-        (shortDiagonal == 0 && irregularRatio <= 0.10) &&
+    m.passed = (shortDiagonal == 0 && m.irregularLengthRatio <= 0.10) &&
         spike == 0 && zigzag < 3;
-    std::string reason;
-    if (!accepted) {
-        if (shortDiagonal > 0) reason = "short_diagonal";
-        else if (spike > 0) reason = "spike";
-        else reason = "zigzag";
+    if (!m.passed) {
+        if (shortDiagonal > 0) m.reason = "short_diagonal";
+        else if (spike > 0) m.reason = "spike";
+        else m.reason = "zigzag";
+    }
+    return m;
+}
+
+std::string outlineRegular::CheckFallbackLocalRegularity(
+    const std::vector<pcl::PointXYZ>& poly,
+    const DirectionContextOut& dirContext,
+    long long fid,
+    int partIndex,
+    const char* stage)
+{
+    const LocalRegularityMetrics m = AnalyzeLocalRegularity(poly, dirContext);
+    if (poly.size() < 3) {
+        if (fid >= 0) {
+            std::cerr << "[FallbackQuality] fid=" << fid
+                      << " part=" << partIndex
+                      << " stage=" << (stage ? stage : "?")
+                      << " accepted=0 reason=too_few_vertices" << std::endl;
+        }
+        return "too_few_vertices";
     }
     if (fid >= 0) {
         std::cerr << "[FallbackQuality] fid=" << fid << " part=" << partIndex
                   << " stage=" << (stage ? stage : "?")
-                  << " short_diagonal=" << shortDiagonal
-                  << " spike=" << spike
-                  << " zigzag=" << zigzag
-                  << " irregular_ratio=" << irregularRatio
-                  << " accepted=" << (accepted ? 1 : 0)
-                  << " reason=" << (accepted ? "-" : reason)
+                  << " short_diagonal=" << m.shortDiagonalCount
+                  << " spike=" << m.spikeCount
+                  << " zigzag=" << m.zigzagCount
+                  << " irregular_ratio=" << m.irregularLengthRatio
+                  << " accepted=" << (m.passed ? 1 : 0)
+                  << " reason=" << (m.passed ? "-" : m.reason)
                   << std::endl;
     }
-    return accepted ? "" : ("fallback_" + reason);
+    return m.passed ? "" : ("fallback_" + m.reason);
 }
 
 // 保守清理: 只删除有明确低面积证据的尖刺和近共线锯齿顶点。
@@ -10792,9 +10806,8 @@ namespace {
     int gAlternateDirAccepted = 0;
 }
 
-// 拓扑保持规则化主通道 wrapper: 首次正常构造; 失败后按失败类型
-// 定向重试(raw_kde 方向回滚 / strict_geometry 严格几何), 仍失败
-// 走 VDP→StrictFallback→OBR。已成功的建筑不进重试分支。
+// 拓扑保持规则化主通道(正式入口): 完整管线 + 救援方向 A/B 影子评估。
+// 影子评估只输出诊断, 不改变返回值。
 std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     const std::vector<pcl::PointXYZ>& initialRing,
     double pixelSize,
@@ -10804,6 +10817,28 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     const std::vector<pcl::PointXYZ>* rawRing,
     const void* detectedDirection)
 {
+    const TopologyPipelineResult pipeline = RunTopologyPipeline(
+        initialRing, pixelSize, usedFallback, dirContext, partIndex,
+        rawRing, detectedDirection, /*evaluationOnly=*/false);
+    // AB3 方向选择已前移到 main.cpp(SelectDirectionSystemsByTopology),
+    // 正式管线只跑一次, 不再内部执行影子评估
+    return pipeline.polygon;
+}
+
+// 完整拓扑管线(首轮 + raw_kde/strict/alternate 重试): 正式与影子
+// 共用同一实现, 防止两套重试逻辑漂移。evaluationOnly=true 时不计
+// RetrySummary、Impl 跳过调试副作用。
+outlineRegular::TopologyPipelineResult outlineRegular::RunTopologyPipeline(
+    const std::vector<pcl::PointXYZ>& initialRing,
+    double pixelSize,
+    bool& usedFallback,
+    DirectionContextOut* dirContext,
+    int partIndex,
+    const std::vector<pcl::PointXYZ>* rawRing,
+    const void* detectedDirection,
+    bool evaluationOnly)
+{
+    TopologyPipelineResult result;
     TopologyPassFailure failure;
     TopologyPassFailure strictFailure;
     // 失败原因格式化: construction > precheck > ceres > candidateQuality
@@ -10818,8 +10853,12 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
     };
     std::vector<pcl::PointXYZ> first = TopologyPreservingRegularizeImpl(
         initialRing, pixelSize, usedFallback, dirContext, partIndex,
-        rawRing, detectedDirection, false, &failure);
-    if (!first.empty()) return first;
+        rawRing, detectedDirection, false, &failure, evaluationOnly);
+    if (!first.empty()) {
+        result.polygon = std::move(first);
+        result.acceptedStage = "first";
+        return result;
+    }
 
     // ---- 重试一: raw_kde 方向回滚 ----
     // PCA 纠偏把主方向拉离 KDE 峰后候选自交的场景: 用原始 KDE 峰
@@ -10855,18 +10894,23 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                       << " retry_deg=" << ext->rawPrimaryAngle * 180.0 / M_PI
                       << " trigger=self_intersecting" << std::endl;
             retryAttempted = true;
-            ++gRetryRawKdeAttempted;
+            if (!evaluationOnly) ++gRetryRawKdeAttempted;
             std::vector<pcl::PointXYZ> second = TopologyPreservingRegularizeImpl(
                 initialRing, pixelSize, usedFallback, dirContext, partIndex,
-                rawRing, &retryDir, false, &retryFailure);
+                rawRing, &retryDir, false, &retryFailure, evaluationOnly);
             const bool accepted = !second.empty();
-            if (accepted) ++gRetryRawKdeAccepted;
+            if (accepted) { if (!evaluationOnly) ++gRetryRawKdeAccepted; }
             std::cerr << "[TopologyRetryResult] fid=" << source_feature_id_
                       << " mode=raw_kde accepted=" << (accepted ? 1 : 0)
                       << " reason="
                       << (accepted ? "ok" : formatFailure(retryFailure))
                       << std::endl;
-            if (accepted) return second;
+            if (accepted) {
+                result.polygon = std::move(second);
+                result.acceptedStage = "raw_kde";
+                result.finalFailure = retryFailure;
+                return result;
+            }
         }
     }
 
@@ -10901,15 +10945,17 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                               : static_cast<long long>(
                                     effective.failedTransitionChain))
                       << std::endl;
-            ++gRetryStrictAttempted;
-            if (std::string(trigger) == "wall_deviation") ++gTriggerWall;
-            else if (std::string(trigger) == "flying_vertex") ++gTriggerFlying;
-            else ++gTriggerTransition;
+            if (!evaluationOnly) ++gRetryStrictAttempted;
+            if (!evaluationOnly) {
+                if (std::string(trigger) == "wall_deviation") ++gTriggerWall;
+                else if (std::string(trigger) == "flying_vertex") ++gTriggerFlying;
+                else ++gTriggerTransition;
+            }
             std::vector<pcl::PointXYZ> third = TopologyPreservingRegularizeImpl(
                 initialRing, pixelSize, usedFallback, dirContext, partIndex,
-                rawRing, detectedDirection, true, &strictFailure);
+                rawRing, detectedDirection, true, &strictFailure, evaluationOnly);
             const bool accepted = !third.empty();
-            if (accepted) ++gRetryStrictAccepted;
+            if (accepted) { if (!evaluationOnly) ++gRetryStrictAccepted; }
             std::cerr << "[TopologyRetryResult] fid=" << source_feature_id_
                       << " mode=strict_geometry accepted=" << (accepted ? 1 : 0)
                       << " reason="
@@ -10923,7 +10969,12 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                               ? "" : " detail=" +
                                     strictFailure.failedTransitionReason)
                       << std::endl;
-            if (accepted) return third;
+            if (accepted) {
+                result.polygon = std::move(third);
+                result.acceptedStage = "strict_geometry";
+                result.finalFailure = strictFailure;
+                return result;
+            }
         }
     }
 
@@ -11008,7 +11059,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                               ? ext->pcaAngleRad * 180.0 / M_PI : -1.0)
                           << " retry_deg=" << cand.angle * 180.0 / M_PI
                           << " evidence=" << cand.evidence << std::endl;
-                ++gAlternateDirAttempted;
+                if (!evaluationOnly) ++gAlternateDirAttempted;
                 DetectedDirectionResult retryDir = *ext;
                 retryDir.primaryAngle = cand.angle;
                 for (auto& s : retryDir.systems) {
@@ -11021,9 +11072,10 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                 std::vector<pcl::PointXYZ> altResult =
                     TopologyPreservingRegularizeImpl(
                         initialRing, pixelSize, usedFallback, dirContext,
-                        partIndex, rawRing, &retryDir, false, &altFailure);
+                        partIndex, rawRing, &retryDir, false, &altFailure,
+                        evaluationOnly);
                 const bool accepted = !altResult.empty();
-                if (accepted) ++gAlternateDirAccepted;
+                if (accepted) { if (!evaluationOnly) ++gAlternateDirAccepted; }
                 std::cerr << "[TopologyRetryResult] fid="
                           << source_feature_id_
                           << " mode=alternate_direction accepted="
@@ -11031,11 +11083,463 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularize(
                           << " reason="
                           << (accepted ? "ok" : formatFailure(altFailure))
                           << std::endl;
-                if (accepted) return altResult;
+                if (accepted) {
+                    result.polygon = std::move(altResult);
+                    result.acceptedStage = "alternate_direction";
+                    result.finalFailure = altFailure;
+                    return result;
+                }
+                result.finalFailure = altFailure;
             }
         }
     }
-    return {};
+    if (result.finalFailure.constructionReason.empty() &&
+        result.finalFailure.precheckReason.empty() &&
+        result.finalFailure.ceresReason.empty()) {
+        if (!strictFailure.constructionReason.empty() ||
+            !strictFailure.precheckReason.empty() ||
+            !strictFailure.ceresReason.empty()) {
+            result.finalFailure = strictFailure;
+        } else if (!retryFailure.constructionReason.empty() ||
+                   !retryFailure.precheckReason.empty() ||
+                   !retryFailure.ceresReason.empty()) {
+            result.finalFailure = retryFailure;
+        } else {
+            result.finalFailure = failure;
+        }
+    }
+    result.acceptedStage = "failed";
+    return result;
+}
+
+// ===== SelectDirectionSystemsByTopology =====
+// 救援方向拓扑 A/B 选择器(AB3 正式受控上线): 对 evidenceBacked
+// active 系统前向增量试跑(完整管线 evaluationOnly, 全新实例),
+// 六条门槛裁决 keep/close。返回筛选后的方向副本(selected),
+// 不修改原始检测结果; 决策链与影子验证期完全一致。
+DetectedDirectionResult outlineRegular::SelectDirectionSystemsByTopology(
+    const std::vector<pcl::PointXYZ>& initialRing,
+    double pixelSize,
+    int partIndex,
+    const std::vector<pcl::PointXYZ>* rawRing,
+    const DetectedDirectionResult& detected,
+    long long fid)
+{
+    const DetectedDirectionResult* ext = &detected;
+    if (!ext->valid || ext->systems.empty()) return detected;
+    std::vector<std::size_t> provisional;
+    for (std::size_t s = 1; s < ext->systems.size(); ++s) {
+        if (ext->systems[s].active && ext->systems[s].evidenceBacked) {
+            provisional.push_back(s);
+        }
+    }
+    if (provisional.empty()) return detected;
+
+    double perimeter = 0.0;
+    for (std::size_t i = 0; i < initialRing.size(); ++i) {
+        perimeter += std::hypot(
+            initialRing[(i + 1) % initialRing.size()].x - initialRing[i].x,
+            initialRing[(i + 1) % initialRing.size()].y - initialRing[i].y);
+    }
+    const double distanceGainGate = std::max(0.05, 0.10 * pixelSize);
+    const double inputEvidenceGate = std::max(10.0, 0.05 * perimeter);
+    const double exclusiveUseGate = std::max(5.0, 0.03 * perimeter);
+    const double sampleSpacing = std::clamp(pixelSize, 0.3, 0.8);
+
+    auto distToRing = [](const pcl::PointXYZ& pt,
+                         const std::vector<pcl::PointXYZ>& ring) {
+        double best = std::numeric_limits<double>::max();
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            const auto& a = ring[i];
+            const auto& b = ring[(i + 1) % ring.size()];
+            const double dx = b.x - a.x;
+            const double dy = b.y - a.y;
+            const double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-12) continue;
+            double t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+            t = std::clamp(t, 0.0, 1.0);
+            best = std::min(best, std::hypot(
+                pt.x - a.x - t * dx, pt.y - a.y - t * dy));
+        }
+        return best;
+    };
+    auto sampleAlong = [](const std::vector<pcl::PointXYZ>& ring,
+                          double spacing) {
+        std::vector<pcl::PointXYZ> pts;
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            const auto& p1 = ring[i];
+            const auto& p2 = ring[(i + 1) % ring.size()];
+            const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+            const int steps = std::max(1, static_cast<int>(len / spacing));
+            for (int k = 0; k < steps; ++k) {
+                const double t = static_cast<double>(k) / steps;
+                pcl::PointXYZ pt;
+                pt.x = static_cast<float>(p1.x + t * (p2.x - p1.x));
+                pt.y = static_cast<float>(p1.y + t * (p2.y - p1.y));
+                pts.push_back(pt);
+            }
+        }
+        return pts;
+    };
+    auto statsOf = [](std::vector<double>& v) {
+        std::sort(v.begin(), v.end());
+        return std::make_pair(
+            v.empty() ? 0.0 : v[v.size() / 2],
+            v.empty() ? 0.0 : v[static_cast<std::size_t>(v.size() * 0.9)]);
+    };
+
+    // 结果评估: 通过性拆分 + 双向距离 + 局部规则性 + 独占利用率
+    auto evaluateResult = [&](const std::vector<pcl::PointXYZ>& result,
+                              double newAngle,
+                              const std::vector<double>& baseAngles)
+                             -> TopologyEvaluation {
+        TopologyEvaluation ev;
+        ev.pipelinePassed = true;
+        ev.vertexCount = static_cast<int>(result.size());
+        for (std::size_t i = 0; i < result.size(); ++i) {
+            const double len = std::hypot(
+                result[(i + 1) % result.size()].x - result[i].x,
+                result[(i + 1) % result.size()].y - result[i].y);
+            if (len < 0.3) ++ev.shortEdgeCount;
+        }
+        DirectionContextOut qc;
+        qc.valid = true;
+        qc.completeEvidence = true;
+        qc.primaryAngle = baseAngles.empty() ? newAngle : baseAngles.front();
+        qc.systemAngles = baseAngles;
+        if (std::isfinite(newAngle)) qc.systemAngles.push_back(newAngle);
+        qc.multiDirection = qc.systemAngles.size() >= 2;
+        const std::string geoReason = CheckPolygonQualityVsRing(
+            result, initialRing, true, qc.multiDirection,
+            qc.systemAngles, 2.5, -1, partIndex);
+        ev.geometryPassed = geoReason.empty();
+        const LocalRegularityMetrics lm = AnalyzeLocalRegularity(result, qc);
+        ev.shortDiagonalCount = lm.shortDiagonalCount;
+        ev.spikeCount = lm.spikeCount;
+        ev.zigzagCount = lm.zigzagCount;
+        ev.irregularLengthRatio = lm.irregularLengthRatio;
+        ev.localRegularityReason = lm.passed ? "" : lm.reason;
+        ev.localRegularityPassed = lm.passed;
+        ev.fullQualityPassed = ev.pipelinePassed && ev.geometryPassed &&
+            ev.localRegularityPassed;
+        const double smoothArea = std::abs(polygonArea2D(initialRing));
+        const double resultArea = std::abs(polygonArea2D(result));
+        ev.areaRatioSmooth = smoothArea > 1e-6 ? resultArea / smoothArea : 0.0;
+        if (rawRing) {
+            ev.rawAvailable = true;
+            const double rawArea = std::abs(polygonArea2D(*rawRing));
+            ev.areaRatioRaw = rawArea > 1e-6 ? resultArea / rawArea : 0.0;
+        }
+        std::vector<double> fwdSmooth, revSmooth, fwdRaw, revRaw;
+        for (const auto& pt : sampleAlong(result, sampleSpacing)) {
+            fwdSmooth.push_back(distToRing(pt, initialRing));
+            if (rawRing) fwdRaw.push_back(distToRing(pt, *rawRing));
+        }
+        for (const auto& pt : sampleAlong(initialRing, sampleSpacing)) {
+            revSmooth.push_back(distToRing(pt, result));
+        }
+        if (rawRing) {
+            for (const auto& pt : sampleAlong(*rawRing, sampleSpacing)) {
+                revRaw.push_back(distToRing(pt, result));
+            }
+        }
+        std::tie(ev.smoothForwardMedian, ev.smoothForwardQ90) = statsOf(fwdSmooth);
+        std::tie(ev.smoothReverseMedian, ev.smoothReverseQ90) = statsOf(revSmooth);
+        if (rawRing) {
+            std::tie(ev.rawForwardMedian, ev.rawForwardQ90) = statsOf(fwdRaw);
+            std::tie(ev.rawReverseMedian, ev.rawReverseQ90) = statsOf(revRaw);
+        }
+        // 独占利用率(margin 分级, 度)
+        if (std::isfinite(newAngle)) {
+            const double dirTol = 12.0 * M_PI / 180.0;
+            const std::size_t R = result.size();
+            std::vector<char> isExclusive(R, 0);
+            for (std::size_t i = 0; i < R; ++i) {
+                const auto& p1 = result[i];
+                const auto& p2 = result[(i + 1) % R];
+                const double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+                if (len < 0.8) continue;
+                const double ang = std::atan2(p2.y - p1.y, p2.x - p1.x);
+                const double dNew = foldedAngleDistance90(ang, newAngle);
+                if (dNew > dirTol) continue;
+                double dBase = 1e9;
+                for (double base : baseAngles) {
+                    dBase = std::min(dBase, foldedAngleDistance90(ang, base));
+                }
+                if (dNew < dBase) {
+                    isExclusive[i] = 1;
+                    ev.addedLengthAny += len;
+                    const double marginDeg = (dBase - dNew) * 180.0 / M_PI;
+                    if (marginDeg >= 5.0) ev.addedLengthMargin5 += len;
+                    if (marginDeg >= 8.0) ev.addedLengthMargin8 += len;
+                    ev.bestMarginDeg = std::max(ev.bestMarginDeg, marginDeg);
+                }
+            }
+            if (R > 0) {
+                std::size_t start = 0;
+                while (start < R && isExclusive[start]) {
+                    std::size_t p = (start + R - 1) % R;
+                    bool wrapped = false;
+                    for (std::size_t g = 0; g < R && isExclusive[p]; ++g) {
+                        start = p; p = (p + R - 1) % R; wrapped = true;
+                    }
+                    if (!wrapped || start == 0) break;
+                }
+                bool inRun = false;
+                double runLen = 0.0, totalAdded = 0.0, longestRun = 0.0;
+                for (std::size_t step = 0; step <= R; ++step) {
+                    const std::size_t i = (start + step) % R;
+                    if (step < R && isExclusive[i]) {
+                        runLen += std::hypot(
+                            result[(i + 1) % R].x - result[i].x,
+                            result[(i + 1) % R].y - result[i].y);
+                        ++ev.addedDirectionEdgeCount;
+                        inRun = true;
+                    } else if (inRun) {
+                        ++ev.addedDirectionRuns;
+                        longestRun = std::max(longestRun, runLen);
+                        totalAdded += runLen;
+                        inRun = false; runLen = 0.0;
+                    }
+                }
+                ev.addedDirectionLongestRunRatio =
+                    totalAdded > 1e-9 ? longestRun / totalAdded : 0.0;
+            }
+        }
+        return ev;
+    };
+
+    // 从管线结构化结果构建 evaluation(真实失败传播)
+    auto evalFromPipe = [&](const TopologyPipelineResult& pipe,
+                            double newAngle,
+                            const std::vector<double>& baseAngles)
+                            -> TopologyEvaluation {
+        if (!pipe.passed()) {
+            TopologyEvaluation ev;
+            const TopologyPassFailure& f = pipe.finalFailure;
+            ev.constructed = f.constructionReason.empty();
+            ev.precheckPassed = f.precheckReason.empty();
+            ev.ceresPassed = f.ceresReason.empty();
+            if (!f.constructionReason.empty()) {
+                ev.failureStage = "construction";
+                ev.failureReason = f.constructionReason;
+                if (!f.failedTransitionReason.empty()) {
+                    ev.failureReason += ":" + f.failedTransitionReason;
+                }
+            } else if (!f.precheckReason.empty()) {
+                ev.failureStage = "precheck";
+                ev.failureReason = f.precheckReason;
+            } else if (!f.ceresReason.empty()) {
+                ev.failureStage = "ceres";
+                ev.failureReason = f.ceresReason;
+            } else {
+                ev.failureStage = "final";
+                ev.failureReason = "empty";
+            }
+            return ev;
+        }
+        TopologyEvaluation ev = evaluateResult(pipe.polygon, newAngle, baseAngles);
+        ev.constructed = true;
+        ev.precheckPassed = true;
+        ev.ceresPassed = true;
+        ev.pipelinePassed = true;
+        ev.fullQualityPassed = ev.pipelinePassed && ev.geometryPassed &&
+            ev.localRegularityPassed;
+        return ev;
+    };
+    auto stageFailDesc = [](const TopologyPipelineResult& pipe) {
+        if (pipe.passed()) return std::string("-");
+        const TopologyPassFailure& f = pipe.finalFailure;
+        if (!f.constructionReason.empty()) {
+            return "construction:" + f.constructionReason;
+        }
+        if (!f.precheckReason.empty()) {
+            return "precheck:" + f.precheckReason;
+        }
+        if (!f.ceresReason.empty()) {
+            return "ceres:" + f.ceresReason;
+        }
+        return std::string("final:empty");
+    };
+    // 单次试跑: 全新实例 + 完整管线
+    auto runPipe = [&](const DetectedDirectionResult& dirSet)
+                       -> TopologyPipelineResult {
+        outlineRegular trial;  // 全新实例, 成员状态零残留
+        bool localFallback = false;
+        return trial.RunTopologyPipeline(
+            initialRing, pixelSize, localFallback, nullptr, partIndex,
+            rawRing, &dirSet, /*evaluationOnly=*/true);
+    };
+
+    // S_0 = baseline(provisional 关闭)
+    DetectedDirectionResult S = *ext;
+    for (std::size_t s : provisional) S.systems[s].active = false;
+    {
+        int act = 0;
+        for (std::size_t s = 1; s < S.systems.size(); ++s) {
+            if (S.systems[s].active && !S.systems[s].evidenceBacked) ++act;
+        }
+        S.multiDirection = act >= 1;
+    }
+    std::vector<double> baseAngles;
+    baseAngles.push_back(ext->systems.front().angleRad);
+    for (std::size_t s = 1; s < ext->systems.size(); ++s) {
+        if (ext->systems[s].active && !ext->systems[s].evidenceBacked) {
+            baseAngles.push_back(ext->systems[s].angleRad);
+        }
+    }
+
+    for (std::size_t k = 0; k < provisional.size(); ++k) {
+        const std::size_t s = provisional[k];
+        const auto& sys = ext->systems[s];
+        const TopologyPipelineResult pipeA = runPipe(S);
+        const TopologyEvaluation evA =
+            evalFromPipe(pipeA, std::numeric_limits<double>::quiet_NaN(),
+                         baseAngles);
+        const std::string aStage = pipeA.acceptedStage;
+        const std::string aFailDesc = stageFailDesc(pipeA);
+        DetectedDirectionResult dirB = S;
+        dirB.systems[s].active = true;
+        dirB.multiDirection = true;
+        const std::vector<double> bAnglesPlus = [&]() {
+            std::vector<double> a = baseAngles;
+            a.push_back(sys.angleRad);
+            return a;
+        }();
+        const TopologyPipelineResult pipeB = runPipe(dirB);
+        const TopologyEvaluation evB =
+            evalFromPipe(pipeB, sys.angleRad, baseAngles);
+        const std::string bStage = pipeB.acceptedStage;
+        const std::string bFailDesc = stageFailDesc(pipeB);
+
+        // ---- 影子偏好 v3: 结构通过性与局部规则性分离 ----
+        // localRegularityPassed 只用于否决 B / 保守辅助,
+        // 不参与"A失败→B"(局部尖刺留给独立清理, 不许新方向自证)
+        const char* preference = "A";
+        std::string prefReason;
+        const bool aStructural = evA.pipelinePassed && evA.geometryPassed;
+        const bool bStructural = evB.pipelinePassed && evB.geometryPassed;
+        // 数量在集合更新前统计
+        const int aSystemCount = [&]() {
+            int c = 0;
+            for (const auto& s2 : S.systems) {
+                if (s2.active) ++c;
+            }
+            return c;
+        }();
+        const int bSystemCount = aSystemCount + 1;
+        if (sys.straightSupportLength < inputEvidenceGate) {
+            prefReason = "insufficient_input_evidence(" +
+                std::to_string(sys.straightSupportLength) + "<" +
+                std::to_string(inputEvidenceGate) + ")";
+        } else if (!bStructural) {
+            prefReason = "B_structural_failure(" +
+                (evB.pipelinePassed ? std::string("geometry") :
+                    evB.failureStage + ":" + evB.failureReason) + ")";
+        } else if (evB.addedLengthMargin8 < exclusiveUseGate) {
+            prefReason = "weak_exclusive_use(m8=" +
+                std::to_string(evB.addedLengthMargin8) + "<" +
+                std::to_string(exclusiveUseGate) + ")";
+        } else if (!aStructural) {
+            preference = "B";
+            prefReason = "A_structural_failure_B_pass";
+        } else {
+            const bool smoothGain =
+                (evA.smoothForwardQ90 - evB.smoothForwardQ90) > distanceGainGate &&
+                (evA.smoothReverseQ90 - evB.smoothReverseQ90) > distanceGainGate;
+            const bool rawGain = !rawRing ||
+                ((evA.rawForwardQ90 - evB.rawForwardQ90) > distanceGainGate &&
+                 (evA.rawReverseQ90 - evB.rawReverseQ90) > distanceGainGate);
+            const bool defectsNotWorse =
+                evB.shortDiagonalCount <= evA.shortDiagonalCount &&
+                evB.spikeCount <= evA.spikeCount &&
+                evB.zigzagCount <= evA.zigzagCount;
+            if (smoothGain && rawGain && defectsNotWorse) {
+                preference = "B";
+                prefReason = "significant_bidirectional_gain";
+            } else if (!defectsNotWorse) {
+                prefReason = "B_more_defects";
+            } else {
+                prefReason = "no_significant_gain(dfwd=" +
+                    std::to_string(evB.smoothForwardQ90 - evA.smoothForwardQ90) +
+                    ",drev=" +
+                    std::to_string(evB.smoothReverseQ90 - evA.smoothReverseQ90) +
+                    ",gate=" + std::to_string(distanceGainGate) + ")";
+            }
+        }
+        // 影子决策驱动下一步集合(在数量统计之后)
+        if (preference[0] == 'B') {
+            S = dirB;
+            baseAngles = bAnglesPlus;
+        }
+
+        std::cerr << "[DirectionSelection]"
+                  << " fid=" << fid << " part=" << partIndex
+                  << " rank=" << (s + 1)
+                  << " candidate_deg=" << sys.angleRad * 180.0 / M_PI
+                  << " decision=" << preference
+                  << " active_before=" << aSystemCount
+                  << " active_after=" << (preference[0] == 'B'
+                      ? aSystemCount + 1 : aSystemCount)
+                  << " A_systems=" << aSystemCount
+                  << " B_systems=" << bSystemCount
+                  << " A_accepted_stage=" << aStage
+                  << " B_accepted_stage=" << bStage
+                  << " A_pipeline=" << (evA.pipelinePassed ? 1 : 0)
+                  << " A_geometry=" << (evA.geometryPassed ? 1 : 0)
+                  << " A_local=" << (evA.localRegularityPassed ? 1 : 0)
+                  << " A_failure=" << aFailDesc
+                  << " B_pipeline=" << (evB.pipelinePassed ? 1 : 0)
+                  << " B_geometry=" << (evB.geometryPassed ? 1 : 0)
+                  << " B_local=" << (evB.localRegularityPassed ? 1 : 0)
+                  << " B_failure=" << bFailDesc
+                  << " A_sm(fwd_q90=" << evA.smoothForwardQ90
+                  << ",rev_q90=" << evA.smoothReverseQ90 << ")"
+                  << " B_sm(fwd_q90=" << evB.smoothForwardQ90
+                  << ",rev_q90=" << evB.smoothReverseQ90 << ")"
+                  << " A_raw(fwd_q90=" << evA.rawForwardQ90
+                  << ",rev_q90=" << evA.rawReverseQ90 << ")"
+                  << " B_raw(fwd_q90=" << evB.rawForwardQ90
+                  << ",rev_q90=" << evB.rawReverseQ90 << ")"
+                  << " raw_available=" << (evB.rawAvailable ? 1 : 0)
+                  << " A_area=" << evA.areaRatioSmooth
+                  << " B_area=" << evB.areaRatioSmooth
+                  << " A_diag/spk/zz=" << evA.shortDiagonalCount
+                  << "/" << evA.spikeCount << "/" << evA.zigzagCount
+                  << " B_diag/spk/zz=" << evB.shortDiagonalCount
+                  << "/" << evB.spikeCount << "/" << evB.zigzagCount
+                  << " B_irreg_ratio=" << evB.irregularLengthRatio
+                  << " input_len=" << sys.straightSupportLength
+                  << " input_runs=" << sys.inputSupportRuns
+                  << " input_run_ratio=" << sys.inputLongestRunRatio
+                  << " added_m8=" << evB.addedLengthMargin8
+                  << " added_edges=" << evB.addedDirectionEdgeCount
+                  << " added_runs=" << evB.addedDirectionRuns
+                  << " best_margin_deg=" << evB.bestMarginDeg
+                  << " shadow_preference=" << preference
+                  << " preference_reason=" << prefReason
+                  << std::endl;
+    }
+    // 汇总: 重新计算 active 数与 multi 派生
+    int activeAfter = 0;
+    for (const auto& s2 : S.systems) {
+        if (s2.active) ++activeAfter;
+    }
+    S.multiDirection = activeAfter >= 2;
+    S.primaryAngle = S.systems.front().angleRad;
+    int activeBefore = 0;
+    for (const auto& s2 : detected.systems) {
+        if (s2.active) ++activeBefore;
+    }
+    std::cerr << "[DirectionSelectionSummary] fid=" << fid
+              << " part=" << partIndex
+              << " candidate_systems=" << detected.systems.size()
+              << " active_before=" << activeBefore
+              << " active_after=" << activeAfter
+              << " multi_before=" << (detected.multiDirection ? 1 : 0)
+              << " multi_after=" << (S.multiDirection ? 1 : 0)
+              << " selection_enabled=1" << std::endl;
+    return S;
 }
 
 void outlineRegular::PrintTopologyRetrySummary()
@@ -11066,7 +11570,8 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
     const std::vector<pcl::PointXYZ>* rawRing,
     const void* detectedDirection,
     bool strictGeometry,
-    TopologyPassFailure* failureOut)
+    TopologyPassFailure* failureOut,
+    bool evaluationOnly)
 {
     usedFallback = false;
     if (initialRing.size() < 6) {
@@ -11743,7 +12248,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                 bridgeSingleVertex = false;
                                 bridgeDogleg = true;
                                 bridged = true;
-                                ++gOrthogonalDoglegAccepted;
+                                if (!evaluationOnly) ++gOrthogonalDoglegAccepted;
                                 std::cerr << "[TopologyBridgeGuard] fid="
                                           << source_feature_id_
                                           << " part=" << partIndex
@@ -11915,7 +12420,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                                     bridgeDogleg = false;
                                     bridgeUCap = false;
                                     bridged = true;
-                                    ++gMissingCapRestored;
+                                    if (!evaluationOnly) ++gMissingCapRestored;
                                     std::cerr << "[TopologyMissingCap] fid="
                                               << source_feature_id_
                                               << " part=" << partIndex
@@ -12117,7 +12622,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
                             bridgeUCapDegenerateA = degenerateA;
                             bridgeUCapDegenerateB = degenerateB;
                             bridged = true;
-                            ++gParallelUCapAccepted;
+                            if (!evaluationOnly) ++gParallelUCapAccepted;
                             std::cerr << "[TopologyBridgeGuard] fid="
                                       << source_feature_id_
                                       << " part=" << partIndex
@@ -12582,7 +13087,7 @@ std::vector<pcl::PointXYZ> outlineRegular::TopologyPreservingRegularizeImpl(
               << " residual_points=" << residualCloud->size()
               << " raw=" << (rawAccepted ? 1 : 0) << std::endl;
 
-    if (rawAccepted && kDumpRawResidualPoints) {
+    if (rawAccepted && kDumpRawResidualPoints && !evaluationOnly) {
         auto& debugPoints = RawResidualDebugPoints();
         auto appendDebug = [&](const pcl::PointXYZ& pt, int src,
                                double weight, int edge) {

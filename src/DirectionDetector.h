@@ -36,6 +36,11 @@ struct DetectedDirectionSystem {
     bool evidenceBacked = false;
     int straightSupportCount = 0;
     double straightSupportLength = 0.0;
+    // 输入证据(来自原始边链统计, 不从规则化结果反推; 供 A/B 评估)
+    double inputLongestChain = 0.0;      // 最长支持直链(m)
+    int inputSupportRuns = 0;            // 支持链沿环序的连续 run 数
+    double inputLongestRunRatio = 0.0;   // 最长 run / 支持总长
+    double inputPerimeterRatio = 0.0;    // 支持总长 / 周长
 };
 
 // 检测结果: 整体

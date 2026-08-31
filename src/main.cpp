@@ -197,6 +197,10 @@ const int kNarrowNeckMaxCutsPerFeature = 12;
 // falls back to the existing VDP path whenever topology checks fail.
 constexpr bool kUseTopologyPreservingResidualRegularization = true;
 constexpr bool kMaskCurveDetectionDebugOnly = true; // 禁用弧检测+恢复, 后续优化后重开
+// AB3 方向选择器正式开关: true = 救援方向经拓扑 A/B 影子试跑筛选后
+// 才进入正式规则化(所有下游统一消费筛选结果); false = 完全恢复
+// DirectionDetector 全部 active 方向直接生效的行为。
+constexpr bool kUseTopologyDirectionABSelection = true;
 
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
@@ -5085,10 +5089,51 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
     // 合格即直接采用; 失败(链不足/方向不确定/候选不合格/Ceres 大位移/
     // 斜边/圆形轮廓)转 VDP 备用, 方向上下文随之传出。
     // ---- 统一主方向检测(所有路径共用, 检测结果视为真值) ----
-    // 在平滑初始轮廓上一次性检测, 后续不再修改方向
-    const auto detectedDir = DetectBuildingDirection(
+    // 在平滑初始轮廓上一次性检测; AB3 选择器对救援方向(evidenceBacked)
+    // 做拓扑 A/B 试跑筛选, 全部下游(Topology/VDP/StrictFallback/debug)
+    // 统一消费筛选后的 selectedDir, 不再读取原始检测集合
+    const auto rawDetectedDir = DetectBuildingDirection(
         ring, rawRing ? *rawRing : std::vector<pcl::PointXYZ>{},
         maskPixelSize > 0.0 ? maskPixelSize : 0.3, sourceFid, partIndex);
+    const DetectedDirectionResult selectedDir =
+        (kUseTopologyDirectionABSelection &&
+         rawDetectedDir.valid &&
+         [&rawDetectedDir]() {
+             for (std::size_t s = 1; s < rawDetectedDir.systems.size(); ++s) {
+                 if (rawDetectedDir.systems[s].active &&
+                     rawDetectedDir.systems[s].evidenceBacked) return true;
+             }
+             return false;
+         }())
+            ? outlineRegular::SelectDirectionSystemsByTopology(
+                  ring, kMaskResidualSpacing,
+                  partIndex, rawRing, rawDetectedDir, sourceFid)
+            : rawDetectedDir;
+    if (!kUseTopologyDirectionABSelection && rawDetectedDir.valid) {
+        std::cerr << "[DirectionSelectionSummary] fid=" << sourceFid
+                  << " part=" << partIndex
+                  << " candidate_systems=" << rawDetectedDir.systems.size()
+                  << " active_before="
+                  << [&rawDetectedDir]() {
+                         int c = 0;
+                         for (const auto& s : rawDetectedDir.systems) {
+                             if (s.active) ++c;
+                         }
+                         return c;
+                     }()
+                  << " active_after="
+                  << [&selectedDir]() {
+                         int c = 0;
+                         for (const auto& s : selectedDir.systems) {
+                             if (s.active) ++c;
+                         }
+                         return c;
+                     }()
+                  << " multi_before=" << (rawDetectedDir.multiDirection ? 1 : 0)
+                  << " multi_after=" << (selectedDir.multiDirection ? 1 : 0)
+                  << " selection_enabled=0" << std::endl;
+    }
+    const DetectedDirectionResult& detectedDir = selectedDir;
     if (detectedDirOut) *detectedDirOut = detectedDir;
 
         // ---- Mask-only 局部圆弧检测(所有路径共用) ----

@@ -18,6 +18,7 @@
 
 #pragma once
 #include "MyCloud.h"
+#include "DirectionDetector.h"  // SelectDirectionSystemsByTopology 返回值
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl/common/centroid.h>
@@ -192,6 +193,8 @@ public:
 	};
 	// 单次拓扑构造实现: strictGeometry=true 启用共线合并全区间校验
 	// 与桥接整段贴合校验(仅重试二使用)。失败信息经 failureOut 传出。
+	// evaluationOnly=true 时跳过正式副作用(raw残差调试点累积),
+	// 供 A/B 影子评估使用。
 	private:
 	std::vector<pcl::PointXYZ> TopologyPreservingRegularizeImpl(
 		const std::vector<pcl::PointXYZ>& initialRing,
@@ -202,8 +205,94 @@ public:
 		const std::vector<pcl::PointXYZ>* rawRing,
 		const void* detectedDirection,
 		bool strictGeometry,
-		TopologyPassFailure* failureOut);
+		TopologyPassFailure* failureOut,
+		bool evaluationOnly = false);
 	public:
+	// A/B 影子评估结果(只读诊断, 不影响正式输出)
+	struct TopologyEvaluation {
+		bool constructed = false;
+		bool precheckPassed = false;
+		bool ceresPassed = false;
+		bool pipelinePassed = false;       // 完整拓扑管线(含重试)返回非空
+		bool geometryPassed = false;       // CheckPolygonQualityVsRing 通过
+		bool localRegularityPassed = false; // 局部短斜边/尖刺/锯齿通过
+		bool fullQualityPassed = false;    // 三项全过
+		std::string failureStage;   // construction/precheck/ceres/final/-
+		std::string failureReason;
+		// 双向边界距离(结果→参考 forward, 参考→结果 reverse)
+		double smoothForwardMedian = 0.0;
+		double smoothForwardQ90 = 0.0;
+		double smoothReverseMedian = 0.0;
+		double smoothReverseQ90 = 0.0;
+		double rawForwardMedian = 0.0;
+		double rawForwardQ90 = 0.0;
+		double rawReverseMedian = 0.0;
+		double rawReverseQ90 = 0.0;
+		bool rawAvailable = false;
+		double areaRatioSmooth = 0.0;
+		double areaRatioRaw = 0.0;
+		double centroidShift = 0.0;
+		int vertexCount = 0;
+		int shortEdgeCount = 0;        // <0.3m 边数
+		int shortDiagonalCount = 0;
+		int spikeCount = 0;
+		int zigzagCount = 0;
+		double irregularLengthRatio = 0.0;
+		std::string localRegularityReason;
+		// 新增方向在结果中的实际利用率(margin 分级独占边)
+		double addedLengthAny = 0.0;       // dNew < dBase
+		double addedLengthMargin5 = 0.0;   // exclusiveMargin >= 5°
+		double addedLengthMargin8 = 0.0;   // exclusiveMargin >= 8°
+		int addedDirectionEdgeCount = 0;
+		int addedDirectionRuns = 0;
+		double addedDirectionLongestRunRatio = 0.0;
+		double bestMarginDeg = 0.0;    // 最大独占角距优势(度)
+	};
+	// 局部规则性指标(只读): CheckFallbackLocalRegularity 的统计内核
+	struct LocalRegularityMetrics {
+		int shortDiagonalCount = 0;
+		int spikeCount = 0;
+		int zigzagCount = 0;
+		double irregularLengthRatio = 0.0;
+		bool passed = false;
+		std::string reason;
+	};
+	static LocalRegularityMetrics AnalyzeLocalRegularity(
+		const std::vector<pcl::PointXYZ>& poly,
+		const DirectionContextOut& dirContext);
+	// 完整拓扑管线结果: polygon + 最终失败传播 + 接受阶段
+	struct TopologyPipelineResult {
+		std::vector<pcl::PointXYZ> polygon;
+		TopologyPassFailure finalFailure;   // 最后一次有意义尝试的失败
+		std::string acceptedStage;          // first/raw_kde/strict_geometry/
+											// alternate_direction/failed
+		bool passed() const { return !polygon.empty(); }
+	};
+	// 完整拓扑管线(正式首轮 + raw_kde/strict/alternate 重试):
+	// 正式与影子共用, 防止两套重试逻辑漂移。evaluationOnly=true 时不计
+	// RetrySummary/桥接计数、不触发影子评估、跳过调试副作用。
+	private:
+	TopologyPipelineResult RunTopologyPipeline(
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		bool& usedFallback,
+		DirectionContextOut* dirContext,
+		int partIndex,
+		const std::vector<pcl::PointXYZ>* rawRing,
+		const void* detectedDirection,
+		bool evaluationOnly);
+	public:
+	// 救援方向拓扑 A/B 选择器(AB3 正式版): 对 evidenceBacked active
+	// 系统逐个前向增量试跑(完整管线 evaluationOnly, 全新实例),
+	// 按已验证的六条门槛裁决 keep/close, 返回筛选后的方向副本。
+	// 不修改原始检测结果; 决策链与影子验证期完全一致。
+	static DetectedDirectionResult SelectDirectionSystemsByTopology(
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		int partIndex,
+		const std::vector<pcl::PointXYZ>* rawRing,
+		const DetectedDirectionResult& detected,
+		long long fid = -1);
 		// Last-resort output that still obeys one explicitly selected orthogonal
 		// direction. It is used instead of writing an unregularized ring.
 		// 多方向骨架: 仅 multiDirection=true 且 systemAngles>=2(生效系统,

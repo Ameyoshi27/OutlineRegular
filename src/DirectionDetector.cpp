@@ -73,6 +73,11 @@ struct DetChain {
     double centerX = 0.0;
     double centerY = 0.0;
     int edgeCount = 0;
+    // ---- 只读诊断字段(救援结构分析用, 不参与任何计算) ----
+    std::size_t startEdgeIndex = 0;      // 链起点在环上的顶点索引
+    std::size_t endEdgeIndex = 0;        // 链终点在环上的顶点索引
+    double rawDirectedAngleRad = 0.0;    // 首尾弦有向角 [-π,π)
+    int ringOrder = 0;                   // 输出序号(环序)
 };
 
 // 正交最小二乘直线拟合(TLS): 返回主轴方向与偏差统计。
@@ -290,6 +295,11 @@ std::vector<DetChain> buildChainsFromRing(
         const double excess = std::max(0.0, chain.maxDeviation / maxDevLimit - 1.0);
         const double linearityFactor = std::exp(-excess);
         chain.weight = std::pow(chainLen, kLenExponent) * linearityFactor;
+        // 只读诊断: 环序索引/有向角/序号(不参与计算)
+        chain.startEdgeIndex = chainFromVertex;
+        chain.endEdgeIndex = endVertex;
+        chain.rawDirectedAngleRad = std::atan2(b.y - a.y, b.x - a.x);
+        chain.ringOrder = static_cast<int>(chains.size());
         chains.push_back(chain);
         chainEdges = 0;
     };
@@ -472,9 +482,12 @@ DetectedDirectionResult DetectBuildingDirection(
         double longest = 0.0;
         const DetChain* longestChain = nullptr;
         double x4 = 0.0, y4 = 0.0, weightSum = 0.0;  // 4θ 圆均值累积
+        int supportRuns = 0;              // 支持链沿环序的连续 run 数(环形)
+        double longestRun = 0.0;          // 最长 run 的链长和
     };
     auto evaluateStraightSupport = [&](double peakAngle) {
         StraightSupport s;
+        std::vector<const DetChain*> supportChains;
         for (const auto& chain : chains) {
             if (foldedDistance90(chain.angleRad, peakAngle) >
                 5.0 * M_PI / 180.0) continue;
@@ -494,6 +507,41 @@ DetectedDirectionResult DetectBuildingDirection(
             s.x4 += chain.weight * std::cos(4.0 * chain.angleRad);
             s.y4 += chain.weight * std::sin(4.0 * chain.angleRad);
             s.weightSum += chain.weight;
+            supportChains.push_back(&chain);
+        }
+        // 环序 run 统计: chains 输出序即 ringOrder, 连续支持链成 run,
+        // 首尾 run(ringOrder 0 与 N-1 相邻)合并
+        if (!supportChains.empty()) {
+            const std::size_t total = chains.size();
+            std::vector<char> isSup(total, 0);
+            for (const DetChain* c : supportChains) {
+                isSup[static_cast<std::size_t>(c->ringOrder)] = 1;
+            }
+            std::size_t start = 0;
+            while (start < total && isSup[start]) {
+                std::size_t p = (start + total - 1) % total;
+                bool wrapped = false;
+                for (std::size_t g = 0; g < total && isSup[p]; ++g) {
+                    start = p;
+                    p = (p + total - 1) % total;
+                    wrapped = true;
+                }
+                if (!wrapped || start == 0) break;
+            }
+            bool inRun = false;
+            double runLen = 0.0;
+            for (std::size_t step = 0; step <= total; ++step) {
+                const std::size_t i = (start + step) % total;
+                if (step < total && isSup[i]) {
+                    runLen += chains[i].length;
+                    inRun = true;
+                } else if (inRun) {
+                    ++s.supportRuns;
+                    s.longestRun = std::max(s.longestRun, runLen);
+                    inRun = false;
+                    runLen = 0.0;
+                }
+            }
         }
         return s;
     };
@@ -672,6 +720,14 @@ DetectedDirectionResult DetectBuildingDirection(
             system.evidenceBacked = true;
             system.straightSupportCount = support.straightCount;
             system.straightSupportLength = support.straightLength;
+            system.inputLongestChain = support.longest;
+            system.inputSupportRuns = support.supportRuns;
+            system.inputLongestRunRatio =
+                support.straightLength > 1e-9
+                    ? support.longestRun / support.straightLength : 0.0;
+            system.inputPerimeterRatio =
+                totalPerimeter > 1e-9
+                    ? support.straightLength / totalPerimeter : 0.0;
         }
         double x4 = 0.0, y4 = 0.0;
         for (const auto& chain : chains) {
@@ -835,6 +891,270 @@ DetectedDirectionResult DetectBuildingDirection(
                               << " weight_share="
                               << chain.weight / std::max(totalWeight, 1e-9)
                               << std::endl;
+                }
+            }
+        }
+    }
+
+    // ---- 救援结构诊断(只读): run 连续性 / 正交完整性 / 模型收益 / 空间 ----
+    // 为下一轮建立结构性判据, 不改变任何检测行为
+    {
+        // 8 个重点分析样本(仅筛选日志, 不参与判断)
+        static const long long kDiagFids[] = {2, 120, 135, 145, 180, 275, 277, 311};
+        auto isDiagFid = [fid]() {
+            for (long long d : kDiagFids) if (d == fid) return true;
+            return false;
+        };
+        auto wrapPi = [](double a) {
+            while (a > M_PI) a -= 2.0 * M_PI;
+            while (a < -M_PI) a += 2.0 * M_PI;
+            return a;
+        };
+        auto rhoTrunc = [](double r) {
+            const double cap = 15.0 * M_PI / 180.0;
+            const double rr = std::min(std::abs(r), cap);
+            return rr * rr;
+        };
+        const double diagWindow = 5.0 * M_PI / 180.0;
+        const double diagTolerantGap = std::max(1.0, 2.0 * pixelSize);
+        for (std::size_t s = 1; s < result.systems.size(); ++s) {
+            const auto& sys = result.systems[s];
+            if (!sys.evidenceBacked) continue;
+            const double theta = sys.angleRad;
+            // 支持链(±5° 于精化角 + 复用救援高质量判据)
+            std::vector<std::size_t> support;
+            std::vector<int> supportAxis(chains.size(), -1);
+            for (std::size_t i = 0; i < chains.size(); ++i) {
+                const auto& c = chains[i];
+                if (foldedDistance90(c.angleRad, theta) > diagWindow) continue;
+                const double devLimit = std::max(0.60, 0.02 * c.chordLength);
+                if (!(c.continuity >= 0.97 && c.maxDeviation <= devLimit &&
+                      c.length >= std::max(2.0, 3.0 * pixelSize))) continue;
+                support.push_back(i);
+                // 有向角判轴: 接近 θ/θ+180 = axis0, θ+90/θ+270 = axis90
+                const double d0 = std::min(
+                    std::abs(wrapPi(c.rawDirectedAngleRad - theta)),
+                    std::abs(wrapPi(c.rawDirectedAngleRad - theta - M_PI)));
+                const double d90 = std::min(
+                    std::abs(wrapPi(c.rawDirectedAngleRad - theta - M_PI / 2.0)),
+                    std::abs(wrapPi(c.rawDirectedAngleRad - theta + M_PI / 2.0)));
+                supportAxis[i] = (d0 <= d90) ? 0 : 90;
+            }
+            // run 分组(strict: 环序直接相邻; tolerant: 间隔非支持链累计≤gap)
+            const std::size_t N = chains.size();
+            std::vector<char> isSup(N, 0);
+            for (std::size_t i : support) isSup[i] = 1;
+            auto chainLenAt = [&](std::size_t i) { return chains[i].length; };
+            // strict runs(环形): 从一个支持链开始扫描
+            std::vector<std::pair<std::size_t, std::size_t>> strictRuns;
+            if (!support.empty()) {
+                std::size_t start = 0;
+                while (start < N && isSup[start]) {  // 起点避开 run 内部
+                    bool wrapped = false;
+                    std::size_t p = (start + N - 1) % N;
+                    for (std::size_t g = 0; g < N; ++g) {
+                        if (!isSup[p]) break;
+                        start = p;
+                        p = (p + N - 1) % N;
+                        wrapped = true;
+                        if (g > N) break;
+                    }
+                    if (!wrapped) break;
+                    if (start == 0) break;
+                }
+                std::size_t i = start;
+                bool inRun = false;
+                std::size_t runStart = 0;
+                for (std::size_t step = 0; step <= N; ++step, i = (i + 1) % N) {
+                    if (isSup[i]) {
+                        if (!inRun) { runStart = i; inRun = true; }
+                    } else if (inRun) {
+                        strictRuns.push_back({runStart, (i + N - 1) % N});
+                        inRun = false;
+                    }
+                }
+            }
+            // strict run 长度统计(链长和)
+            auto runLength = [&](std::size_t a, std::size_t b) {
+                double len = 0.0;
+                std::size_t i = a;
+                for (std::size_t step = 0; step < N; ++step) {
+                    len += chainLenAt(i);
+                    if (i == b) break;
+                    i = (i + 1) % N;
+                }
+                return len;
+            };
+            double supportTotal = 0.0, longestRun = 0.0;
+            int longestRunChains = 0;
+            for (const auto& r : strictRuns) {
+                const double rl = runLength(r.first, r.second);
+                int cnt = 0;
+                std::size_t i = r.first;
+                for (std::size_t step = 0; step < N; ++step) {
+                    ++cnt;
+                    if (i == r.second) break;
+                    i = (i + 1) % N;
+                }
+                if (rl > longestRun) { longestRun = rl; longestRunChains = cnt; }
+                supportTotal += rl;
+            }
+            // tolerant runs: 合并间隔 ≤ gap 的相邻 strict runs(环形)
+            int tolerantRuns = static_cast<int>(strictRuns.size());
+            if (strictRuns.size() >= 2) {
+                for (std::size_t a = 0; a < strictRuns.size(); ++a) {
+                    const std::size_t b = (a + 1) % strictRuns.size();
+                    double gapLen = 0.0;
+                    std::size_t i = (strictRuns[a].second + 1) % N;
+                    while (i != strictRuns[b].first && gapLen <= diagTolerantGap) {
+                        gapLen += chainLenAt(i);
+                        i = (i + 1) % N;
+                    }
+                    if (gapLen <= diagTolerantGap) --tolerantRuns;
+                }
+            }
+            // 轴统计 + 正交角点(环序直接相邻的支持链对不同轴)
+            double axis0Len = 0.0, axis90Len = 0.0, axis0Longest = 0.0, axis90Longest = 0.0;
+            int axis0Count = 0, axis90Count = 0, orthoCorners = 0;
+            for (std::size_t i : support) {
+                if (supportAxis[i] == 0) {
+                    ++axis0Count; axis0Len += chains[i].length;
+                    axis0Longest = std::max(axis0Longest, chains[i].length);
+                } else {
+                    ++axis90Count; axis90Len += chains[i].length;
+                    axis90Longest = std::max(axis90Longest, chains[i].length);
+                }
+            }
+            for (std::size_t i : support) {
+                const std::size_t j = (i + 1) % N;
+                if (!isSup[j]) continue;
+                if (supportAxis[i] != supportAxis[j] &&
+                    supportAxis[i] >= 0 && supportAxis[j] >= 0) {
+                    ++orthoCorners;
+                }
+            }
+            const double axisBalance = std::max(axis0Len, axis90Len) > 1e-9
+                ? std::min(axis0Len, axis90Len) / std::max(axis0Len, axis90Len)
+                : 0.0;
+            // 单/双方向模型收益(全楼高质量直链, 截断平方损失)
+            double E1 = 0.0, E2 = 0.0, assigned2Len = 0.0, assigned2W = 0.0;
+            int assigned2Count = 0;
+            double allHQWeight = 0.0;
+            const double primary = result.primaryAngle;
+            for (const auto& c : chains) {
+                const double devLimit = std::max(0.60, 0.02 * c.chordLength);
+                if (!(c.continuity >= 0.97 && c.maxDeviation <= devLimit &&
+                      c.length >= std::max(2.0, 3.0 * pixelSize))) continue;
+                const double r1 = foldedDistance90(c.angleRad, primary);
+                const double r1b = foldedDistance90(c.angleRad, theta);
+                E1 += c.weight * rhoTrunc(r1);
+                E2 += c.weight * rhoTrunc(std::min(r1, r1b));
+                allHQWeight += c.weight;
+                if (r1b < r1) {
+                    ++assigned2Count;
+                    assigned2Len += c.length;
+                    assigned2W += c.weight;
+                }
+            }
+            const double energyGain = E1 > 1e-12 ? (E1 - E2) / E1 : 0.0;
+            // 空间分布
+            double scx = 0.0, scy = 0.0, wSum = 0.0;
+            double minCx = 1e18, minCy = 1e18, maxCx = -1e18, maxCy = -1e18;
+            for (std::size_t i : support) {
+                scx += chains[i].centerX * chains[i].length;
+                scy += chains[i].centerY * chains[i].length;
+                wSum += chains[i].length;
+                minCx = std::min(minCx, chains[i].centerX);
+                maxCx = std::max(maxCx, chains[i].centerX);
+                minCy = std::min(minCy, chains[i].centerY);
+                maxCy = std::max(maxCy, chains[i].centerY);
+            }
+            if (wSum > 1e-9) { scx /= wSum; scy /= wSum; }
+            const double centerSpan = std::hypot(maxCx - minCx, maxCy - minCy);
+            // 主峰支持质心距离
+            double pcx = 0.0, pcy = 0.0, pw = 0.0;
+            for (const auto& c : chains) {
+                if (foldedDistance90(c.angleRad, primary) > diagWindow) continue;
+                const double devLimit = std::max(0.60, 0.02 * c.chordLength);
+                if (!(c.continuity >= 0.97 && c.maxDeviation <= devLimit &&
+                      c.length >= std::max(2.0, 3.0 * pixelSize))) continue;
+                pcx += c.centerX * c.length;
+                pcy += c.centerY * c.length;
+                pw += c.length;
+            }
+            if (pw > 1e-9) { pcx /= pw; pcy /= pw; }
+            const double centroidDist = std::hypot(scx - pcx, scy - pcy);
+            if (fid >= 0) {
+                std::cerr << "[DirectionRescueStructure]"
+                          << " fid=" << fid << " part=" << partIdx
+                          << " rank=" << (s + 1)
+                          << " primary_deg=" << primary * 180.0 / M_PI
+                          << " secondary_raw_deg=" << sys.angleRad * 180.0 / M_PI
+                          << " secondary_refined_deg=" << sys.angleRad * 180.0 / M_PI
+                          << " angle_gap_deg="
+                          << foldedDistance90(primary, theta) * 180.0 / M_PI
+                          << " height_ratio=" << sys.height
+                          << " prominence_ratio=" << sys.prominence
+                          << " straight_chains=" << support.size()
+                          << " straight_length=" << supportTotal
+                          << " strict_runs=" << strictRuns.size()
+                          << " tolerant_runs=" << tolerantRuns
+                          << " longest_run_length=" << longestRun
+                          << " longest_run_ratio="
+                          << (supportTotal > 1e-9
+                              ? longestRun / supportTotal : 0.0)
+                          << " longest_run_chains=" << longestRunChains
+                          << " axis0_count=" << axis0Count
+                          << " axis0_length=" << axis0Len
+                          << " axis0_longest=" << axis0Longest
+                          << " axis90_count=" << axis90Count
+                          << " axis90_length=" << axis90Len
+                          << " axis90_longest=" << axis90Longest
+                          << " axis_balance=" << axisBalance
+                          << " orthogonal_corners=" << orthoCorners
+                          << " single_energy=" << E1
+                          << " multi_energy=" << E2
+                          << " energy_gain=" << energyGain
+                          << " secondary_assigned_chains=" << assigned2Count
+                          << " secondary_assigned_length=" << assigned2Len
+                          << " secondary_weight_share="
+                          << (allHQWeight > 1e-9 ? assigned2W / allHQWeight : 0.0)
+                          << " support_centroid=" << scx << "," << scy
+                          << " support_center_span=" << centerSpan
+                          << " distance_to_primary_centroid=" << centroidDist
+                          << " accepted_current=" << (sys.active ? 1 : 0)
+                          << std::endl;
+                // 重点样本的支持链明细
+                if (isDiagFid()) {
+                    int runId = 0;
+                    for (const auto& r : strictRuns) {
+                        ++runId;
+                        std::size_t i = r.first;
+                        for (std::size_t step = 0; step < N; ++step) {
+                            std::cerr << "[DirectionRescueChain]"
+                                      << " fid=" << fid
+                                      << " peak_rank=" << (s + 1)
+                                      << " chain_order=" << chains[i].ringOrder
+                                      << " start_edge=" << chains[i].startEdgeIndex
+                                      << " end_edge=" << chains[i].endEdgeIndex
+                                      << " raw_angle_deg="
+                                      << chains[i].rawDirectedAngleRad * 180.0 / M_PI
+                                      << " folded_angle_deg="
+                                      << chains[i].angleRad * 180.0 / M_PI
+                                      << " axis=" << supportAxis[i]
+                                      << " length=" << chains[i].length
+                                      << " chord=" << chains[i].chordLength
+                                      << " continuity=" << chains[i].continuity
+                                      << " rmse=" << chains[i].rmse
+                                      << " max_deviation=" << chains[i].maxDeviation
+                                      << " center=" << chains[i].centerX << ","
+                                      << chains[i].centerY
+                                      << " run_id=" << runId
+                                      << std::endl;
+                            if (i == r.second) break;
+                            i = (i + 1) % N;
+                        }
+                    }
                 }
             }
         }
