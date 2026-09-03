@@ -206,6 +206,51 @@ constexpr bool kUseTopologyDirectionABSelection = true;
 // 当前 smooth 方向拓扑 + raw/smooth 双残差正式模式。
 constexpr bool kUseRawOutlineForAllRegularization = false;
 
+// ---- 方向假设白名单(上线控制层, 检测器仍通用) ----
+// 三种模式:
+//   shadow           正式 H0 输出, 候选只诊断, 不评估白名单
+//   whitelist_shadow 白名单命中+候选通过门控, 仍不回写, 输出对照日志
+//   whitelist_active 白名单命中+候选通过门控, 正式以候选方向重跑管线,
+//                    失败/不一致自动回退 H0
+// 默认: 总开关关闭 + shadow 对照开启(正式输出与基线逐字节一致)。
+constexpr bool kEnableDirectionHypothesisWhitelist = false;
+constexpr bool kDirectionHypothesisWhitelistShadow = true;
+// 白名单条目: fid+part+hypothesisName+source 四元匹配; expectedAngle
+// 仅做漂移校验(容差内), 不参与方向计算, 不使用人工绘制角度。
+struct DirectionHypothesisWhitelistEntry {
+    long long fid;
+    int partIndex;
+    const char* hypothesisName;
+    double expectedAngleDeg;
+    const char* source;
+};
+constexpr double kWhitelistAngleTolDeg = 1.0;
+// 首批: 6 个常规 Hrefine 影子 improved 案例(干净层, q90 delta ≤0.03)。
+// 第二批(shadow 条目, 默认不 active): fid207 Hrefine(15.369°, 方向方案,
+// q90+0.063 需接受为已知代价), fid247 Hfinal_staircase(29.305°, 局部
+// 斜边例外, 边界代价远低于 Hadd)。
+// 暂不列入 active: fid78/96(H0 失败恢复类), fid71(borderline),
+// fid86(neutral), fid17/303(边界退化), fid247 Hadd(borderline)。
+const std::vector<DirectionHypothesisWhitelistEntry>
+    kDirectionHypothesisWhitelist = {
+{13, 0, "Hrefine", 49.277, "macro_smooth"},
+{62, 0, "Hrefine", 15.566, "macro_smooth"},
+{159, 0, "Hrefine", 30.057, "macro_smooth"},
+{202, 0, "Hrefine", 17.848, "macro_smooth"},
+{238, 0, "Hrefine", 15.421, "macro_smooth"},
+{314, 0, "Hrefine", 23.638, "macro_smooth"},
+        // ---- 第二批(默认仅 shadow 对照; active 须整批人工确认) ----
+{207, 0, "Hrefine", 15.369, "macro_smooth"},
+        {247, 0, "Hfinal_staircase", 29.305, "post_ceres"},
+};
+// 白名单运行统计(进程累计; active 回退原因逐条记录)
+int gWlLogged = 0;        // 输出对照日志的部件数
+int gWlHits = 0;          // fid+part 命中
+int gWlPassed = 0;        // 门控通过(candidate 可用)
+int gWlActiveUsed = 0;    // active 模式实际采用候选
+int gWlFallback = 0;      // active 模式回退 H0
+std::vector<std::string> gWlFallbackLog;
+
 // ---- 计时索引(秒，用于定位规则化各阶段耗时) ----
 double g_supportTime = 0.0;   // 支撑点提取(含 KdTree 查询)累计
 double g_optimizeTime = 0.0;
@@ -2154,7 +2199,9 @@ bool FindNarrowNeckCandidates(
     return !candidates.empty();
 }
 
-// 作用：把(多)多边形几何拆成面积达标的单多边形部件列表。
+// 查找并删除由窄颈连接到主体的小耳朵。与窄颈切分共用宽度、弧长和
+// 面积定义，但只接受“一侧小且另一侧大”的候选；两侧都大的候选仍
+// 留给正式窄颈切分逻辑，避免把真实附属建筑吞掉。
 void CollectPolygonParts(
     OGRGeometry* geometry,
     std::vector<std::unique_ptr<OGRGeometry>>& parts)
@@ -5138,7 +5185,208 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
                   << " selection_enabled=0" << std::endl;
     }
     const DetectedDirectionResult& detectedDir = selectedDir;
-    if (detectedDirOut) *detectedDirOut = detectedDir;
+    // ---- 阶梯方向证据检测(shadow-only 诊断) ----
+    // 宏观直墙方向证据提取(shadow-only): 长稳定直段→聚类→分类
+    // + 方向假设全量影子评估(H0/Hadd/Hrestore/Hrefine/HrefineRaw/Hreplace)
+    std::vector<outlineRegular::DirectionHypothesisResult> hypResults;
+    if (detectedDir.valid && !detectedDir.systems.empty()) {
+        std::vector<double> selectedActive;
+        for (const auto& s : detectedDir.systems) {
+            if (s.active) selectedActive.push_back(s.angleRad);
+        }
+        // raw 检测的全部候选(含被 selector 关闭的 active=false)
+        std::vector<double> rawAll;
+        for (const auto& s : rawDetectedDir.systems) {
+            rawAll.push_back(s.angleRad);
+        }
+        // selector 关闭前 active、之后 inactive 的系统角(区分
+        // selector_removed 与检测器自身 gating 的 raw_inactive)
+        std::vector<double> selectorClosed;
+        for (std::size_t i = 0;
+             i < rawDetectedDir.systems.size() &&
+             i < detectedDir.systems.size(); ++i) {
+            if (rawDetectedDir.systems[i].active &&
+                !detectedDir.systems[i].active) {
+                selectorClosed.push_back(rawDetectedDir.systems[i].angleRad);
+            }
+        }
+        const auto macroEv = outlineRegular::DetectMacroDirectionEvidence(
+            ring, rawRing, selectedActive, rawAll,
+            maskPixelSize > 0.0 ? maskPixelSize : 0.3,
+            sourceFid, partIndex, selectorClosed);
+        // 方向假设影子评估: 完整管线试跑(evaluationOnly), 只输出诊断。
+        // pixelSize 必须与正式管线一致(kMaskResidualSpacing), 保证
+        // H0 影子与正式几何决策路径相同
+        hypResults = outlineRegular::EvaluateDirectionHypotheses(
+            ring, kMaskResidualSpacing,
+            partIndex, rawRing, detectedDir, rawDetectedDir,
+            macroEv, sourceFid);
+    }
+
+    // ---- 方向假设白名单(上线控制层): 匹配 fid+part+name+source,
+    // 角度仅漂移校验; 门控通过才允许 active 模式消费候选方向副本 ----
+    const char* wlMode =
+        !kEnableDirectionHypothesisWhitelist
+            ? (kDirectionHypothesisWhitelistShadow ? "whitelist_shadow"
+                                                   : "shadow")
+            : "whitelist_active";
+    const DirectionHypothesisWhitelistEntry* wlEntry = nullptr;
+    const outlineRegular::DirectionHypothesisResult* wlCand = nullptr;
+    std::string wlFallbackReason;   // 空=命中且通过
+    if (kEnableDirectionHypothesisWhitelist ||
+        kDirectionHypothesisWhitelistShadow) {
+        for (const auto& e : kDirectionHypothesisWhitelist) {
+            if (e.fid != sourceFid || e.partIndex != partIndex) continue;
+            wlEntry = &e;
+            break;
+        }
+        if (!wlEntry) {
+            wlFallbackReason = "no_whitelist_entry";
+        } else {
+            // 找到 name+source 匹配且角度在容差内的候选(取最近角;
+            // results[0] 是 H0)。同名多候选(如不同精化目标)靠角度区分。
+            double bestMatchDist = kWhitelistAngleTolDeg;
+            for (std::size_t k = 1; k < hypResults.size(); ++k) {
+                const auto& h = hypResults[k];
+                if (h.name != wlEntry->hypothesisName) continue;
+                if (h.source != wlEntry->source) continue;
+                double d = std::abs(
+                    h.candidateAngleDeg - wlEntry->expectedAngleDeg);
+                d = std::fmod(d, 90.0);
+                d = std::min(d, 90.0 - d);
+                if (d <= bestMatchDist) {
+                    bestMatchDist = d;
+                    wlCand = &h;
+                }
+            }
+            if (!wlCand) {
+                wlFallbackReason = "candidate_not_found";
+            } else {
+                auto fold90 = [](double d) {
+                    d = std::fmod(std::abs(d), 90.0);
+                    return std::min(d, 90.0 - d);
+                };
+                const double foldedDelta = fold90(
+                    wlCand->candidateAngleDeg - wlEntry->expectedAngleDeg);
+                if (foldedDelta > kWhitelistAngleTolDeg) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "angle_drift(" +
+                        std::to_string(foldedDelta) + ")";
+                } else if (!wlCand->attempted) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "candidate_not_attempted";
+                } else if (!wlCand->pipelineSuccess) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "candidate_pipeline_failed";
+                } else if (wlCand->outcome != "improved") {
+                    wlCand = nullptr;
+                    wlFallbackReason = "outcome_not_improved";
+                } else if (!wlCand->hardFailures.empty()) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "hard_failures";
+                } else if (!wlCand->softRegressions.empty()) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "soft_regressions";
+                } else if (!wlCand->assignmentParticipates) {
+                    wlCand = nullptr;
+                    wlFallbackReason = "weak_assignment";
+                } else if (!wlCand->finalDirectionUsagePassed) {
+                    const std::string why =
+                        wlCand->finalDirectionUsageReason;
+                    wlCand = nullptr;
+                    wlFallbackReason = "final_direction_usage:" + why;
+                } else if (!wlCand->hasCandidateDirection &&
+                           wlCand->name != "Hfinal_staircase") {
+                    // Hfinal_staircase 无方向副本(消费 candidatePolygon)
+                    wlCand = nullptr;
+                    wlFallbackReason = "no_direction_copy";
+                }
+            }
+        }
+        // 白名单对照日志(仅命中 fid+part 的建筑输出, shadow/active 相同)
+        if (wlEntry) {
+            const outlineRegular::DirectionHypothesisResult& h0 =
+                hypResults.empty() ? outlineRegular::DirectionHypothesisResult{}
+                                   : hypResults.front();
+            ++gWlLogged;
+            if (wlEntry) ++gWlHits;
+            if (wlCand) ++gWlPassed;
+            std::cerr << "[DirHypothesisWhitelist]"
+                      << " fid=" << sourceFid << " part=" << partIndex
+                      << " mode=" << wlMode
+                      << " whitelist_hit=" << (wlEntry ? 1 : 0)
+                      << " hypothesis="
+                      << (wlEntry ? wlEntry->hypothesisName : "none")
+                      << " expected_angle="
+                      << (wlEntry ? wlEntry->expectedAngleDeg : 0.0)
+                      << " actual_angle="
+                      << (wlCand ? wlCand->candidateAngleDeg : 0.0)
+                      << " angle_delta="
+                      << (wlCand && wlEntry
+                          ? std::abs(wlCand->candidateAngleDeg
+                                     - wlEntry->expectedAngleDeg)
+                          : -1.0)
+                      << " gates_pass=" << (wlCand ? 1 : 0)
+                      << " fallback_reason="
+                      << (wlFallbackReason.empty() ? "none"
+                                                   : wlFallbackReason)
+                      << " h0_stage=" << h0.pipelineStage
+                      << " candidate_stage="
+                      << (wlCand ? wlCand->pipelineStage : "-")
+                      << " h0_vertices=" << h0.vertexCount
+                      << " candidate_vertices="
+                      << (wlCand ? wlCand->vertexCount : -1)
+                      << " h0_short=" << h0.shortEdgeCount
+                      << " candidate_short="
+                      << (wlCand ? wlCand->shortEdgeCount : -1)
+                      << " h0_micro=" << h0.microEdgeCount
+                      << " candidate_micro="
+                      << (wlCand ? wlCand->microEdgeCount : -1)
+                      << " h0_defects="
+                      << (h0.spikeCount + h0.zigzagCount
+                          + h0.shortDiagonalCount)
+                      << " candidate_defects="
+                      << (wlCand ? wlCand->spikeCount + wlCand->zigzagCount
+                                  + wlCand->shortDiagonalCount
+                                : -1)
+                      << " h0_q90(f=" << h0.smoothForwardQ90
+                      << ",r=" << h0.smoothReverseQ90 << ")"
+                      << " candidate_q90(f="
+                      << (wlCand ? wlCand->smoothForwardQ90 : 0.0)
+                      << ",r=" << (wlCand ? wlCand->smoothReverseQ90 : 0.0)
+                      << ")"
+                      << " h0_raw_q90(f=" << h0.rawForwardQ90
+                      << ",r=" << h0.rawReverseQ90 << ")"
+                      << " candidate_raw_q90(f="
+                      << (wlCand ? wlCand->rawForwardQ90 : 0.0)
+                      << ",r=" << (wlCand ? wlCand->rawReverseQ90 : 0.0)
+                      << ")"
+                      << " candidate_assignment_length="
+                      << (wlCand ? wlCand->candidateAssignedEdgeLength : 0.0)
+                      << " candidate_assignment_edges="
+                      << (wlCand ? wlCand->candidateAssignedEdgeCount : 0)
+                      << " candidate_assignment_tol_length="
+                      << (wlCand ? wlCand->candidateTolAssignedLength : 0.0)
+                      << " candidate_usage_ratio="
+                      << (wlCand ? wlCand->candidateUsageRatio : 0.0)
+                      << " active_or_shadow=" << wlMode
+                      << std::endl;
+        }
+    }
+    // 正式方向: 默认 H0(selected); active 模式且门控通过才用候选副本。
+    // Hfinal_staircase 的方向集与 H0 相同(不新增系统), 其 active 消费
+    // 走 candidatePolygon 路径: 先正式 H0 Ceres, 再对正式 H0 polygon
+    // 执行 staircase 替换(不进任何 Ceres, exception 边 target=-1)。
+    DetectedDirectionResult formalDir = detectedDir;
+    bool wlActiveUse = false;
+    const bool wlStairActive =
+        kEnableDirectionHypothesisWhitelist && wlCand &&
+        wlCand->name == "Hfinal_staircase";
+    if (kEnableDirectionHypothesisWhitelist && wlCand) {
+        formalDir = wlCand->candidateDirection;   // staircase 时 == H0
+        wlActiveUse = true;
+    }
+    if (detectedDirOut) *detectedDirOut = formalDir;
 
         // ---- Mask-only 局部圆弧检测(所有路径共用) ----
     // 检测在平滑环上确定区间; rawRing 可用时提供拟合支撑;
@@ -5151,9 +5399,161 @@ std::vector<pcl::PointXYZ> RegularizeRingFromMaskOnly(
 
         if (kUseTopologyPreservingResidualRegularization) {
         bool topoFallback = false;
+        // 正式管线: 默认 H0 方向; active 白名单命中时用候选方向副本
+        // (不修改 selectedDir 原对象)。候选正式失败或与影子结果不一致
+        // 时, 以全新实例正式重跑 H0 并回退。
         auto topoResult = regularizer.TopologyPreservingRegularize(
             ring, kMaskResidualSpacing, topoFallback, &dirCtx, partIndex,
-            rawRing, &detectedDir);
+            rawRing, &formalDir);
+        if (wlActiveUse) {
+            auto runH0Formally = [&](std::string reason) {
+                std::cerr << "[DirHypothesisWhitelist] fid=" << sourceFid
+                          << " part=" << partIndex
+                          << " mode=whitelist_active"
+                          << " fallback_to_h0=1 fallback_reason=" << reason
+                          << std::endl;
+                ++gWlFallback;
+                gWlFallbackLog.push_back(
+                    "fid=" + std::to_string(sourceFid)
+                    + " part=" + std::to_string(partIndex)
+                    + " reason=" + reason);
+                outlineRegular h0Retry;   // 全新实例, 正式参数
+                outlineRegular::DirectionContextOut h0Ctx;
+                bool h0Fallback = false;
+                auto h0Result = h0Retry.TopologyPreservingRegularize(
+                    ring, kMaskResidualSpacing, h0Fallback, &h0Ctx,
+                    partIndex, rawRing, &detectedDir);
+                formalDir = detectedDir;
+                dirCtx = h0Ctx;
+                if (!h0Result.empty()) {
+                    topoResult = std::move(h0Result);
+                    topoFallback = h0Fallback;
+                    return true;
+                }
+                topoResult.clear();
+                topoFallback = true;
+                return false;
+            };
+            auto shadowConsistent = [&topoResult](const auto& shadowPoly) {
+                if (shadowPoly.empty() ||
+                    topoResult.size() != shadowPoly.size()) {
+                    return false;
+                }
+                for (std::size_t k = 0; k < topoResult.size(); ++k) {
+                    if (std::hypot(topoResult[k].x - shadowPoly[k].x,
+                                   topoResult[k].y - shadowPoly[k].y)
+                        > 1e-6) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (wlStairActive) {
+                // staircase: 正式 H0 Ceres 已完成(topoResult),
+                // 现在对其执行 staircase 替换(不进任何 Ceres)
+                if (topoResult.empty()) {
+                    wlActiveUse = false;
+                    ++gWlFallback;
+                    gWlFallbackLog.push_back(
+                        "fid=" + std::to_string(sourceFid)
+                        + " part=" + std::to_string(partIndex)
+                        + " reason=h0_formal_pipeline_failed");
+                    std::cerr << "[DirHypothesisWhitelist] fid=" << sourceFid
+                              << " part=" << partIndex
+                              << " mode=whitelist_active"
+                              << " fallback_to_h0=1"
+                              << " fallback_reason=h0_formal_pipeline_failed"
+                              << std::endl;
+                } else {
+                    std::vector<double> h0ActiveAngles;
+                    for (const auto& s : detectedDir.systems) {
+                        if (s.active) {
+                            h0ActiveAngles.push_back(s.angleRad);
+                        }
+                    }
+                    const auto fsr =
+                        outlineRegular::BuildFinalStaircaseReduction(
+                            topoResult, h0ActiveAngles, kMaskResidualSpacing,
+                            ring, rawRing, /*isMultiDirection=*/false,
+                            sourceFid, partIndex);
+                    if (fsr.accepted) {
+                        const auto h0Poly = topoResult;
+                        topoResult = fsr.polygon;
+                        if (shadowConsistent(wlCand->candidatePolygon)) {
+                            ++gWlActiveUsed;
+                            std::cerr << "[DirHypothesisWhitelist]"
+                                      << " fid=" << sourceFid
+                                      << " part=" << partIndex
+                                      << " mode=whitelist_active"
+                                      << " hypothesis=Hfinal_staircase"
+                                      << " edge_type="
+                                         "final_staircase_exception"
+                                      << " target_system=-1"
+                                      << " fallback_to_h0=0"
+                                      << " active_shadow_consistent=1"
+                                      << " verts=" << topoResult.size()
+                                      << std::endl;
+                        } else {
+                            wlActiveUse = false;
+                            topoResult = h0Poly;   // 回退正式 H0 几何
+                            ++gWlFallback;
+                            gWlFallbackLog.push_back(
+                                "fid=" + std::to_string(sourceFid)
+                                + " part=" + std::to_string(partIndex)
+                                + " reason=staircase_active_shadow_"
+                                  "inconsistent");
+                            std::cerr << "[DirHypothesisWhitelist]"
+                                      << " fid=" << sourceFid
+                                      << " part=" << partIndex
+                                      << " mode=whitelist_active"
+                                      << " fallback_to_h0=1"
+                                      << " fallback_reason="
+                                         "staircase_active_shadow_"
+                                         "inconsistent"
+                                      << std::endl;
+                        }
+                    } else {
+                        wlActiveUse = false;
+                        ++gWlFallback;
+                        gWlFallbackLog.push_back(
+                            "fid=" + std::to_string(sourceFid)
+                            + " part=" + std::to_string(partIndex)
+                            + " reason=staircase_formal_rejected:"
+                            + fsr.rejectReason);
+                        std::cerr << "[DirHypothesisWhitelist]"
+                                  << " fid=" << sourceFid
+                                  << " part=" << partIndex
+                                  << " mode=whitelist_active"
+                                  << " fallback_to_h0=1"
+                                  << " fallback_reason="
+                                     "staircase_formal_rejected:"
+                                  << fsr.rejectReason << std::endl;
+                    }
+                }
+            } else if (topoResult.empty()) {
+                // 候选正式失败 → 回退 H0
+                wlActiveUse = false;
+                runH0Formally("candidate_formal_pipeline_failed");
+            } else {
+                // 候选成功: 正式 vs 影子一致性终检(同管线同输入应逐点一致)
+                if (shadowConsistent(wlCand->candidatePolygon)) {
+                    ++gWlActiveUsed;
+                    std::cerr << "[DirHypothesisWhitelist] fid=" << sourceFid
+                              << " part=" << partIndex
+                              << " mode=whitelist_active"
+                              << " fallback_to_h0=0"
+                              << " active_shadow_consistent=1"
+                              << " verts=" << topoResult.size()
+                              << std::endl;
+                } else {
+                    // 正式/影子不一致(候选漂移) → 回退 H0
+                    wlActiveUse = false;
+                    const bool h0ok = runH0Formally(
+                        "active_shadow_inconsistent");
+                    (void)h0ok;
+                }
+            }
+        }
         if (!topoResult.empty()) {
             if (bestHypothesisOut) *bestHypothesisOut = topoResult;
             if (pathOut) *pathOut = MaskOnlyPath::Topology;
@@ -5914,6 +6314,28 @@ int RunMaskOnlyMode(const std::string& inputRaster, const std::string& outputVec
     }
     auto loopEnd = std::chrono::steady_clock::now();
     outlineRegular::PrintTopologyRetrySummary();
+    outlineRegular::PrintDirectionHypothesisSummary();
+    // 白名单运行汇总(shadow/active 均输出; active 才有 used/fallback)
+    {
+        std::cout << "[DirHypothesisWhitelistSummary]"
+                  << " mode="
+                  << (!kEnableDirectionHypothesisWhitelist
+                          ? (kDirectionHypothesisWhitelistShadow
+                                 ? "whitelist_shadow" : "shadow")
+                          : "whitelist_active")
+                  << " entries=" << kDirectionHypothesisWhitelist.size()
+                  << " logged=" << gWlLogged
+                  << " hits=" << gWlHits
+                  << " gates_passed=" << gWlPassed
+                  << " active_used=" << gWlActiveUsed
+                  << " fallback_h0=" << gWlFallback
+                  << " writeback_enabled="
+                  << (kEnableDirectionHypothesisWhitelist ? 1 : 0)
+                  << std::endl;
+        for (const auto& s : gWlFallbackLog) {
+            std::cout << "  [wl_fallback] " << s << std::endl;
+        }
+    }
     if (kUseRawOutlineForAllRegularization) {
         std::cout << "[RawOnlyModeSummary]"
                   << " requested_parts=" << rawOnlyStats.requested

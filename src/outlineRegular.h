@@ -334,6 +334,243 @@ public:
 		const std::vector<pcl::PointXYZ>* rawRing,
 		long long fid = -1,
 		int partIndex = 0);
+	// ---- 宏观直墙方向证据提取器(shadow-only) ----
+	// 从平滑输入轮廓提取连续、足够长、近似直线的稳定方向段,
+	// 聚类为方向证据并分类(existing/refine/removed/add/replace)
+	struct MacroDirEvidence {
+	bool valid = false;
+	std::size_t startVertex = 0;
+	std::size_t endVertex = 0;
+	int edgeCount = 0;
+	double pathLength = 0.0;
+	double chordLength = 0.0;
+	double tlsAngleDeg = 0.0;
+	double rmse = 0.0;
+	double maxDev = 0.0;
+	double firstHalfDeg = 0.0;
+	double secondHalfDeg = 0.0;
+	double halfDrift = 0.0;
+	// 去重统计
+	double uniqueSupport = 0.0;      // 环边 mask 去重后的真实支撑长度
+	double longestRun = 0.0;           // 最长独立连续区段
+	int independentRuns = 0;           // 空间分离的独立区段数
+	// raw 验证
+	bool rawValid = false;
+	double rawTlsDeg = 0.0;
+	double rawRmse = 0.0;
+	double rawMaxDev = 0.0;
+	double smoothRawGap = 0.0;         // smooth/raw TLS 角差(度)
+	// v7b: 逐弧段审计(cluster 级 raw 语义 + near-miss)
+	double arcTlsAngleDeg = -1.0;     // 最长合格弧段的独立 TLS 角
+	double rawArcRatio = 0.0;          // raw 合格弧段数/合格弧段数(cluster 级)
+	bool partialSupport = false;       // 通过门槛但有少数弧段被拒(不影响分类)
+	int rejectedArcs = 0;              // 被逐弧段门槛拒绝的弧段数
+	double failedArcLength = 0.0;      // 被拒弧段总长
+	bool lowConfidence = false;        // near_miss/partial 类低置信度候选
+	std::string nearMissReason;        // cluster 级被丢弃的具体原因
+	// v8: 最长被拒弧段自身的审计值(borderline 低置信度准入用)
+	double nearMissRmse = 0.0;
+	double nearMissMaxDev = 0.0;
+	double nearMissArcLength = 0.0;
+	double nearMissArcAngleDeg = -1.0;
+	std::string nearMissRejectReason;  // 被拒原因(rmse/maxdev/too_short/...)
+	// 分类
+	std::string classification;
+	double gapToSelected = 0.0;
+	double gapToRaw = 0.0;
+	};
+	static std::vector<MacroDirEvidence> DetectMacroDirectionEvidence(
+	const std::vector<pcl::PointXYZ>& smoothRing,
+	const std::vector<pcl::PointXYZ>* rawRing,
+	const std::vector<double>& selectedActiveAngles,
+	const std::vector<double>& rawAllAngles,
+	double pixelSize,
+	long long fid = -1,
+	int partIndex = 0,
+	// selector 关闭前 active、关闭后 inactive 的系统角(区分
+	// selector_removed 与检测器自身 gating 的 raw_inactive)
+	const std::vector<double>& selectorClosedAngles = {});
+	// ---- 方向假设全量影子评估(shadow-only) ----
+	// 对证据门槛通过的候选构造 H0/Hadd/Hrestore/Hrefine/HrefineRaw/Hreplace,
+	// 每个假设完整管线试跑(evaluationOnly, 全新实例), 与 H0 比较质量。
+	// 只输出诊断, 不修改正式方向结果与输出。
+	struct DirectionHypothesisResult {
+	std::string name;                  // H0/Hadd/Hrestore/Hrefine/HrefineRaw/Hreplace
+	double candidateAngleDeg = 0.0;    // 候选角(H0 为 NaN)
+	double originalAngleDeg = 0.0;     // 被精化/替换的原方向角
+	std::string source;                // raw_detector/macro_smooth/macro_raw/near_miss
+	bool lowConfidence = false;
+	bool attempted = false;            // 完整管线已运行
+	std::string skipReason;            // 未构造/未运行原因
+	std::string pipelineStage;         // accepted stage 或失败 stage
+	bool pipelineSuccess = false;
+	std::string failureReason;
+	int directionSystemCount = 0;
+	// v8: 假设元数据
+	std::string selectorReason;        // Hrestore: selector 关闭原因
+	std::string refineTarget;          // Hrefine: primary/secondary
+	std::string mergedFrom;            // 被去重合并的候选来源(分号分隔)
+	// 新方向实际使用(margin8 独占)
+	double candidateAssignedEdgeLength = 0.0;
+	int candidateAssignedEdgeCount = 0;
+	double candidateUsageRatio = 0.0;   // 独占长/周长
+	int assignedChainCount = 0;
+	double candidateTolAssignedLength = 0.0;  // 12°容差内归属长(refine 用)
+	bool assignmentParticipates = false;      // 候选角实际参与 assignment
+	std::string assignmentOwnerDist;          // 各系统角容差归属长分布(审计)
+	// v12: 最终方向使用硬验收(全部 active system 在最终 polygon 的
+	// 真实边归属; 区别于 assignment 参与证据)
+	bool finalDirectionUsagePassed = false;
+	std::string finalDirectionUsageReason;
+	// 质量指标(管线成功时有效)
+	int vertexCount = 0;
+	int shortEdgeCount = 0;
+	int microEdgeCount = 0;
+	int spikeCount = 0;
+	int zigzagCount = 0;
+	int shortDiagonalCount = 0;
+	double irregularLengthRatio = 0.0;
+	double smoothForwardQ90 = 0.0;
+	double smoothReverseQ90 = 0.0;
+	double rawForwardQ90 = 0.0;
+	double rawReverseQ90 = 0.0;
+	double areaRatioSmooth = 0.0;
+	double centroidShift = 0.0;
+	bool simplePolygon = true;
+	std::string directionViolation;    // CheckPolygonQualityVsRing 失败原因
+	// 与 H0 比较(v8: 数值化 delta + 分级列表)
+	std::string outcome;               // improved/neutral/degraded/rejected/
+	                                   // unchanged/failed
+	std::string outcomeReason;         // classification_reason
+	double q90Delta = 0.0;             // smooth reverse q90 delta(负=改善)
+	double rawQ90Delta = 0.0;
+	int defectDelta = 0;               // spike+zigzag+diag
+	int shortEdgeDelta = 0;
+	int microEdgeDelta = 0;
+	double areaDelta = 0.0;
+	double centroidDelta = 0.0;
+	std::string qualityDelta;          // 关键指标 delta 汇总(一行)
+	std::string hardFailures;          // 硬拒绝项(数值+阈值)
+	std::string softRegressions;       // 软退化项(数值+阈值)
+	std::string improvements;          // 改善项(数值+阈值)
+	// v10: 候选方向集完整副本(白名单命中后正式管线消费的正是它,
+	// 含 systems/active/angleRad/evidenceBacked/统计字段/multiDirection/
+	// primaryAngle 等全部下游依赖字段——禁止只存角度再手工拼系统)
+	DetectedDirectionResult candidateDirection;
+	bool hasCandidateDirection = false;
+	// v10: 候选影子几何(仅供 active 正式结果一致性终检对照,
+	// 不得直接作为正式输出)
+	std::vector<pcl::PointXYZ> candidatePolygon;
+	};
+	static std::vector<DirectionHypothesisResult> EvaluateDirectionHypotheses(
+	const std::vector<pcl::PointXYZ>& initialRing,
+	double pixelSize,
+	int partIndex,
+	const std::vector<pcl::PointXYZ>* rawRing,
+	const DetectedDirectionResult& selected,
+	const DetectedDirectionResult& rawDetected,
+	const std::vector<MacroDirEvidence>& macroEvidence,
+	long long fid);
+	// ---- 最终方向使用硬验收(v12) ----
+	// "检测到方向"不等于"正式采用方向": 每个 active system 必须在
+	// 最终 polygon 中拥有达到最小长度/数量要求的平行或垂直边。
+	// 统一容差 kDirectionUsageTolDeg(12°, 90° 周期无向, 平行/垂直
+	// 同属一个系统); 每条合格边只归属最近系统(不重复计数);
+	// final_staircase_exception 边豁免(不归属任何系统)。
+	struct DirectionUsageSummary {
+		int parallelEdgeCount = 0;
+		int perpendicularEdgeCount = 0;
+		int assignedEdgeCount = 0;
+		double assignedEdgeLength = 0.0;
+		double usageRatio = 0.0;        // assigned_length / perimeter
+		double minAngleErrorDeg = 0.0;
+		double maxAngleErrorDeg = 0.0;
+		bool passed = false;
+		std::string reason;
+	};
+	struct DirectionUsageResult {
+		std::vector<DirectionUsageSummary> perSystem;
+		bool allPassed = false;
+		double perimeter = 0.0;
+		double requiredLength = 0.0;    // max(3m, 2% perimeter)
+	};
+	static DirectionUsageResult ValidateActiveDirectionUsage(
+		const std::vector<pcl::PointXYZ>& finalPolygon,
+		const std::vector<double>& activeAngles,
+		const std::vector<std::size_t>& exceptionEdges,
+		double pixelSize);
+	// ---- Ceres 后单主方向三链微正交迭代合并(正式收尾, v13) ----
+	// 识别 A→B→C→D 局部微正交绕行(e1∥e3 同向, e2 短且垂直于 e1,
+	// e1/e3 归属唯一主方向的平行/垂直族), 以长度加权平均法向偏移
+	// 重建合并边(与相邻边方向线求交), 逐次副本试算 + 事务验收,
+	// 迭代至无可接受候选。任何失败保留原路径; 整体失败回退输入。
+	struct FinalThreeChainCleanupResult {
+		std::vector<pcl::PointXYZ> polygon;   // 清理后(失败=输入原样)
+		bool changed = false;
+		int passes = 0;
+		int accepted = 0;
+		int rejected = 0;
+		int remainingCandidates = 0;
+		std::string fallbackReason;
+	};
+	static FinalThreeChainCleanupResult CleanupFinalSingleDirectionThreeChains(
+		const std::vector<pcl::PointXYZ>& ceresResult,
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		double directionAngle,
+		long long fid,
+		int partIndex);
+	// ---- 最终结果细长矩形噪声清理(v14, 单主方向第一阶段) ----
+	// 识别 U 形细长凸出/凹口(两条平行反向长轨 + 短端连接, 长宽比≥3,
+	// 附着于主体轮廓), 以 a-e 连接线(端边平行→桥接)或端边方向线求交
+	// (端边不平行)替换; 全部事务验收, 失败保留原路径。多主方向建筑
+	// 第一阶段跳过(仅输出含实测数据的诊断)。
+	struct FinalThinRectCleanupResult {
+		std::vector<pcl::PointXYZ> polygon;   // 清理后(失败=输入原样)
+		bool changed = false;
+		int passes = 0;
+		int accepted = 0;
+		int rejected = 0;
+		int nearMissMulti = 0;          // 多方向跳过但检测到结构(诊断)
+		int remainingCandidates = 0;
+		std::string fallbackReason;
+	};
+	static FinalThinRectCleanupResult CleanupFinalThinRectangularNoise(
+		const std::vector<pcl::PointXYZ>& polygon,
+		const std::vector<pcl::PointXYZ>& initialRing,
+		double pixelSize,
+		const DirectionContextOut& directionContext,
+		long long fid,
+		int partIndex);
+	static void PrintDirectionHypothesisSummary();
+
+	// ---- 阶梯方向证据检测器(纯检测, 不修改几何/方向) ----
+	// 从平滑输入轮廓的滑动窗口提取长区间的宏观 TLS 方向,
+	// 识别被 kChainMergeTurnDeg 拆碎的阶梯趋势(如 30° 斜边的栅格化)
+	struct StaircaseDirectionEvidence {
+		bool valid = false;
+		std::size_t startVertex = 0;
+		std::size_t endVertex = 0;
+		int edgeCount = 0;
+		int alternations = 0;
+		double pathLength = 0.0;
+		double chordLength = 0.0;
+		double chordAngleDeg = 0.0;
+		double tlsAngleDeg = 0.0;
+		double rmse = 0.0;
+		double maxDev = 0.0;
+		bool monotonic = true;
+		double angleGapToPrimary = 0.0;
+		double angleGapToSecondary = 0.0;
+		std::string rejectReason;
+	};
+	static std::vector<StaircaseDirectionEvidence>
+	DetectStaircaseDirectionEvidence(
+		const std::vector<pcl::PointXYZ>& smoothRing,
+		const std::vector<double>& systemAngles,
+		double pixelSize,
+		long long fid = -1,
+		int partIndex = 0);
 	// 最终阶梯后处理(第二次 Ceres 之后): 长连续栅格阶梯以保留端点的
 	// 单弦替换, 直边不属于 active system——记为 final_staircase_exception,
 	// 不进任何 Ceres、不新增方向系统。仅 single-direction 启用。
@@ -351,6 +588,11 @@ public:
 		int edgeCount = 0;
 		std::size_t startVertex = 0, endVertex = 0;
 		std::string rejectReason;
+		// v11: 局部双向证据(替换前/后 run/弦→参考弧 q90), 审计用
+		double evSmoothBefore = 0.0;
+		double evSmoothAfter = 0.0;
+		double evRawBefore = 0.0;
+		double evRawAfter = 0.0;
 	};
 	static FinalStaircaseResult BuildFinalStaircaseReduction(
 		const std::vector<pcl::PointXYZ>& secondCeresResult,

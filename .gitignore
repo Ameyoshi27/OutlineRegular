@@ -13,3 +13,5 @@ build_deps_release/
 debug_best_hypothesis.*
 debug_support_points.las
 *_debug_support_points.las
+
+ai_memory/

@@ -41,6 +41,9 @@ struct DetectedDirectionSystem {
     int inputSupportRuns = 0;            // 支持链沿环序的连续 run 数
     double inputLongestRunRatio = 0.0;   // 最长 run / 支持总长
     double inputPerimeterRatio = 0.0;    // 支持总长 / 周长
+    // AB3 选择器关闭该系统时的拒绝原因(纯诊断, 不参与几何决策;
+    // 影子 Hrestore 评估引用)
+    std::string selectorRejectReason;
 };
 
 // 检测结果: 整体
